@@ -382,6 +382,92 @@ function Invoke-AgentWithLimitRetry {
 }
 
 # ---------------------------------------------------------------------------
+# Merging a finished phase
+# ---------------------------------------------------------------------------
+
+function Get-MainBranch {
+    <#
+        The branch a finished phase merges into. Configurable, because guessing wrong here
+        is the one mistake in this tool that writes to a branch people pull from.
+    #>
+    param($Config)
+
+    if ($Config.PSObject.Properties.Name -contains 'mainBranch' -and $Config.mainBranch) {
+        return $Config.mainBranch
+    }
+    $head = git -C $Config.codeDir symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>$null
+    if ($head) { return ($head -replace '^origin/', '') }
+    foreach ($candidate in @('main', 'master')) {
+        if (git -C $Config.codeDir rev-parse --verify --quiet $candidate) { return $candidate }
+    }
+    throw 'Cannot work out the main branch. Set "mainBranch" in phasekit.json.'
+}
+
+function Test-PhaseReady {
+    <#
+        Everything that must be true before a phase branch is allowed to become the truth.
+        These are exactly the checks a human does when they bother: gates green on the
+        branch itself, nothing uncommitted, every task in the phase ticked, and at least
+        one commit to show for it.
+
+        Returns a report object. It never merges and never modifies anything.
+    #>
+    param(
+        [Parameter(Mandatory)] $Config,
+        [Parameter(Mandatory)] [string] $Phase
+    )
+
+    $branch = "$($Config.branchPrefix)$Phase"
+    $problems = New-Object System.Collections.Generic.List[string]
+
+    if (-not (git -C $Config.codeDir rev-parse --verify --quiet $branch)) {
+        $problems.Add("branch $branch does not exist")
+        return [pscustomobject]@{ ok = $false; branch = $branch; problems = $problems; commits = @() }
+    }
+
+    $current = (git -C $Config.codeDir branch --show-current).Trim()
+    if ($current -ne $branch) { $problems.Add("not on $branch (currently on $current)") }
+
+    $dirty = @(git -C $Config.codeDir status --porcelain)
+    if ($dirty.Count -gt 0) {
+        $problems.Add("$($dirty.Count) uncommitted change(s) — a task ended without committing")
+    }
+
+    # Commits the phase produced, measured from the base recorded when the run started, or
+    # from the fork point if that file is gone.
+    $baseFile = Join-Path $Config.logDir ("phase-{0}.base" -f ($Phase -replace '[^\w.-]', '_'))
+    $base = if (Test-Path $baseFile) { (Get-Content -LiteralPath $baseFile -TotalCount 1).Trim() }
+            else { (git -C $Config.codeDir merge-base (Get-MainBranch -Config $Config) $branch).Trim() }
+
+    $commits = @(git -C $Config.codeDir log --oneline "$base..$branch")
+    if ($commits.Count -eq 0) { $problems.Add('the branch has no commits on it') }
+
+    # Every task belonging to this phase must be ticked. An unticked task with work behind
+    # it is the same disagreement as a ticked task with none — both mean the ledger is not
+    # describing the repository.
+    $unticked = @()
+    if (Test-Path $Config.plan) {
+        $escaped = [regex]::Escape($Phase)
+        foreach ($line in Get-Content -LiteralPath $Config.plan) {
+            if ($line -match "^\s*- \[( |x)\]\s+$escaped\.") {
+                if ($Matches[1] -ne 'x') { $unticked += ($line -replace '^\s*- \[ \]\s*', '') }
+            }
+        }
+    }
+    if ($unticked.Count -gt 0) {
+        $problems.Add("$($unticked.Count) task(s) in this phase not ticked: " + ($unticked -join '; '))
+    }
+
+    return [pscustomobject]@{
+        ok       = ($problems.Count -eq 0)
+        branch   = $branch
+        base     = $base
+        commits  = $commits
+        problems = $problems
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Gates
 # ---------------------------------------------------------------------------
 

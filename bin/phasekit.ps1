@@ -83,6 +83,8 @@ phasekit — plan-driven, unattended agent runs
   phasekit reply <phase> -Text .   answer a question, in the same conversation
   phasekit reply <phase> -File .   the same, reading the answer from a file
   phasekit continue <phase>        pick up a phase that was interrupted
+  phasekit check <phase>           are the merge preconditions met? changes nothing
+  phasekit merge <phase>           verify, show the commits, then merge into main
   phasekit status [<phase>]        branch, commits, dirty files, pinned session
   phasekit gates                   run the project's gates locally, no agent
   phasekit logs [-Follow]          show or tail the newest run log
@@ -333,6 +335,70 @@ function Invoke-Run {
 # status / gates / logs
 # ---------------------------------------------------------------------------
 
+function Invoke-Merge {
+    <#
+        Merges a finished phase into the main branch, but only once everything a careful
+        human would check is true. The point of the branch is that the phase can be thrown
+        away; the point of the checks is that "merge it" stops being a decision you make
+        while tired.
+    #>
+    param([switch] $Quiet)
+
+    if (-not $Phase) { throw 'Which phase? e.g.  phasekit merge 0' }
+
+    $cfg = Get-PhaseKitConfig -Path $Config
+    $main = Get-MainBranch -Config $cfg
+    $report = Test-PhaseReady -Config $cfg -Phase $Phase
+
+    Write-Host ''
+    Write-Host "  Merging $($report.branch) into $main" -ForegroundColor Cyan
+    Write-Host ''
+
+    foreach ($p in $report.problems) { Write-Host "  BLOCKED  $p" -ForegroundColor Red }
+
+    if ($report.commits.Count -gt 0) {
+        Write-Host "  $($report.commits.Count) commit(s) on the branch:" -ForegroundColor Cyan
+        foreach ($c in $report.commits) { Write-Host "    $c" }
+        Write-Host ''
+    }
+
+    # Gates run on the branch as it stands, not on whatever the agent last reported. A
+    # green report from an hour ago is a claim; this is a measurement.
+    Write-Host '  Gates:' -ForegroundColor Cyan
+    $failed = Invoke-Gates -Config $cfg
+    Write-Host ''
+
+    if (-not $report.ok -or $failed -gt 0) {
+        Write-Host 'Not merging.' -ForegroundColor Red
+        if ($failed -gt 0) { Write-Host "  $failed gate(s) failing on this branch." -ForegroundColor Red }
+        Write-Host ''
+        Write-Host "Finish the phase first:  phasekit continue $Phase" -ForegroundColor Cyan
+        return 1
+    }
+
+    if (-not $Force -and -not $Quiet) {
+        Write-Host "Everything checks out. Review the diff before you say yes:" -ForegroundColor Green
+        Write-Host "  git -C `"$($cfg.codeDir)`" diff $($report.base)..$($report.branch)"
+        Write-Host ''
+        $answer = Read-Host "Merge $($report.branch) into $main? [y/N]"
+        if ($answer -notmatch '^(y|yes)$') { Write-Host 'Left alone.'; return 1 }
+    }
+
+    git -C $cfg.codeDir checkout $main
+    git -C $cfg.codeDir merge --no-ff --no-edit $report.branch
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ''
+        Write-Host 'Merge failed — resolve it by hand. Nothing else here will help.' -ForegroundColor Red
+        return $LASTEXITCODE
+    }
+
+    Write-Host ''
+    Write-Host "Merged into $main." -ForegroundColor Green
+    Write-Host "  Push when ready:   git -C `"$($cfg.codeDir)`" push"
+    Write-Host "  Tidy the branch:   git -C `"$($cfg.codeDir)`" branch -d $($report.branch)"
+    return 0
+}
+
 function Invoke-Status {
     $cfg = Get-PhaseKitConfig -Path $Config
 
@@ -435,6 +501,19 @@ if ($Detach -and -not $env:PHASEKIT_DETACHED) {
 
 switch ($Command.ToLowerInvariant()) {
     'init' { Invoke-Init; exit 0 }
+    'merge' { exit (Invoke-Merge) }
+    'check' {
+        # The merge preconditions, reported and nothing else. Safe to run at any time,
+        # including while a phase is still going.
+        $cfg = Get-PhaseKitConfig -Path $Config
+        if (-not $Phase) { throw 'Which phase? e.g.  phasekit check 0' }
+        $r = Test-PhaseReady -Config $cfg -Phase $Phase
+        Write-Host ''
+        if ($r.ok) { Write-Host "  Phase $Phase is ready to merge (gates not run — use 'phasekit merge')." -ForegroundColor Green }
+        else { foreach ($p in $r.problems) { Write-Host "  BLOCKED  $p" -ForegroundColor Yellow } }
+        Write-Host ''
+        exit ($(if ($r.ok) { 0 } else { 1 }))
+    }
     'run' { exit (Invoke-Run -Mode 'run') }
     'reply' { exit (Invoke-Run -Mode 'reply') }
     'continue' { exit (Invoke-Run -Mode 'continue') }
