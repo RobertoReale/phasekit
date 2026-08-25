@@ -1,0 +1,23 @@
+{
+  "workingDir": ".",
+  "codeDir": ".",
+
+  "plan": "PLAN.md",
+  "prompts": "PROMPTS.md",
+  "logDir": ".phasekit/logs",
+
+  "model": "opus",
+  "effort": "high",
+
+  "branchPrefix": "plan/phase-",
+  "requireCleanTree": true,
+
+  "usageLimit": {
+    "maxRetries": 6,
+    "waitMinutes": 20
+  },
+
+  "gates": [
+    { "name": "tests", "cwd": ".", "run": "echo replace me" }
+  ]
+}

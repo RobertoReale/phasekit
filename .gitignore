@@ -1,0 +1,6 @@
+# phasekit run logs and session pins
+.phasekit/
+
+# local scratch
+*.local.*
+answer-*.txt
