@@ -140,6 +140,18 @@ function Build-PhasePrompt {
     $block = Read-PhasePrompt -PromptsFile $Config.prompts -Phase $Phase
     $planName = Split-Path -Leaf $Config.plan
     $promptsName = Split-Path -Leaf $Config.prompts
+    $isTask = $Phase -match '\.'
+
+    # A phase gets its own block; an individual task usually does not, and writing one per
+    # task would be twenty near-identical copies waiting to drift apart. So a target with a
+    # dot in it falls back to the generic "## task" block, with {{TASK}} substituted.
+    if (-not $block -and $isTask) {
+        $generic = Read-PhasePrompt -PromptsFile $Config.prompts -Phase 'task'
+        if ($generic) {
+            $block = $generic -replace '\{\{TASK\}\}', $Phase
+            Write-Host "Using the generic '## task' block for $Phase." -ForegroundColor DarkGray
+        }
+    }
 
     if (-not $block) {
         # No block for this phase: fall back to pointing at the file. Say so loudly,
@@ -148,9 +160,10 @@ function Build-PhasePrompt {
         return "Read $planName and $promptsName, then carry out the Phase $Phase prompt from $promptsName exactly as it is written there, including its CHECK FIRST step. Do not go beyond that phase."
     }
 
-    $header = "You are executing phase $Phase of $planName, unattended, in a headless session.`n" +
-              "The instructions below are the phase prompt, copied verbatim from $promptsName.`n" +
-              "Follow them exactly. Do not start any later phase.`n`n"
+    $what = if ($isTask) { "task $Phase" } else { "phase $Phase" }
+    $header = "You are executing $what of $planName, unattended, in a headless session.`n" +
+              "The instructions below are the prompt for it, copied verbatim from $promptsName.`n" +
+              "Follow them exactly. Do not go beyond what they ask for.`n`n"
 
     return $header + $block
 }

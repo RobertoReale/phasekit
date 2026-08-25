@@ -74,6 +74,28 @@ Change nothing.
 
 ---
 
+## task — any single task
+
+Used automatically by `phasekit run <task>` whenever the target has a dot in it —
+`phasekit run 4.2` sends this block with `{{TASK}}` replaced by `4.2`. One generic block
+instead of one per task, which would be twenty near-identical copies waiting to drift.
+
+```
+Read AGENT-RULES.md and PLAN.md.
+
+CHECK FIRST: the gates are green, the working tree is clean, and the task
+immediately before {{TASK}} in the ledger is both ticked and backed by a commit in
+git log. Report each; if any fails, STOP and tell me.
+
+THEN: execute task {{TASK}} from PLAN.md and nothing else. Respect every constraint
+listed under it — those are the invariants the task is most likely to break.
+
+One commit. Gates green before it. Documentation updated in the same commit. Tick
+the ledger. Then stop.
+```
+
+---
+
 ## audit
 
 ```
