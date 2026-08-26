@@ -70,6 +70,17 @@ $root = Split-Path -Parent $PSScriptRoot
 
 $script:SessionId = $Session
 
+# Paths the user typed are relative to the directory they typed them in. Resolve them
+# now, because a run later moves to workingDir — which for a two-repo layout is the
+# parent — and a perfectly correct `-File answer.txt` would then point nowhere.
+foreach ($p in @('File', 'Config')) {
+    $v = Get-Variable -Name $p -ValueOnly -ErrorAction SilentlyContinue
+    if ($v -and -not [System.IO.Path]::IsPathRooted($v)) {
+        $candidate = Join-Path (Get-Location).Path $v
+        if (Test-Path $candidate) { Set-Variable -Name $p -Value (Resolve-Path $candidate).Path }
+    }
+}
+
 # ---------------------------------------------------------------------------
 # help
 # ---------------------------------------------------------------------------
