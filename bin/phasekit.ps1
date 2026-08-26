@@ -197,20 +197,38 @@ function Start-Detached {
     <#
         Relaunches this script in an independent process. PHASEKIT_DETACHED stops the
         child from detaching again.
+
+        Start-Process joins -ArgumentList with spaces and quotes nothing, so any path
+        containing a space arrives at the child split into pieces. Every path here is a
+        user path — the script's own location included — so quoting is not optional.
     #>
     param([string[]] $ForwardArgs)
 
     $pwsh = (Get-Process -Id $PID).Path
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath) + $ForwardArgs
+    $quote = { param($a) if ($a -match '\s') { '"' + $a + '"' } else { $a } }
+
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (& $quote $PSCommandPath)) +
+               ($ForwardArgs | ForEach-Object { & $quote $_ })
 
     $env:PHASEKIT_DETACHED = '1'
     $proc = Start-Process -FilePath $pwsh -ArgumentList $argList -WindowStyle Hidden -PassThru
     $env:PHASEKIT_DETACHED = $null
 
+    # A child that dies instantly is the normal failure here, and it dies silently
+    # because its window is hidden. Confirm it is actually alive before promising it is.
+    Start-Sleep -Seconds 3
+    if ($proc.HasExited) {
+        Write-Host ''
+        Write-Host "The detached process exited immediately (code $($proc.ExitCode))." -ForegroundColor Red
+        Write-Host 'Run the same command without -Detach to see why.' -ForegroundColor Red
+        return 1
+    }
+
     Write-Host ''
     Write-Host "Detached: pid $($proc.Id). It keeps running if you close this window." -ForegroundColor Green
     Write-Host "Watch it:  phasekit logs -Follow"
     Write-Host "Stop it:   Stop-Process -Id $($proc.Id)"
+    return 0
 }
 
 function Assert-CleanTreeAndBranch {
@@ -483,10 +501,20 @@ function Invoke-Logs {
         Sort-Object LastWriteTime -Descending
     if (-not $logs) { Write-Host 'No logs yet.'; return }
 
-    $newest = $logs[0].FullName
-    Write-Host "Tailing $newest" -ForegroundColor Cyan
-    if ($Follow) { Get-Content -LiteralPath $newest -Tail 20 -Wait }
-    else { Get-Content -LiteralPath $newest -Tail 60 }
+    $newest = $logs[0]
+    $age = [math]::Round(((Get-Date) - $newest.LastWriteTime).TotalMinutes)
+    Write-Host ''
+    Write-Host "  $($newest.Name)" -ForegroundColor Cyan
+    Write-Host "  last written $($newest.LastWriteTime.ToString('HH:mm:ss'))  ($age min ago)" -ForegroundColor DarkGray
+    if ($age -gt 5 -and -not $Follow) {
+        Write-Host '  Nothing has been written for a while — this run is finished, waiting out a usage limit, or dead.' -ForegroundColor Yellow
+    }
+    Write-Host ''
+
+    # Rendered, not raw: the log is stream-json, and dumping it verbatim is what sends
+    # people to `git log` instead.
+    if ($Follow) { Get-Content -LiteralPath $newest.FullName -Tail 40 -Wait | ForEach-Object { Write-StreamLine -Line $_ } }
+    else { Get-Content -LiteralPath $newest.FullName -Tail 200 | ForEach-Object { Write-StreamLine -Line $_ } }
 }
 
 # ---------------------------------------------------------------------------

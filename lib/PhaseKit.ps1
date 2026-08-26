@@ -265,6 +265,76 @@ remaining tasks of this phase under the same rules. Do not redo work that is alr
 committed, and do not start the next phase.
 '@
 
+function Write-StreamLine {
+    <#
+        Renders one stream-json line as a readable line of terminal output. Shared by the
+        live run and by `phasekit logs`, because a log full of raw JSON is not a log — it
+        is the reason you go and look at git instead.
+
+        When replaying, the event's own timestamp is used, so a log reads as history
+        rather than as everything having happened just now.
+    #>
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $Line,
+        [string] $SessionFile
+    )
+
+    if ($Line -notmatch '^\s*\{') {
+        if ($Line.Trim()) { Write-Host $Line }
+        return
+    }
+
+    try { $ev = $Line | ConvertFrom-Json } catch { return }
+
+    $t = if ($ev.timestamp) {
+        try { ([datetime] $ev.timestamp).ToLocalTime().ToString('HH:mm:ss') } catch { (Get-Date).ToString('HH:mm:ss') }
+    } else { (Get-Date).ToString('HH:mm:ss') }
+
+    if ($SessionFile -and $ev.session_id -and $ev.session_id -ne $script:SessionId) {
+        $script:SessionId = $ev.session_id
+        Set-Content -LiteralPath $SessionFile -Value $ev.session_id
+    }
+
+    switch ($ev.type) {
+        'system' {
+            if ($ev.subtype -eq 'init') {
+                Write-Host "$t  session $($ev.session_id)  cwd $($ev.cwd)" -ForegroundColor DarkGray
+            }
+        }
+        'assistant' {
+            foreach ($c in $ev.message.content) {
+                switch ($c.type) {
+                    'text' {
+                        if ($c.text.Trim()) { Write-Host "$t  $($c.text.Trim())" }
+                    }
+                    'tool_use' {
+                        $detail = switch ($c.name) {
+                            'Bash' { $c.input.command }
+                            'PowerShell' { $c.input.command }
+                            'Read' { $c.input.file_path }
+                            'Edit' { $c.input.file_path }
+                            'Write' { $c.input.file_path }
+                            'Grep' { $c.input.pattern }
+                            'Glob' { $c.input.pattern }
+                            'Task' { $c.input.description }
+                            default { '' }
+                        }
+                        $detail = ([string] $detail) -replace '\s+', ' '
+                        if ($detail.Length -gt 100) { $detail = $detail.Substring(0, 100) + '...' }
+                        Write-Host "$t  -> $($c.name) $detail" -ForegroundColor DarkCyan
+                    }
+                }
+            }
+        }
+        'result' {
+            $cost = if ($ev.total_cost_usd) { '  $' + ([math]::Round($ev.total_cost_usd, 2)) } else { '' }
+            Write-Host ''
+            Write-Host "$t  DONE  turns=$($ev.num_turns)$cost" -ForegroundColor Green
+            if ($ev.result) { Write-Host $ev.result }
+        }
+    }
+}
+
 function Invoke-Agent {
     <#
         Runs claude and renders its stream-json output as one readable line per event.
@@ -285,58 +355,7 @@ function Invoke-Agent {
     & claude @ClaudeArgs 2>&1 | ForEach-Object {
         $line = [string] $_
         Add-Content -LiteralPath $LogPath -Value $line
-
-        if ($line -notmatch '^\s*\{') {
-            if ($line.Trim()) { Write-Host $line }
-            return
-        }
-
-        try { $ev = $line | ConvertFrom-Json } catch { return }
-        $t = (Get-Date).ToString('HH:mm:ss')
-
-        if ($ev.session_id -and $ev.session_id -ne $script:SessionId) {
-            $script:SessionId = $ev.session_id
-            Set-Content -LiteralPath $SessionFile -Value $ev.session_id
-        }
-
-        switch ($ev.type) {
-            'system' {
-                if ($ev.subtype -eq 'init') {
-                    Write-Host "$t  session $($ev.session_id)  cwd $($ev.cwd)" -ForegroundColor DarkGray
-                }
-            }
-            'assistant' {
-                foreach ($c in $ev.message.content) {
-                    switch ($c.type) {
-                        'text' {
-                            if ($c.text.Trim()) { Write-Host "$t  $($c.text.Trim())" }
-                        }
-                        'tool_use' {
-                            $detail = switch ($c.name) {
-                                'Bash' { $c.input.command }
-                                'PowerShell' { $c.input.command }
-                                'Read' { $c.input.file_path }
-                                'Edit' { $c.input.file_path }
-                                'Write' { $c.input.file_path }
-                                'Grep' { $c.input.pattern }
-                                'Glob' { $c.input.pattern }
-                                'Task' { $c.input.description }
-                                default { '' }
-                            }
-                            $detail = ([string] $detail) -replace '\s+', ' '
-                            if ($detail.Length -gt 100) { $detail = $detail.Substring(0, 100) + '...' }
-                            Write-Host "$t  -> $($c.name) $detail" -ForegroundColor DarkCyan
-                        }
-                    }
-                }
-            }
-            'result' {
-                $cost = if ($ev.total_cost_usd) { '  $' + ([math]::Round($ev.total_cost_usd, 2)) } else { '' }
-                Write-Host ''
-                Write-Host "$t  DONE  turns=$($ev.num_turns)$cost" -ForegroundColor Green
-                if ($ev.result) { Write-Host $ev.result }
-            }
-        }
+        Write-StreamLine -Line $line -SessionFile $SessionFile
     }
     return $LASTEXITCODE
 }
