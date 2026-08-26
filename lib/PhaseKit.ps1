@@ -60,6 +60,8 @@ function Get-PhaseKitConfig {
         maxRetries       = 6
         waitMinutes      = 20
         gates            = @()
+        # The targets `phasekit auto` walks, in order. See Get-AutoSequence.
+        autoSequence     = @()
     }
 
     foreach ($k in @('workingDir', 'codeDir', 'plan', 'prompts', 'logDir', 'model', 'effort', 'branchPrefix', 'mainBranch')) {
@@ -73,6 +75,7 @@ function Get-PhaseKitConfig {
         if ($raw.usageLimit.waitMinutes) { $cfg.waitMinutes = [int] $raw.usageLimit.waitMinutes }
     }
     if ($raw.gates) { $cfg.gates = @($raw.gates) }
+    if ($raw.autoSequence) { $cfg.autoSequence = @($raw.autoSequence) }
 
     # Relative paths in the config are relative to the config file, never to the shell's
     # current directory — otherwise the same command means different things depending on
@@ -554,4 +557,70 @@ function Invoke-Gates {
         }
     }
     return $failed
+}
+
+# ---------------------------------------------------------------------------
+# Unattended sequences
+# ---------------------------------------------------------------------------
+
+function Get-AutoSequence {
+    <#
+        The list of targets `phasekit auto` walks, read from phasekit.json:
+
+            "autoSequence": [
+              "4.2",
+              { "target": "4.3", "model": "opus" },
+              { "target": "6.1", "note": "needs an API key you must obtain yourself" }
+            ]
+
+        A bare string uses the configured default model. An object may override the model
+        per target, which is where the cheap-model-for-mechanical-work decision lives.
+    #>
+    param([Parameter(Mandatory)] $Config, [string[]] $Targets)
+
+    if ($Targets) {
+        # Accept both -Targets 4.2,4.3 and -Targets "4.2,4.3", since the second is what
+        # survives being forwarded to a detached child process.
+        $flat = @()
+        foreach ($t in $Targets) { $flat += ($t -split ',' | Where-Object { $_.Trim() }) }
+        return @($flat | ForEach-Object { [pscustomobject]@{ target = $_.Trim(); model = $null; note = $null } })
+    }
+
+    if (-not $Config.autoSequence -or $Config.autoSequence.Count -eq 0) {
+        throw 'Nothing to run. Add "autoSequence" to phasekit.json, or pass -Targets 4.2,4.3'
+    }
+
+    return @($Config.autoSequence | ForEach-Object {
+        if ($_ -is [string]) { [pscustomobject]@{ target = $_; model = $null; note = $null } }
+        else { [pscustomobject]@{ target = $_.target; model = $_.model; note = $_.note } }
+    })
+}
+
+function Test-TargetDone {
+    <#
+        Whether a target has already landed, so a rerun of the sequence picks up where it
+        stopped instead of redoing finished work. Done means both halves agree: every
+        ledger box for it is ticked, AND its branch is either gone or already contained in
+        the main branch. One without the other is the ledger-versus-repository
+        disagreement this whole tool exists to surface, so it counts as not done.
+    #>
+    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Target)
+
+    $escaped = [regex]::Escape($Target)
+    $boxes = @()
+    if (Test-Path $Config.plan) {
+        foreach ($line in Get-Content -LiteralPath $Config.plan) {
+            # "4.2" matches its own box; a phase like "4" matches every 4.x box.
+            if ($line -match "^\s*- \[( |x)\]\s+$escaped(\.|\s)") { $boxes += $Matches[1] }
+        }
+    }
+    if ($boxes.Count -eq 0) { return $false }
+    if ($boxes -contains ' ') { return $false }
+
+    $branch = "$($Config.branchPrefix)$Target"
+    if (-not (git -C $Config.codeDir rev-parse --verify --quiet $branch)) { return $true }
+
+    $main = Get-MainBranch -Config $Config
+    git -C $Config.codeDir merge-base --is-ancestor $branch $main 2>$null
+    return ($LASTEXITCODE -eq 0)
 }

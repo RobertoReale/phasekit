@@ -59,6 +59,12 @@ param(
     # logs: tail the newest log as it grows.
     [switch] $Follow,
 
+    # auto: the targets to walk, overriding autoSequence in phasekit.json.
+    [string[]] $Targets,
+
+    # auto: push to the remote after each successful merge.
+    [switch] $Push,
+
     # init: overwrite files that already exist.
     [switch] $Force
 )
@@ -98,6 +104,7 @@ phasekit — plan-driven, unattended agent runs
   phasekit merge <phase>           verify, show the commits, then merge into main
   phasekit status [<phase>]        branch, commits, dirty files, pinned session
   phasekit gates                   run the project's gates locally, no agent
+  phasekit auto [-Push]            walk autoSequence unattended: run, verify, merge, next
   phasekit logs [-Follow]          show or tail the newest run log
 
 Options
@@ -429,6 +436,114 @@ function Invoke-Merge {
     return 0
 }
 
+function Invoke-Auto {
+    <#
+        Walks a list of targets unattended: run, verify, merge, next. Stops at the first
+        thing that needs a person and says exactly what and where.
+
+        The stop-on-first-problem rule is the whole design. Skipping a failed target to
+        "make progress" would build every later one on top of something nobody looked at,
+        which is the failure this tool exists to prevent — and unlike a human, an
+        unattended loop would not notice it had happened.
+    #>
+    $cfg = Get-PhaseKitConfig -Path $Config
+    if ($Model) { $cfg.model = $Model }
+    if ($MaxRetries) { $cfg.maxRetries = $MaxRetries }
+    if ($WaitMinutes) { $cfg.waitMinutes = $WaitMinutes }
+
+    $sequence = Get-AutoSequence -Config $cfg -Targets $Targets
+    $stopFile = Join-Path $cfg.logDir 'auto-stopped.txt'
+    Remove-Item -LiteralPath $stopFile -ErrorAction SilentlyContinue
+
+    Write-Host ''
+    Write-Host "  Unattended sequence — $($sequence.Count) target(s)" -ForegroundColor Cyan
+    foreach ($s in $sequence) {
+        $m = if ($s.model) { $s.model } else { $cfg.model }
+        $done = Test-TargetDone -Config $cfg -Target $s.target
+        $mark = if ($done) { 'done' } else { '    ' }
+        Write-Host ("    [{0}] {1,-6} {2}{3}" -f $mark, $s.target, $m, $(if ($s.note) { "   ($($s.note))" } else { '' }))
+    }
+    Write-Host ''
+    if ($Push) { Write-Host '  Pushing after each merge.' -ForegroundColor Yellow }
+
+    function Stop-Auto {
+        param([string] $Target, [string] $Why, [string] $Next)
+        $text = @"
+Unattended sequence stopped at $Target
+$(Get-Date -Format 'yyyy-MM-dd HH:mm')
+
+Why: $Why
+
+What to do: $Next
+"@
+        Set-Content -LiteralPath $stopFile -Value $text
+        Write-Host ''
+        Write-Host "STOPPED at $Target" -ForegroundColor Red
+        Write-Host "  $Why" -ForegroundColor Red
+        Write-Host "  $Next" -ForegroundColor Cyan
+        Write-Host "  Written to: $stopFile"
+    }
+
+    foreach ($item in $sequence) {
+        $target = $item.target
+        if ($item.model) { $Model = $item.model } else { $Model = $null }
+
+        if (Test-TargetDone -Config $cfg -Target $target) {
+            Write-Host "  $target already done — skipping." -ForegroundColor DarkGray
+            continue
+        }
+
+        if ($item.note) {
+            Write-Host ''
+            Write-Host "  Note on $target : $($item.note)" -ForegroundColor Yellow
+        }
+
+        Write-Host ''
+        Write-Host ('=' * 72) -ForegroundColor Cyan
+        Write-Host "  $target" -ForegroundColor Cyan
+        Write-Host ('=' * 72) -ForegroundColor Cyan
+
+        $Phase = $target
+        $exit = Invoke-Run -Mode 'run'
+
+        # A non-zero exit here is a question, a crash, or an exhausted usage allowance.
+        # One `continue` covers the interruptions; a genuine question survives it and
+        # stops the sequence, which is correct.
+        if ($exit -ne 0) {
+            Write-Host ''
+            Write-Host "  $target ended non-zero — trying one resume before giving up." -ForegroundColor Yellow
+            $exit = Invoke-Run -Mode 'continue'
+        }
+
+        $report = Test-PhaseReady -Config $cfg -Phase $target
+        if (-not $report.ok) {
+            Stop-Auto -Target $target `
+                -Why ($report.problems -join '; ') `
+                -Next "Read the log, then:  phasekit reply $target -File answer.txt   (or  phasekit continue $target)"
+            return 1
+        }
+
+        $merged = Invoke-Merge -Quiet
+        if ($merged -ne 0) {
+            Stop-Auto -Target $target -Why 'the merge preconditions or the gates failed on the branch' `
+                -Next "phasekit merge $target   to see what blocked it"
+            return 1
+        }
+
+        if ($Push) {
+            git -C $cfg.codeDir push
+            if ($LASTEXITCODE -ne 0) {
+                Stop-Auto -Target $target -Why 'push failed' -Next 'push by hand, then rerun phasekit auto'
+                return 1
+            }
+        }
+    }
+
+    Write-Host ''
+    Write-Host 'Sequence complete. Every target ran, verified and merged.' -ForegroundColor Green
+    return 0
+}
+
 function Invoke-Status {
     $cfg = Get-PhaseKitConfig -Path $Config
 
@@ -534,6 +649,8 @@ if ($Detach -and -not $env:PHASEKIT_DETACHED) {
         $v = Get-Variable -Name $p -ValueOnly -ErrorAction SilentlyContinue
         if ($v) { $fwd += @("-$p", "$v") }
     }
+    if ($Targets) { $fwd += @('-Targets', ($Targets -join ',')) }
+    if ($Push) { $fwd += '-Push' }
     if ($NoBranch) { $fwd += '-NoBranch' }
     Start-Detached -ForwardArgs $fwd
     exit 0
@@ -567,6 +684,7 @@ switch ($Command.ToLowerInvariant()) {
         Write-Host "$failed gate(s) failing." -ForegroundColor Red
         exit 1
     }
+    'auto' { exit (Invoke-Auto) }
     'logs' { Invoke-Logs; exit 0 }
     default { Show-Help; exit 0 }
 }
