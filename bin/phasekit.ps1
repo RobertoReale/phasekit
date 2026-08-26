@@ -516,12 +516,31 @@ What to do: $Next
 
         $exit = Invoke-Run -Mode 'run'
 
-        # A non-zero exit here is a question, a crash, or an exhausted usage allowance.
-        # One `continue` covers the interruptions; a genuine question survives it and
-        # stops the sequence, which is correct.
-        if ($exit -ne 0) {
-            Write-Host ''
-            Write-Host "  $target ended non-zero — trying one resume before giving up." -ForegroundColor Yellow
+        # Usage limits are already handled inside the run. What reaches here is a question,
+        # a crash, or a dropped connection. Only the last of those is worth retrying: a
+        # question survives any number of resumes and just gets re-asked, so it stops the
+        # sequence — which is correct, because it needs a person.
+        $tries = 0
+        while ($exit -ne 0 -and $tries -lt 5) {
+            $logNow = Get-ChildItem -Path $cfg.logDir -Filter "phase-$($target -replace '[^\w.-]', '_')-*.log" |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            $tail = if ($logNow) { (Get-Content -LiteralPath $logNow.FullName -Tail 40) -join "`n" } else { '' }
+
+            if (-not (Test-TransientFailure -LogTail $tail)) {
+                if ($tries -eq 0) {
+                    # An interruption with no diagnosis at all — a reboot, a killed process —
+                    # leaves no marker in the log, so allow exactly one resume before
+                    # treating it as something that needs a person.
+                    Write-Host ''
+                    Write-Host "  $target ended non-zero with no network error in the log — one resume, then I stop." -ForegroundColor Yellow
+                } else { break }
+            } else {
+                Write-Host ''
+                Write-Host "  $target hit a network error — resuming in 2 min (attempt $($tries + 1) of 5)." -ForegroundColor Yellow
+                Start-Sleep -Seconds 120
+            }
+
+            $tries++
             $exit = Invoke-Run -Mode 'continue'
         }
 

@@ -624,3 +624,13 @@ function Test-TargetDone {
     git -C $Config.codeDir merge-base --is-ancestor $branch $main 2>$null
     return ($LASTEXITCODE -eq 0)
 }
+
+function Test-TransientFailure {
+    <#
+        Whether a non-zero exit was the network rather than the work. A dropped stream or a
+        5xx is worth retrying blindly; an agent that stopped to ask a question is not, and
+        retrying that one just burns turns re-asking it.
+    #>
+    param([Parameter(Mandatory)] [string] $LogTail)
+    return ($LogTail -match '(?i)api error|stalled mid-stream|connection (reset|closed|error)|ECONNRESET|ETIMEDOUT|socket hang up|502|503|504|overloaded')
+}
