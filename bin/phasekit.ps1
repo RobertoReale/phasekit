@@ -451,6 +451,11 @@ function Invoke-Auto {
     if ($MaxRetries) { $cfg.maxRetries = $MaxRetries }
     if ($WaitMinutes) { $cfg.waitMinutes = $WaitMinutes }
 
+    # Pin the config path for the rest of the sequence. Each run moves the shell to
+    # workingDir, which for a two-repo layout is the parent — and the walk-up search would
+    # then fail to find the config it had just been using.
+    $Config = $cfg.configPath
+
     $sequence = Get-AutoSequence -Config $cfg -Targets $Targets
     $stopFile = Join-Path $cfg.logDir 'auto-stopped.txt'
     Remove-Item -LiteralPath $stopFile -ErrorAction SilentlyContinue
@@ -504,6 +509,11 @@ What to do: $Next
         Write-Host ('=' * 72) -ForegroundColor Cyan
 
         $Phase = $target
+
+        # -DryRun prints each target's prompt and stops there. Verifying and merging a
+        # run that never happened would report every target as broken.
+        if ($DryRun) { Invoke-Run -Mode 'run' | Out-Null; continue }
+
         $exit = Invoke-Run -Mode 'run'
 
         # A non-zero exit here is a question, a crash, or an exhausted usage allowance.

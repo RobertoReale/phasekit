@@ -70,11 +70,34 @@ phasekit run 0
 | `phasekit continue <phase>` | Pick up an interrupted phase where it stopped |
 | `phasekit status [<phase>]` | Branch, dirty files, commits on the phase, ledger vs git log |
 | `phasekit gates` | Run the gates yourself, no agent, no cost |
+| `phasekit auto [-Push]` | Walk `autoSequence` unattended: run, verify, merge, next |
 | `phasekit logs [-Follow]` | Show or tail the newest run log |
 
 Useful flags: `-Detach` (survives closing the terminal), `-DryRun` (print the prompt and
 the exact `claude` command, run nothing), `-NoBranch`, `-Model`, `-Effort`, `-MaxRetries`,
 `-WaitMinutes`.
+
+## Unattended sequences
+
+`phasekit auto` walks a list of targets on its own: run, verify, merge, next. The list
+lives in `phasekit.json`, and each entry may name its own model — the cheap one where the
+gates fully cover the change, the expensive one where a mistake would be silent:
+
+```json
+"autoSequence": [
+  { "target": "4.2", "model": "sonnet", "note": "mechanical move, fully covered by tests" },
+  { "target": "4.3", "model": "opus",   "note": "riskiest task in the plan" },
+  { "target": "7.2", "model": "sonnet" }
+]
+```
+
+It **stops at the first target that needs a person** and writes the reason to
+`auto-stopped.txt`. Skipping ahead would build every later target on top of something
+nobody looked at — and unlike a human, an unattended loop would never notice. A target
+that is already ticked *and* merged is skipped, so rerunning after a stop picks up where
+it left off.
+
+Leave irreversible steps out of the sequence and run them by hand.
 
 ## Configuration
 
