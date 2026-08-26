@@ -284,8 +284,9 @@ function Show-RunResult {
         }
 
         Write-Host ''
-        Write-Host "Review, then merge:  git -C `"$($Config.codeDir)`" checkout master; git -C `"$($Config.codeDir)`" merge --no-ff $($Branch.name)"
-        Write-Host "Or throw it away:    git -C `"$($Config.codeDir)`" checkout master; git -C `"$($Config.codeDir)`" branch -D $($Branch.name)"
+        $main = Get-MainBranch -Config $Config
+        Write-Host "Review, then merge:  git -C `"$($Config.codeDir)`" checkout $main; git -C `"$($Config.codeDir)`" merge --no-ff $($Branch.name)"
+        Write-Host "Or throw it away:    git -C `"$($Config.codeDir)`" checkout $main; git -C `"$($Config.codeDir)`" branch -D $($Branch.name)"
     }
 
     Write-Host ''

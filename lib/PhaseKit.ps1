@@ -52,13 +52,17 @@ function Get-PhaseKitConfig {
         model            = 'opus'
         effort           = 'high'
         branchPrefix     = 'plan/phase-'
+        # Left empty on purpose: Get-MainBranch detects it from the repository, and a
+        # default here would silently win over the detection on a repo whose main is
+        # called something else.
+        mainBranch       = ''
         requireCleanTree = $true
         maxRetries       = 6
         waitMinutes      = 20
         gates            = @()
     }
 
-    foreach ($k in @('workingDir', 'codeDir', 'plan', 'prompts', 'logDir', 'model', 'effort', 'branchPrefix')) {
+    foreach ($k in @('workingDir', 'codeDir', 'plan', 'prompts', 'logDir', 'model', 'effort', 'branchPrefix', 'mainBranch')) {
         if ($raw.PSObject.Properties.Name -contains $k -and $raw.$k) { $cfg[$k] = $raw.$k }
     }
     if ($raw.PSObject.Properties.Name -contains 'requireCleanTree') {
