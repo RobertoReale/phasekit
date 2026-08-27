@@ -313,6 +313,40 @@ function Show-RunResult {
 # run / reply / continue
 # ---------------------------------------------------------------------------
 
+function Restore-PhaseBranch {
+    <#
+        Puts a resumed run back on the branch its earlier session was working on.
+
+        `continue` used to leave the branch alone, which was right when it resumed a run
+        in the same terminal minutes later. It is wrong after a reboot or a killed runner:
+        the shell comes back on whatever branch it likes, and the resumed agent would then
+        commit the rest of the phase onto it. A dirty tree is expected here — that is the
+        work being picked up — so it is not a reason to refuse.
+    #>
+    param($Config, [string] $Phase)
+
+    if ($NoBranch) { return $null }
+
+    $branch = "$($Config.branchPrefix)$Phase"
+    if (-not (git -C $Config.codeDir rev-parse --verify --quiet $branch)) { return $null }
+
+    $current = (git -C $Config.codeDir branch --show-current).Trim()
+    if ($current -ne $branch) {
+        Write-Host "  Back onto $branch (was on $current)" -ForegroundColor Yellow
+        git -C $Config.codeDir checkout $branch | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "Cannot get back onto $branch from $current. Sort the working tree out by hand."
+        }
+    }
+
+    $safe = $Phase -replace '[^\w.-]', '_'
+    $baseFile = Join-Path $Config.logDir ("phase-{0}.base" -f $safe)
+    $base = if (Test-Path $baseFile) { (Get-Content -LiteralPath $baseFile -TotalCount 1).Trim() }
+            else { (git -C $Config.codeDir merge-base (Get-MainBranch -Config $Config) $branch).Trim() }
+
+    return [pscustomobject]@{ name = $branch; base = $base }
+}
+
 function Invoke-Run {
     param([string] $Mode)   # 'run' | 'reply' | 'continue'
 
@@ -353,9 +387,11 @@ function Invoke-Run {
         return 0
     }
 
-    # Branch handling only for a fresh run: reply and continue join work already in flight,
-    # where a dirty tree is expected rather than a reason to refuse.
-    $branch = if ($Mode -eq 'run') { Assert-CleanTreeAndBranch -Config $cfg -Phase $Phase } else { $null }
+    # A fresh run demands a clean tree and creates the branch. Reply and continue join work
+    # already in flight, where a dirty tree is the work — but they still have to be on the
+    # right branch, which after a reboot they are not.
+    $branch = if ($Mode -eq 'run') { Assert-CleanTreeAndBranch -Config $cfg -Phase $Phase }
+              else { Restore-PhaseBranch -Config $cfg -Phase $Phase }
 
     $log = New-LogPath -Config $cfg -Phase $Phase
 
@@ -527,7 +563,18 @@ What to do: $Next
         # run that never happened would report every target as broken.
         if ($DryRun) { Invoke-Run -Mode 'run' | Out-Null; continue }
 
-        $exit = @(Invoke-Run -Mode 'run')[-1]
+        # A target with a pinned session and a branch was started by an earlier runner that
+        # did not finish — a reboot, a killed process, a machine that slept through the
+        # usage-limit wait. Starting it over would throw away everything that session did
+        # and, worse, refuse outright, because the half-done work makes the tree dirty.
+        $sessionFile = Get-SessionFile -Config $cfg -Phase $target
+        $started = (Test-Path $sessionFile) -and
+                   (git -C $cfg.codeDir rev-parse --verify --quiet "$($cfg.branchPrefix)$target")
+        if ($started) {
+            Write-Host "  $target was already started - resuming that session, not restarting the phase." -ForegroundColor Yellow
+        }
+
+        $exit = @(Invoke-Run -Mode $(if ($started) { 'continue' } else { 'run' }))[-1]
 
         # Usage limits are already handled inside the run. What reaches here is a question,
         # a crash, or a dropped connection. Only the last of those is worth retrying: a
