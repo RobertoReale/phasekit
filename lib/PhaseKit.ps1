@@ -59,6 +59,10 @@ function Get-PhaseKitConfig {
         requireCleanTree = $true
         maxRetries       = 6
         waitMinutes      = 20
+        # Sound and a desktop notice when the sequence ends or stops to ask. On by
+        # default: an unattended run nobody is watching is exactly the one whose stop
+        # costs hours before anyone notices.
+        notify           = $true
         gates            = @()
         # The targets `phasekit auto` walks, in order. See Get-AutoSequence.
         autoSequence     = @()
@@ -69,6 +73,9 @@ function Get-PhaseKitConfig {
     }
     if ($raw.PSObject.Properties.Name -contains 'requireCleanTree') {
         $cfg.requireCleanTree = [bool] $raw.requireCleanTree
+    }
+    if ($raw.PSObject.Properties.Name -contains 'notify') {
+        $cfg.notify = [bool] $raw.notify
     }
     if ($raw.usageLimit) {
         if ($raw.usageLimit.maxRetries) { $cfg.maxRetries = [int] $raw.usageLimit.maxRetries }
@@ -210,6 +217,54 @@ function Get-ResumeArgs {
 
 # What a usage-limit stop looks like, as opposed to a real failure. A limit is worth
 # waiting out; a failing test is not worth retrying blindly.
+# ---------------------------------------------------------------------------
+# Telling the person
+# ---------------------------------------------------------------------------
+
+function Send-PhaseKitNotice {
+    <#
+        Sound and a desktop notice, for the two moments that are worth interrupting
+        someone: the sequence finished, or it stopped and needs an answer.
+
+        The second is the one that pays for this. A stopped sequence costs nothing to fix
+        and everything to not notice — the run that waited three hours for a person to
+        walk past a terminal is the most expensive thing this tool can do.
+
+        Sound first and separately from the notice: a balloon can be suppressed by focus
+        assist or a full-screen window, and neither is a reason to fail silently. Every
+        part is best-effort — a machine with no audio device must not take a run down.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Title,
+        [Parameter(Mandatory)] [string] $Message,
+        [ValidateSet('done', 'attention')] [string] $Kind = 'done'
+    )
+
+    try {
+        foreach ($i in 1..3) {
+            if ($Kind -eq 'attention') { [System.Media.SystemSounds]::Exclamation.Play() }
+            else { [System.Media.SystemSounds]::Asterisk.Play() }
+            Start-Sleep -Milliseconds 800
+        }
+    } catch { }
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+        $tray = New-Object System.Windows.Forms.NotifyIcon
+        $tray.Icon = [System.Drawing.SystemIcons]::Information
+        $tray.Visible = $true
+        $tray.BalloonTipTitle = $Title
+        $tray.BalloonTipText = $Message
+        $tray.BalloonTipIcon = if ($Kind -eq 'attention') { 'Warning' } else { 'Info' }
+        $tray.ShowBalloonTip(30000)
+        # The notice is drawn by this process; disposing immediately takes it away again.
+        Start-Sleep -Seconds 12
+        $tray.Visible = $false
+        $tray.Dispose()
+    } catch { }
+}
+
 # ---------------------------------------------------------------------------
 # Waiting out a usage limit
 # ---------------------------------------------------------------------------

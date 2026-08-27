@@ -105,6 +105,22 @@ it left off.
 
 Leave irreversible steps out of the sequence and run them by hand.
 
+It tells you when it ends, either way — sound and a desktop notice on both the completion
+and the stop. The stop is the one that pays for it: a sequence waiting for an answer costs
+nothing to fix and everything to not notice. Set `"notify": false` to turn it off.
+
+Everything above survives inside the running process. Nothing inside a process survives
+that process dying, so a reboot is the one interruption the runner cannot handle on its
+own:
+
+```powershell
+tools/resume-at-logon.ps1 -Install -Push -Config path	o\phasekit.json
+```
+
+That registers a logon task which resumes the sequence, and does nothing once it has
+finished. Resuming is safe to repeat: merged targets are skipped, and a target with a
+pinned session is continued rather than restarted.
+
 ## Configuration
 
 `phasekit.json`, found by walking up from the current directory:

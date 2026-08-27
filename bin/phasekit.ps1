@@ -536,6 +536,10 @@ What to do: $Next
         Write-Host "  $Why" -ForegroundColor Red
         Write-Host "  $Next" -ForegroundColor Cyan
         Write-Host "  Written to: $stopFile"
+
+        if ($cfg.notify) {
+            Send-PhaseKitNotice -Kind 'attention' -Title "phasekit stopped at $Target" -Message "$Why`n`n$Next"
+        }
     }
 
     foreach ($item in $sequence) {
@@ -638,6 +642,10 @@ Every target ran, verified and merged.
 "@
     Write-Host ''
     Write-Host 'Sequence complete. Every target ran, verified and merged.' -ForegroundColor Green
+    if ($cfg.notify) {
+        Send-PhaseKitNotice -Kind 'done' -Title 'phasekit: sequence complete' `
+            -Message "$($sequence.Count) target(s) ran, verified and merged into $(Get-MainBranch -Config $cfg)."
+    }
     return 0
 }
 
