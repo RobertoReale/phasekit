@@ -210,6 +210,79 @@ function Get-ResumeArgs {
 
 # What a usage-limit stop looks like, as opposed to a real failure. A limit is worth
 # waiting out; a failing test is not worth retrying blindly.
+# ---------------------------------------------------------------------------
+# Waiting out a usage limit
+# ---------------------------------------------------------------------------
+
+$script:AwakeDepth = 0
+
+function Set-MachineAwake {
+    <#
+        Keeps the machine from suspending for as long as an unattended run is in flight.
+
+        A sequence that waits three hours for a usage limit is exactly the workload
+        Windows decides is idle, and a suspended machine runs nothing. The display is
+        deliberately left alone: this asks the system to stay up, not the screen to stay
+        on. Nested callers are counted, so a run inside a sequence releasing the request
+        does not let the machine sleep under the rest of the sequence.
+    #>
+    param([switch] $Off)
+
+    if (-not ('PhaseKit.Power' -as [type])) {
+        Add-Type -Namespace PhaseKit -Name Power -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern uint SetThreadExecutionState(uint esFlags);
+'@
+    }
+
+    $ES_CONTINUOUS = [uint32] '0x80000000'
+    $ES_SYSTEM_REQUIRED = [uint32] '0x00000001'
+
+    if ($Off) {
+        $script:AwakeDepth = [Math]::Max(0, $script:AwakeDepth - 1)
+        if ($script:AwakeDepth -eq 0) { [void][PhaseKit.Power]::SetThreadExecutionState($ES_CONTINUOUS) }
+        return
+    }
+
+    $script:AwakeDepth++
+    [void][PhaseKit.Power]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED)
+}
+
+function Wait-UntilDeadline {
+    <#
+        Sleeps until a wall-clock time, not for a duration.
+
+        `Start-Sleep -Seconds 10000` measures a timer that a suspended machine does not
+        advance and does not reliably fire on resume: a run that slept through a standby
+        woke up hours late, or not at all. Short sleeps against `Get-Date` cannot drift
+        that way — whatever happens to the machine in between, the first tick after the
+        deadline ends the wait.
+
+        The countdown is written to the run log as well as the console, because a wait is
+        otherwise indistinguishable from a dead run: no claude process, and a log that
+        stopped growing. That misreading is the most expensive one in this workflow.
+    #>
+    param(
+        [Parameter(Mandatory)] [datetime] $Deadline,
+        [string] $LogPath
+    )
+
+    $lastNote = Get-Date
+    while ($true) {
+        $left = ($Deadline - (Get-Date)).TotalSeconds
+        if ($left -le 0) { break }
+
+        if (((Get-Date) - $lastNote).TotalMinutes -ge 15) {
+            $note = "  ... still waiting out the usage limit, {0:N0} min to go (resuming ~{1})" -f ($left / 60), $Deadline.ToString('HH:mm')
+            Write-Host $note -ForegroundColor DarkGray
+            if ($LogPath) { Add-Content -LiteralPath $LogPath -Value $note }
+            $lastNote = Get-Date
+        }
+
+        Start-Sleep -Seconds ([Math]::Min(60, [Math]::Max(1, [int] $left)))
+    }
+}
+
 $script:LimitPattern = 'usage limit|session limit|weekly limit|rate limit|resets at|resets \d|429'
 
 function Get-ResetWaitMinutes {
@@ -409,9 +482,17 @@ function Invoke-AgentWithLimitRetry {
         $source = if ($announced) { 'until the announced reset' } else { 'fixed interval' }
         $resumeAt = (Get-Date).AddMinutes($wait).ToString('HH:mm')
 
+        $note = "Usage limit reached. Waiting $wait min ($source), resuming at ~$resumeAt (attempt $attempt of $($Config.maxRetries))."
         Write-Host ''
-        Write-Host "Usage limit reached. Waiting $wait min ($source), resuming at ~$resumeAt (attempt $attempt of $($Config.maxRetries))." -ForegroundColor Yellow
-        Start-Sleep -Seconds ($wait * 60)
+        Write-Host $note -ForegroundColor Yellow
+        # Into the log too, so `phasekit logs -Follow` shows a run that is waiting rather
+        # than a log that simply stopped.
+        Add-Content -LiteralPath $LogPath -Value ''
+        Add-Content -LiteralPath $LogPath -Value $note
+
+        Set-MachineAwake
+        try { Wait-UntilDeadline -Deadline (Get-Date).AddMinutes($wait) -LogPath $LogPath }
+        finally { Set-MachineAwake -Off }
 
         $resume = (Get-ResumeArgs -SessionId $script:SessionId) + @('-p', $script:ContinuePrompt) + $Common
         $exit = Invoke-Agent -ClaudeArgs $resume -LogPath $LogPath -SessionFile $SessionFile

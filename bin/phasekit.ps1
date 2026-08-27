@@ -898,9 +898,9 @@ switch ($Command.ToLowerInvariant()) {
         Write-Host ''
         exit ($(if ($r.ok) { 0 } else { 1 }))
     }
-    'run' { exit (Invoke-Run -Mode 'run') }
-    'reply' { exit (Invoke-Run -Mode 'reply') }
-    'continue' { exit (Invoke-Run -Mode 'continue') }
+    'run' { Set-MachineAwake; try { exit (Invoke-Run -Mode 'run') } finally { Set-MachineAwake -Off } }
+    'reply' { Set-MachineAwake; try { exit (Invoke-Run -Mode 'reply') } finally { Set-MachineAwake -Off } }
+    'continue' { Set-MachineAwake; try { exit (Invoke-Run -Mode 'continue') } finally { Set-MachineAwake -Off } }
     'status' { Invoke-Status; exit 0 }
     'gates' {
         $cfg = Get-PhaseKitConfig -Path $Config
@@ -911,7 +911,9 @@ switch ($Command.ToLowerInvariant()) {
         Write-Host "$failed gate(s) failing." -ForegroundColor Red
         exit 1
     }
-    'auto' { exit (Invoke-Auto) }
+    # Held for the whole sequence, gates and merges included, and released however it
+    # ends. An unattended run is not idle, whatever the power settings think.
+    'auto' { Set-MachineAwake; try { exit (Invoke-Auto) } finally { Set-MachineAwake -Off } }
     'logs' { exit (Invoke-Logs) }
     default { Show-Help; exit 0 }
 }

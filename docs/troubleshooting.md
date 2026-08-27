@@ -119,6 +119,32 @@ and the commit, or the agent ticked optimistically.
 `phasekit status` prints the ledger next to the git log. Untick the box, then
 `phasekit continue <phase>`.
 
+## The wait never ended — the machine slept through it
+
+The runner is alive, there is no `claude` process, the log stopped at the limit message,
+and the announced reset came and went. Nothing resumes.
+
+`Start-Sleep -Seconds 10000` measures a timer, and a suspended machine neither advances
+it nor reliably fires it on resume. A three-hour wait for a usage limit is precisely the
+workload Windows decides is idle, so the machine suspends *into* the wait and the run
+never wakes up on the other side.
+
+Two changes, both in the runner:
+
+- The wait is now against a wall-clock deadline, in short sleeps. Whatever happens to the
+  machine in between, the first tick past the deadline ends it.
+- The whole sequence holds `ES_SYSTEM_REQUIRED`, so the machine stays up while an
+  unattended run is in flight. The display is left alone — the screen still turns off.
+
+A wait now also writes to the run log, not only the hidden console, so `phasekit logs
+-Follow` shows a countdown instead of a log that just stops. That was the ambiguity
+underneath this whole failure mode: a run waiting out a limit and a dead run look
+identical from the outside.
+
+If you find one hung in the old way, it is safe to kill: `Stop-Process -Id <pid>`, then
+rerun `phasekit auto`. The target it was on has a pinned session and a branch, so the
+sequence resumes that conversation rather than restarting the phase.
+
 ## Usage limits
 
 `claude -p` does not wait and resume by itself when the allowance runs out; it exits with
