@@ -59,6 +59,10 @@ param(
     # logs: tail the newest log as it grows.
     [switch] $Follow,
 
+    # -Detach normally hands the terminal straight back to following the run. This leaves
+    # you at the prompt instead.
+    [switch] $NoFollow,
+
     # auto: the targets to walk, overriding autoSequence in phasekit.json.
     [string[]] $Targets,
 
@@ -105,10 +109,11 @@ phasekit — plan-driven, unattended agent runs
   phasekit status [<phase>]        branch, commits, dirty files, pinned session
   phasekit gates                   run the project's gates locally, no agent
   phasekit auto [-Push]            walk autoSequence unattended: run, verify, merge, next
-  phasekit logs [-Follow]          show or tail the newest run log
+  phasekit logs [-Follow]          follow the run, rolling over as each phase starts
 
 Options
-  -Detach          run in a process that survives this terminal closing
+  -Detach          run in a process that survives this terminal closing, then follow it
+  -NoFollow        with -Detach, return to the prompt instead of following
   -DryRun          print the prompt and the claude command, run nothing
   -NoBranch        stay on the current branch
   -Model -Effort   override phasekit.json for this run
@@ -462,7 +467,11 @@ function Invoke-Auto {
 
     $sequence = Get-AutoSequence -Config $cfg -Targets $Targets
     $stopFile = Join-Path $cfg.logDir 'auto-stopped.txt'
+    $doneFile = Join-Path $cfg.logDir 'auto-finished.txt'
+    # Both markers are how a follower knows the sequence ended, and why. A stale one from
+    # the last sequence would end the next follow the moment it started.
     Remove-Item -LiteralPath $stopFile -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $doneFile -ErrorAction SilentlyContinue
 
     Write-Host ''
     Write-Host "  Unattended sequence — $($sequence.Count) target(s)" -ForegroundColor Cyan
@@ -574,6 +583,12 @@ What to do: $Next
         }
     }
 
+    Set-Content -LiteralPath $doneFile -Value @"
+Unattended sequence complete
+$(Get-Date -Format 'yyyy-MM-dd HH:mm')
+
+Every target ran, verified and merged.
+"@
     Write-Host ''
     Write-Host 'Sequence complete. Every target ran, verified and merged.' -ForegroundColor Green
     return 0
@@ -646,26 +661,147 @@ function Invoke-Status {
     Write-Host ''
 }
 
+function Write-LogHeader {
+    param([System.IO.FileInfo] $File)
+    Write-Host ''
+    Write-Host ('-' * 72) -ForegroundColor DarkGray
+    Write-Host "  $($File.Name)" -ForegroundColor Cyan
+    Write-Host ('-' * 72) -ForegroundColor DarkGray
+    Write-Host ''
+}
+
+function Get-NewestLog {
+    param([string] $LogDir)
+    Get-ChildItem -Path $LogDir -Filter '*.log' -ErrorAction SilentlyContinue |
+        Sort-Object CreationTime -Descending | Select-Object -First 1
+}
+
+function Watch-Logs {
+    <#
+        Follows the run as it happens, across phases.
+
+        `Get-Content -Wait` was not enough for an unattended sequence: it holds one file
+        open, and the moment auto finishes a phase it starts writing a *new* log. The tail
+        then sits on a file nobody is writing to any more, which looks exactly like a hung
+        run — so you go and restart the follow by hand at every phase boundary.
+
+        This reads by byte offset instead, and rolls over to any log created after the one
+        it is on. It ends when the sequence does, by either marker auto leaves behind.
+    #>
+    param($Config)
+
+    $stopFile = Join-Path $Config.logDir 'auto-stopped.txt'
+    $doneFile = Join-Path $Config.logDir 'auto-finished.txt'
+    $startedAt = Get-Date
+
+    # A detached launch gets here before the child has opened its first log.
+    $current = Get-NewestLog -LogDir $Config.logDir
+    while (-not $current) {
+        Start-Sleep -Seconds 1
+        if (((Get-Date) - $startedAt).TotalSeconds -gt 60) { Write-Host 'No log appeared in 60s — the run never started.' -ForegroundColor Red; return 1 }
+        $current = Get-NewestLog -LogDir $Config.logDir
+    }
+
+    # Only the tail of the log already in progress; every later one from its first line,
+    # because there is nothing to catch up on.
+    $tail = 40
+    $lastData = Get-Date
+    $lastNotice = Get-Date
+
+    while ($true) {
+        Write-LogHeader -File $current
+        $createdAt = $current.CreationTime
+
+        $fs = [System.IO.File]::Open($current.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+                                     [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+        # Stateful, so a UTF-8 character split across two reads still decodes.
+        $decoder = [System.Text.Encoding]::UTF8.GetDecoder()
+        $pending = ''
+        $primed = $false
+        $rollTo = $null
+
+        try {
+            while ($true) {
+                $len = $fs.Length
+                if ($fs.Position -lt $len) {
+                    $count = [int][Math]::Min($len - $fs.Position, 1MB)
+                    $bytes = New-Object byte[] $count
+                    $read = $fs.Read($bytes, 0, $count)
+                    if ($read -gt 0) {
+                        $chars = New-Object char[] ($read)
+                        $n = $decoder.GetChars($bytes, 0, $read, $chars, 0)
+                        $pending += [string]::new($chars, 0, $n)
+
+                        # The last piece has no newline yet: the writer is mid-line. Hold it
+                        # back rather than rendering half an event.
+                        $parts = $pending -split "`n"
+                        $pending = $parts[-1]
+                        $lines = @($parts[0..($parts.Count - 2)])
+
+                        if (-not $primed -and $tail -gt 0 -and $lines.Count -gt $tail) {
+                            $lines = $lines[($lines.Count - $tail)..($lines.Count - 1)]
+                        }
+                        foreach ($l in $lines) { Write-StreamLine -Line $l.TrimEnd("`r") }
+                        if ($lines.Count -gt 0) { $lastData = Get-Date; $lastNotice = Get-Date }
+                    }
+                    $primed = $true
+                    continue
+                }
+
+                $primed = $true
+
+                # Caught up. Anything else to move to?
+                $newest = Get-NewestLog -LogDir $Config.logDir
+                if ($newest -and $newest.CreationTime -gt $createdAt) { $rollTo = $newest; break }
+
+                foreach ($marker in @($stopFile, $doneFile)) {
+                    if ((Test-Path $marker) -and (Get-Item $marker).LastWriteTime -gt $startedAt) {
+                        Write-Host ''
+                        Get-Content -LiteralPath $marker | ForEach-Object {
+                            Write-Host "  $_" -ForegroundColor $(if ($marker -eq $doneFile) { 'Green' } else { 'Red' })
+                        }
+                        Write-Host ''
+                        return $(if ($marker -eq $doneFile) { 0 } else { 1 })
+                    }
+                }
+
+                # Silence is normal here — gates, a merge, or a usage-limit wait, none of
+                # which write to the log. Say so, so it does not read as a hang.
+                $quiet = ((Get-Date) - $lastData).TotalMinutes
+                if ($quiet -gt 3 -and ((Get-Date) - $lastNotice).TotalMinutes -gt 5) {
+                    Write-Host ("  ... quiet for {0:N0} min - gates, a merge, or waiting out a usage limit" -f $quiet) -ForegroundColor DarkGray
+                    $lastNotice = Get-Date
+                }
+
+                Start-Sleep -Seconds 1
+            }
+        } finally { $fs.Dispose() }
+
+        $current = $rollTo
+        $tail = 0
+    }
+}
+
 function Invoke-Logs {
     $cfg = Get-PhaseKitConfig -Path $Config
-    $logs = Get-ChildItem -Path $cfg.logDir -Filter '*.log' -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending
-    if (-not $logs) { Write-Host 'No logs yet.'; return }
+    if ($Follow) { return (Watch-Logs -Config $cfg) }
 
-    $newest = $logs[0]
+    $newest = Get-NewestLog -LogDir $cfg.logDir
+    if (-not $newest) { Write-Host 'No logs yet.'; return 0 }
+
     $age = [math]::Round(((Get-Date) - $newest.LastWriteTime).TotalMinutes)
     Write-Host ''
     Write-Host "  $($newest.Name)" -ForegroundColor Cyan
     Write-Host "  last written $($newest.LastWriteTime.ToString('HH:mm:ss'))  ($age min ago)" -ForegroundColor DarkGray
-    if ($age -gt 5 -and -not $Follow) {
-        Write-Host '  Nothing has been written for a while — this run is finished, waiting out a usage limit, or dead.' -ForegroundColor Yellow
+    if ($age -gt 5) {
+        Write-Host '  Nothing has been written for a while - this run is finished, waiting out a usage limit, or dead.' -ForegroundColor Yellow
     }
     Write-Host ''
 
     # Rendered, not raw: the log is stream-json, and dumping it verbatim is what sends
     # people to `git log` instead.
-    if ($Follow) { Get-Content -LiteralPath $newest.FullName -Tail 40 -Wait | ForEach-Object { Write-StreamLine -Line $_ } }
-    else { Get-Content -LiteralPath $newest.FullName -Tail 200 | ForEach-Object { Write-StreamLine -Line $_ } }
+    Get-Content -LiteralPath $newest.FullName -Tail 200 | ForEach-Object { Write-StreamLine -Line $_ }
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -687,8 +823,17 @@ if ($Detach -and -not $env:PHASEKIT_DETACHED) {
     if ($Targets) { $fwd += @('-Targets', ($Targets -join ',')) }
     if ($Push) { $fwd += '-Push' }
     if ($NoBranch) { $fwd += '-NoBranch' }
-    Start-Detached -ForwardArgs $fwd
-    exit 0
+    if ((Start-Detached -ForwardArgs $fwd) -eq 1) { exit 1 }
+
+    # The run is now independent of this terminal, so hand the terminal back to watching
+    # it. Ctrl+C here stops the watching, never the run — which is the whole point of
+    # detaching, and is worth saying out loud because the two look identical.
+    if ($NoFollow) { exit 0 }
+    Write-Host ''
+    Write-Host '  Following the run. Ctrl+C stops the following, not the run.' -ForegroundColor DarkGray
+    Write-Host '  Come back to it any time with:  phasekit logs -Follow' -ForegroundColor DarkGray
+    $Follow = $true
+    exit (Invoke-Logs)
 }
 
 switch ($Command.ToLowerInvariant()) {
@@ -720,6 +865,6 @@ switch ($Command.ToLowerInvariant()) {
         exit 1
     }
     'auto' { exit (Invoke-Auto) }
-    'logs' { Invoke-Logs; exit 0 }
+    'logs' { exit (Invoke-Logs) }
     default { Show-Help; exit 0 }
 }

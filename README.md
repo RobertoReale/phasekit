@@ -71,11 +71,17 @@ phasekit run 0
 | `phasekit status [<phase>]` | Branch, dirty files, commits on the phase, ledger vs git log |
 | `phasekit gates` | Run the gates yourself, no agent, no cost |
 | `phasekit auto [-Push]` | Walk `autoSequence` unattended: run, verify, merge, next |
-| `phasekit logs [-Follow]` | Show or tail the newest run log |
+| `phasekit logs [-Follow]` | Follow the run, rolling over to each new phase's log |
 
 Useful flags: `-Detach` (survives closing the terminal), `-DryRun` (print the prompt and
 the exact `claude` command, run nothing), `-NoBranch`, `-Model`, `-Effort`, `-MaxRetries`,
 `-WaitMinutes`.
+
+`-Detach` then hands the terminal straight back to following the run, so one command both
+starts it and shows it. `Ctrl+C` there stops the *following*; the run is a separate process
+and carries on. `-NoFollow` leaves you at the prompt instead, and `phasekit logs -Follow`
+reattaches whenever you want. The follower rolls over on its own as each phase opens its
+own log, and ends when the sequence does.
 
 ## Unattended sequences
 
