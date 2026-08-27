@@ -280,8 +280,12 @@ function Show-RunResult {
     if ($Branch) {
         Write-Host ''
         Write-Host "What this run produced on $($Branch.name):" -ForegroundColor Cyan
-        git -C $Config.codeDir --no-pager log --oneline "$($Branch.base)..HEAD"
-        git -C $Config.codeDir --no-pager diff --stat "$($Branch.base)..HEAD"
+        # Out-Host, not a bare call: anything a function writes to the output stream becomes
+        # part of its return value, and this one is called just before Invoke-Run returns an
+        # exit code. Letting git's stdout through here turns `0` into an array, and every
+        # `-ne 0` test upstream then reads a successful run as a failure.
+        git -C $Config.codeDir --no-pager log --oneline "$($Branch.base)..HEAD" | Out-Host
+        git -C $Config.codeDir --no-pager diff --stat "$($Branch.base)..HEAD" | Out-Host
 
         $leftovers = git -C $Config.codeDir status --porcelain
         if ($leftovers) {
@@ -421,8 +425,8 @@ function Invoke-Merge {
         if ($answer -notmatch '^(y|yes)$') { Write-Host 'Left alone.'; return 1 }
     }
 
-    git -C $cfg.codeDir checkout $main
-    git -C $cfg.codeDir merge --no-ff --no-edit $report.branch
+    git -C $cfg.codeDir checkout $main | Out-Host
+    git -C $cfg.codeDir merge --no-ff --no-edit $report.branch | Out-Host
     if ($LASTEXITCODE -ne 0) {
         Write-Host ''
         Write-Host 'Merge failed — resolve it by hand. Nothing else here will help.' -ForegroundColor Red
@@ -514,7 +518,7 @@ What to do: $Next
         # run that never happened would report every target as broken.
         if ($DryRun) { Invoke-Run -Mode 'run' | Out-Null; continue }
 
-        $exit = Invoke-Run -Mode 'run'
+        $exit = @(Invoke-Run -Mode 'run')[-1]
 
         # Usage limits are already handled inside the run. What reaches here is a question,
         # a crash, or a dropped connection. Only the last of those is worth retrying: a
@@ -541,7 +545,7 @@ What to do: $Next
             }
 
             $tries++
-            $exit = Invoke-Run -Mode 'continue'
+            $exit = @(Invoke-Run -Mode 'continue')[-1]
         }
 
         $report = Test-PhaseReady -Config $cfg -Phase $target
@@ -552,7 +556,9 @@ What to do: $Next
             return 1
         }
 
-        $merged = Invoke-Merge -Quiet
+        # Last element, not the whole thing: if any callee ever leaks to the output stream
+        # again, this reads the exit code rather than the noise in front of it.
+        $merged = @(Invoke-Merge -Quiet)[-1]
         if ($merged -ne 0) {
             Stop-Auto -Target $target -Why 'the merge preconditions or the gates failed on the branch' `
                 -Next "phasekit merge $target   to see what blocked it"
@@ -560,7 +566,7 @@ What to do: $Next
         }
 
         if ($Push) {
-            git -C $cfg.codeDir push
+            git -C $cfg.codeDir push | Out-Host
             if ($LASTEXITCODE -ne 0) {
                 Stop-Auto -Target $target -Why 'push failed' -Next 'push by hand, then rerun phasekit auto'
                 return 1
