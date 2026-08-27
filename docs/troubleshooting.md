@@ -149,6 +149,30 @@ runner's own window, or `phasekit status`, before concluding anything died.
 If the limit pattern ever fails to match a new wording, the run stops with the log tail
 visible, which is the safe direction to fail in.
 
+## `auto` stopped on a target it had just merged
+
+`auto-stopped.txt` says the merge preconditions failed, but `git log` on the main
+branch shows the merge commit sitting there, and the tree is clean. Both statements
+are true: the merge happened, and the runner then read it as a failure.
+
+The cause is PowerShell's, not git's. A function returns **everything** written to
+the output stream, not just what `return` names. A bare `git merge` or `git log`
+inside a function that ends in `return 0` makes the caller receive
+`@('Merge made by the ort strategy.', '12 files changed…', 0)`. Comparing that array
+with `-ne 0` yields the non-matching elements — a non-empty array, which is truthy —
+so `if ($merged -ne 0)` fires on success.
+
+Fixed in the runner by piping every native command inside a value-returning function
+to `Out-Host`, and by reading exit codes as `@(Invoke-Thing)[-1]`. If you extend
+`phasekit` yourself, that is the rule: **a function that returns an exit code may not
+let anything else reach the output stream.** `Write-Host` is safe; a bare `git`,
+`npm` or `python` call is not.
+
+How to tell this is what happened: the stop reason mentions the merge or the gates,
+but `phasekit status` shows a clean tree, the ledger ticked, and the phase branch
+already an ancestor of main. Rerunning `phasekit auto` is safe — targets that are
+ticked *and* merged are skipped, so it picks up at the next real one.
+
 ## `Get-Content: The 'Raw' and 'Tail' parameters cannot be specified in the same command`
 
 An old bug in hand-rolled runners: reading the log tail crashes the error handler, so the
