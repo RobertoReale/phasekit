@@ -608,6 +608,15 @@ What to do: $Next
             $exit = @(Invoke-Run -Mode 'continue')[-1]
         }
 
+        # A run can end non-zero after its work already landed — the usual way is a runner
+        # killed between the merge and the next target. Verifying then reports "not on the
+        # phase branch", which is true, describes a success, and is written to
+        # auto-stopped.txt in the words of a failure. Ask the outcome, not the exit code.
+        if (Test-TargetDone -Config $cfg -Target $target) {
+            Write-Host "  $target landed and merged despite exit $exit - moving on." -ForegroundColor DarkGray
+            continue
+        }
+
         $report = Test-PhaseReady -Config $cfg -Phase $target
         if (-not $report.ok) {
             Stop-Auto -Target $target `
