@@ -114,7 +114,7 @@ that process dying, so a reboot is the one interruption the runner cannot handle
 own:
 
 ```powershell
-tools/resume-at-logon.ps1 -Install -Push -Config path	o\phasekit.json
+tools/resume-at-logon.ps1 -Install -Push -Config path\to\phasekit.json
 ```
 
 That registers a logon task which resumes the sequence, and does nothing once it has
