@@ -49,6 +49,28 @@ param(
 $ErrorActionPreference = 'Stop'
 $phasekit = Join-Path (Split-Path -Parent $PSScriptRoot) 'bin' 'phasekit.ps1'
 
+# Task Scheduler is the Windows answer to "run this when the machine comes back". The
+# other platforms have their own, and they are different enough that wrapping all three
+# behind one script would hide which one you actually got. Say so and point at the
+# equivalent, rather than failing on a missing cmdlet three lines further down.
+if (-not $IsWindows) {
+    Write-Host ''
+    Write-Host 'This registers a Windows Task Scheduler task, and this is not Windows.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'The equivalent, with the same guard so it does nothing once the sequence has finished:'
+    Write-Host ''
+    Write-Host '  macOS   — a launchd agent with RunAtLoad, in ~/Library/LaunchAgents'
+    Write-Host '  Linux   — a systemd --user unit with WantedBy=default.target,'
+    Write-Host '            or  @reboot  in crontab'
+    Write-Host ''
+    Write-Host 'The command either should run, with your own paths:'
+    Write-Host ''
+    Write-Host '  pwsh -NoProfile -Command "if (Test-Path <logDir>/auto-finished.txt) { exit 0 };' -ForegroundColor Cyan
+    Write-Host '                            & <phasekit>/bin/phasekit.ps1 auto -Push -Detach -NoFollow -Config <config>"' -ForegroundColor Cyan
+    Write-Host ''
+    exit 1
+}
+
 function Get-Task { Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue }
 
 if ($Status) {
