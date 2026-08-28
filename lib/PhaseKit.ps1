@@ -420,7 +420,7 @@ function Wait-UntilDeadline {
         if ($left -le 0) { break }
 
         if (((Get-Date) - $lastNote).TotalMinutes -ge 15) {
-            $note = "  ... still waiting out the usage limit, {0:N0} min to go (resuming ~{1})" -f ($left / 60), $Deadline.ToString('HH:mm')
+            $note = "$script:NoteMarker ... still waiting out the usage limit, {0:N0} min to go (resuming ~{1})" -f ($left / 60), $Deadline.ToString('HH:mm')
             Write-Host $note -ForegroundColor DarkGray
             if ($LogPath) { Add-Content -LiteralPath $LogPath -Value $note }
             $lastNote = Get-Date
@@ -430,7 +430,64 @@ function Wait-UntilDeadline {
     }
 }
 
-$script:LimitPattern = 'usage limit|session limit|weekly limit|rate limit|resets at|resets \d|429'
+$script:LimitPattern = 'usage limit|session limit|weekly limit|rate limit|resets at|resets \d|\b429\b'
+
+# phasekit writes its own notes into the agent's log so `logs -Follow` shows a run that
+# is waiting rather than a log that simply stopped. Those notes say "usage limit" — so
+# they must be recognisable, or the next retry reads the previous retry's note and
+# confirms itself: eight waits, four hours, on the strength of nothing but its own voice.
+$script:NoteMarker = '[phasekit]'
+
+# A dropped link is not a spent allowance and not a question to the owner: it is the one
+# failure worth retrying at once. Kept narrow on purpose — anything not listed here still
+# stops the run and is shown, because a sequence that retries an unknown failure eight
+# times hides it eight times.
+$script:TransientPattern = 'Connection closed mid-response|connection error|ECONNRESET|ETIMEDOUT|EPIPE|socket hang up|Overloaded|\b(502|503|504|529)\b|Internal server error'
+
+function Get-LimitSignal {
+    <#
+        The log is JSONL, and most of its bulk is tool results — whatever the agent read,
+        grepped or printed. Matching the limit pattern against that raw text asks a file
+        the agent happened to open whether the account is out of allowance. It once said
+        yes: a grep of docs/audit.md scrolled past a `429` and a crashed run
+        ("Connection closed mid-response") was filed as a usage limit and slept half an
+        hour before resuming.
+
+        So match only against text that speaks for the runtime, never for the workload:
+        lines the CLI wrote outside the JSON stream (its own limit banner lands here),
+        the `result` field of a result record, and assistant prose. Tool results, tool
+        inputs and thinking blocks are excluded — that is where quoted numbers live.
+    #>
+    param([Parameter(Mandatory)] [string] $LogTail)
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($line in ($LogTail -split "`n")) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed) { continue }
+
+        # phasekit's own notes are not evidence about the account — skip them first.
+        if ($trimmed.StartsWith($script:NoteMarker)) { continue }
+
+        # Not JSON: the CLI's own stderr, where its limit banner lands.
+        if (-not $trimmed.StartsWith('{')) { $parts.Add($trimmed); continue }
+
+        try { $d = $trimmed | ConvertFrom-Json } catch { $parts.Add($trimmed); continue }
+
+        switch ($d.type) {
+            'result' {
+                if ($d.result) { $parts.Add([string] $d.result) }
+            }
+            'assistant' {
+                foreach ($c in $d.message.content) {
+                    if ($c.type -eq 'text' -and $c.text) { $parts.Add([string] $c.text) }
+                }
+            }
+        }
+    }
+
+    return ($parts -join "`n")
+}
 
 function Get-ResetWaitMinutes {
     <#
@@ -611,12 +668,16 @@ function Invoke-AgentWithLimitRetry {
 
         # -Tail and -Raw are mutually exclusive on Get-Content, so join the lines by hand.
         $tail = if (Test-Path $LogPath) { (Get-Content -LiteralPath $LogPath -Tail 40) -join "`n" } else { '' }
+        $signal = Get-LimitSignal -LogTail $tail
 
-        if ($tail -notmatch $script:LimitPattern) {
+        $isLimit = $signal -match $script:LimitPattern
+        $isTransient = -not $isLimit -and $signal -match $script:TransientPattern
+
+        if (-not $isLimit -and -not $isTransient) {
             Write-Host ''
-            Write-Host "Stopped for a reason that is not a usage limit (exit $exit)." -ForegroundColor Red
+            Write-Host "Stopped for a reason that is neither a usage limit nor a dropped connection (exit $exit)." -ForegroundColor Red
             Write-Host 'Last lines of the log — an agent that stops to ask a question looks like this too:' -ForegroundColor Red
-            Write-Host $tail
+            Write-Host $(if ($signal) { $signal } else { $tail })
             Write-Host ''
             Write-Host "Full log: $LogPath" -ForegroundColor Red
             Write-Host "Answer it without losing its context:  phasekit reply $Phase -Text `"your answer`"" -ForegroundColor Cyan
@@ -624,12 +685,23 @@ function Invoke-AgentWithLimitRetry {
         }
 
         $attempt++
-        $announced = Get-ResetWaitMinutes -LogTail $tail
-        $wait = if ($announced) { $announced } else { $Config.waitMinutes }
-        $source = if ($announced) { 'until the announced reset' } else { 'fixed interval' }
-        $resumeAt = (Get-Date).AddMinutes($wait).ToString('HH:mm')
 
-        $note = "Usage limit reached. Waiting $wait min ($source), resuming at ~$resumeAt (attempt $attempt of $($Config.maxRetries))."
+        if ($isTransient) {
+            # The link dropped, not the allowance. Waiting out a usage-limit interval here
+            # would idle half an hour over a fault that is usually gone in seconds, and
+            # stopping would hand an unattended sequence back to someone who is asleep.
+            # Back off briefly and resume: the session id is pinned, so nothing is re-done.
+            $wait = [Math]::Min(5, $attempt)
+            $resumeAt = (Get-Date).AddMinutes($wait).ToString('HH:mm')
+            $note = "$script:NoteMarker Connection dropped. Waiting $wait min, resuming at ~$resumeAt (attempt $attempt of $($Config.maxRetries))."
+        }
+        else {
+            $announced = Get-ResetWaitMinutes -LogTail $signal
+            $wait = if ($announced) { $announced } else { $Config.waitMinutes }
+            $source = if ($announced) { 'until the announced reset' } else { 'fixed interval' }
+            $resumeAt = (Get-Date).AddMinutes($wait).ToString('HH:mm')
+            $note = "$script:NoteMarker Usage limit reached. Waiting $wait min ($source), resuming at ~$resumeAt (attempt $attempt of $($Config.maxRetries))."
+        }
         Write-Host ''
         Write-Host $note -ForegroundColor Yellow
         # Into the log too, so `phasekit logs -Follow` shows a run that is waiting rather
