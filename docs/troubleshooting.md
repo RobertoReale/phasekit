@@ -210,3 +210,29 @@ $tail = (Get-Content $log -Tail 40) -join "`n"
 
 Worth knowing because the crash appears *inside* the code that was supposed to explain
 what went wrong, which makes it look like the runner itself is broken.
+
+## `the branch has no commits on it`, but the phase clearly did the work
+
+The agent reports a finished task, the gates are green, the tree is clean — and
+verification stops the sequence saying the phase branch is empty. It is empty. The
+commit went to the *other* repository.
+
+This only happens in the split layout, where the plan lives in its own notes repo
+beside the code repo. Most phases change code, so measuring a phase by the commits on
+its code branch works nearly always — until a task is purely a documentation task and
+lands entirely in the notes repo. Then the measurement is looking in a place the work
+was never going to be, and reports a success in the words of a failure.
+
+`phasekit` now marks both repositories when a phase starts: the `.base` file holds the
+code repo's HEAD on line one and the notes repo's on line two. A branch with no
+commits is only a problem when the notes repo has nothing new either. `merge` prints
+the notes commits in that case, so an empty branch reads as an answer rather than as
+something missing.
+
+The notes repo is found from the **plan's** directory, not from `workingDir` —
+`workingDir` is the common parent of the two checkouts and is usually not a repository
+at all, whereas the plan is by definition inside the notes repo.
+
+A run started before this existed has a one-line `.base` file, and is read the old way:
+an unmeasurable claim is not evidence. If you hit the stop on such a run, check the
+notes repo's log by hand before treating it as a failure.

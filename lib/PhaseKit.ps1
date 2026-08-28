@@ -578,6 +578,35 @@ function Get-MainBranch {
     throw 'Cannot work out the main branch. Set "mainBranch" in phasekit.json.'
 }
 
+function Get-NotesRepo {
+    <#
+        The working repository, when it is a different one from the code repository — the
+        plan-in-a-separate-notes-repo layout. Returns $null when they are the same repo,
+        or when workingDir is not a repo at all.
+
+        It matters because a phase's work does not have to land in the code repository. A
+        documentation task can be entirely a notes-repo task, and measuring it by commits
+        on the code branch reports a success as "the branch has no commits on it".
+    #>
+    param([Parameter(Mandatory)] $Config)
+
+    $root = { param($d)
+        if (-not $d -or -not (Test-Path $d)) { return $null }
+        $r = git -C $d rev-parse --show-toplevel 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $r) { return $null }
+        return (Resolve-Path $r.Trim()).Path
+    }
+
+    # Anchored on the plan, not on workingDir. In the split layout workingDir is the
+    # *common parent* of the two checkouts and is typically not a repository at all, while
+    # the plan is by definition inside the notes repo — so this is both the correct
+    # question and the one that has an answer.
+    $notes = & $root (Split-Path -Parent $Config.plan)
+    $code = & $root $Config.codeDir
+    if (-not $notes -or $notes -eq $code) { return $null }
+    return $notes
+}
+
 function Test-PhaseReady {
     <#
         Everything that must be true before a phase branch is allowed to become the truth.
@@ -615,7 +644,22 @@ function Test-PhaseReady {
             else { (git -C $Config.codeDir merge-base (Get-MainBranch -Config $Config) $branch).Trim() }
 
     $commits = @(git -C $Config.codeDir log --oneline "$base..$branch")
-    if ($commits.Count -eq 0) { $problems.Add('the branch has no commits on it') }
+
+    # No commits on the branch is usually a phase that produced nothing. It is not, when
+    # the plan lives in its own repository and the task was entirely a notes task: the
+    # work is real, it is just not in the code repository. Look there before calling it a
+    # failure, using the second line of the .base file — the notes HEAD as it was when the
+    # run started. Without that line (a run from before this existed) the old reading
+    # stands, because an unmeasurable claim is not evidence.
+    $notesCommits = @()
+    if ($commits.Count -eq 0) {
+        $notes = Get-NotesRepo -Config $Config
+        $notesBase = if (Test-Path $baseFile) { @(Get-Content -LiteralPath $baseFile)[1] }
+        if ($notes -and $notesBase) {
+            $notesCommits = @(git -C $notes log --oneline "$($notesBase.Trim())..HEAD" 2>$null)
+        }
+        if ($notesCommits.Count -eq 0) { $problems.Add('the branch has no commits on it') }
+    }
 
     # Every task belonging to this phase must be ticked. An unticked task with work behind
     # it is the same disagreement as a ticked task with none — both mean the ledger is not
@@ -634,11 +678,12 @@ function Test-PhaseReady {
     }
 
     return [pscustomobject]@{
-        ok       = ($problems.Count -eq 0)
-        branch   = $branch
-        base     = $base
-        commits  = $commits
-        problems = $problems
+        ok           = ($problems.Count -eq 0)
+        branch       = $branch
+        base         = $base
+        commits      = $commits
+        notesCommits = $notesCommits
+        problems     = $problems
     }
 }
 

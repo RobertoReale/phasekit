@@ -268,7 +268,16 @@ function Assert-CleanTreeAndBranch {
     else { git -C $Config.codeDir checkout -b $branch | Out-Null }
 
     $base = (git -C $Config.codeDir rev-parse HEAD).Trim()
-    Set-Content -LiteralPath (Join-Path $Config.logDir ("phase-{0}.base" -f ($Phase -replace '[^\w.-]', '_'))) -Value $base
+
+    # Two lines: the code repo's HEAD, then the notes repo's, when the plan lives in one of
+    # its own. A phase can land all of its work in the notes repo — a documentation task
+    # does exactly that — and without this second mark there is nothing to measure it
+    # against, so verification reads a real success as an empty branch.
+    $lines = @($base)
+    $notes = Get-NotesRepo -Config $Config
+    if ($notes) { $lines += (git -C $notes rev-parse HEAD).Trim() }
+
+    Set-Content -LiteralPath (Join-Path $Config.logDir ("phase-{0}.base" -f ($Phase -replace '[^\w.-]', '_'))) -Value $lines
     return [pscustomobject]@{ name = $branch; base = $base }
 }
 
@@ -441,6 +450,12 @@ function Invoke-Merge {
     if ($report.commits.Count -gt 0) {
         Write-Host "  $($report.commits.Count) commit(s) on the branch:" -ForegroundColor Cyan
         foreach ($c in $report.commits) { Write-Host "    $c" }
+        Write-Host ''
+    } elseif ($report.notesCommits.Count -gt 0) {
+        # Say where the work went, so an empty branch reads as the answer it is rather than
+        # as something missing.
+        Write-Host "  Nothing in the code repository — this phase landed in the notes repository:" -ForegroundColor Cyan
+        foreach ($c in $report.notesCommits) { Write-Host "    $c" }
         Write-Host ''
     }
 
