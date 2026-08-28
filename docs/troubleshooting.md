@@ -236,3 +236,35 @@ at all, whereas the plan is by definition inside the notes repo.
 A run started before this existed has a one-line `.base` file, and is read the old way:
 an unmeasurable claim is not evidence. If you hit the stop on such a run, check the
 notes repo's log by hand before treating it as a failure.
+
+## `auto` wants to redo the whole plan, or skips everything
+
+Both symptoms come from the same place: the plan file is gone. Deleting a finished
+plan is the last task of this workflow, so this is a state the tool has to survive.
+
+`Test-TargetDone` normally needs two things to agree — every ledger box ticked, and
+the branch merged. With no ledger there is nothing to agree with, so the repository
+alone decides, and one rule flips: a **missing branch** means "merged and tidied away"
+when a ledger confirms it, and "never started" when nothing does. With no plan, no
+branch now means not done. Redoing finished work costs a session; skipping unfinished
+work builds everything after it on sand.
+
+If you hit this on an older checkout, the symptom was `auto` starting again from the
+first target of the sequence.
+
+## A target that legitimately produces no commit
+
+Some targets do their work outside both repositories — retiring a repository on the
+host, publishing a release, flipping a setting. Verification would call that an empty
+branch and stop the sequence. Mark the entry instead:
+
+```json
+{ "target": "7.4", "allowNoCommits": true, "note": "archives the notes repo on GitHub" }
+```
+
+It is deliberately per-target and opt-in. Making it the default would remove the check
+that catches the far more common case: a phase that reported success and produced
+nothing.
+
+Naming targets with `-Targets` reuses their configured entries, so this flag, the
+per-target model, and the note all still apply when you rerun a single one by hand.

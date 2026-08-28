@@ -433,13 +433,13 @@ function Invoke-Merge {
         away; the point of the checks is that "merge it" stops being a decision you make
         while tired.
     #>
-    param([switch] $Quiet)
+    param([switch] $Quiet, [switch] $AllowNoCommits)
 
     if (-not $Phase) { throw 'Which phase? e.g.  phasekit merge 0' }
 
     $cfg = Get-PhaseKitConfig -Path $Config
     $main = Get-MainBranch -Config $cfg
-    $report = Test-PhaseReady -Config $cfg -Phase $Phase
+    $report = Test-PhaseReady -Config $cfg -Phase $Phase -AllowNoCommits:$AllowNoCommits
 
     Write-Host ''
     Write-Host "  Merging $($report.branch) into $main" -ForegroundColor Cyan
@@ -632,7 +632,7 @@ What to do: $Next
             continue
         }
 
-        $report = Test-PhaseReady -Config $cfg -Phase $target
+        $report = Test-PhaseReady -Config $cfg -Phase $target -AllowNoCommits:$item.allowNoCommits
         if (-not $report.ok) {
             Stop-Auto -Target $target `
                 -Why ($report.problems -join '; ') `
@@ -642,7 +642,7 @@ What to do: $Next
 
         # Last element, not the whole thing: if any callee ever leaks to the output stream
         # again, this reads the exit code rather than the noise in front of it.
-        $merged = @(Invoke-Merge -Quiet)[-1]
+        $merged = @(Invoke-Merge -Quiet -AllowNoCommits:$item.allowNoCommits)[-1]
         if ($merged -ne 0) {
             Stop-Auto -Target $target -Why 'the merge preconditions or the gates failed on the branch' `
                 -Next "phasekit merge $target   to see what blocked it"
@@ -654,6 +654,18 @@ What to do: $Next
             if ($LASTEXITCODE -ne 0) {
                 Stop-Auto -Target $target -Why 'push failed' -Next 'push by hand, then rerun phasekit auto'
                 return 1
+            }
+
+            # The notes repo carries the ledger and, for a documentation task, the whole
+            # output. Pushing only the code repo leaves that with no copy anywhere else.
+            $notes = Get-NotesRepo -Config $cfg
+            if ($notes -and (git -C $notes rev-parse --abbrev-ref '@{upstream}' 2>$null)) {
+                git -C $notes push | Out-Host
+                if ($LASTEXITCODE -ne 0) {
+                    Stop-Auto -Target $target -Why 'push of the notes repository failed' `
+                        -Next "git -C `"$notes`" push   by hand, then rerun phasekit auto"
+                    return 1
+                }
             }
         }
     }

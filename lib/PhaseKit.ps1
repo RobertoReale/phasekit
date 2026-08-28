@@ -175,7 +175,10 @@ function Build-PhasePrompt {
     }
 
     $what = if ($isTask) { "task $Phase" } else { "phase $Phase" }
-    $header = "You are executing $what of $planName, unattended, in a headless session.`n" +
+    # The last task in this workflow deletes the plan, so by the time it runs there is no
+    # plan to name. Naming one anyway sends the agent looking for a file that is not there.
+    $of = if (Test-Path $Config.plan) { " of $planName" } else { '' }
+    $header = "You are executing $what$of, unattended, in a headless session.`n" +
               "The instructions below are the prompt for it, copied verbatim from $promptsName.`n" +
               "Follow them exactly. Do not go beyond what they ask for.`n`n"
 
@@ -618,7 +621,12 @@ function Test-PhaseReady {
     #>
     param(
         [Parameter(Mandatory)] $Config,
-        [Parameter(Mandatory)] [string] $Phase
+        [Parameter(Mandatory)] [string] $Phase,
+
+        # For a target whose whole job is outside both repositories — retiring a
+        # repository on the host, say. Producing no commit is then the expected outcome,
+        # and only a target that says so in the config gets the exemption.
+        [switch] $AllowNoCommits
     )
 
     $branch = "$($Config.branchPrefix)$Phase"
@@ -658,7 +666,7 @@ function Test-PhaseReady {
         if ($notes -and $notesBase) {
             $notesCommits = @(git -C $notes log --oneline "$($notesBase.Trim())..HEAD" 2>$null)
         }
-        if ($notesCommits.Count -eq 0) { $problems.Add('the branch has no commits on it') }
+        if ($notesCommits.Count -eq 0 -and -not $AllowNoCommits) { $problems.Add('the branch has no commits on it') }
     }
 
     # Every task belonging to this phase must be ticked. An unticked task with work behind
@@ -764,7 +772,21 @@ function Get-AutoSequence {
         # survives being forwarded to a detached child process.
         $flat = @()
         foreach ($t in $Targets) { $flat += ($t -split ',' | Where-Object { $_.Trim() }) }
-        return @($flat | ForEach-Object { [pscustomobject]@{ target = $_.Trim(); model = $null; note = $null } })
+
+        # Naming a target on the command line says *which* to run, not that everything the
+        # config knows about it should be forgotten. Its model, its note and its
+        # allowNoCommits flag still apply.
+        $configured = @{}
+        foreach ($e in @($Config.autoSequence)) {
+            if ($e -is [string]) { $configured[$e] = [pscustomobject]@{ target = $e; model = $null; note = $null; allowNoCommits = $false } }
+            elseif ($e.target)   { $configured[$e.target] = [pscustomobject]@{ target = $e.target; model = $e.model; note = $e.note; allowNoCommits = [bool]$e.allowNoCommits } }
+        }
+
+        return @($flat | ForEach-Object {
+            $name = $_.Trim()
+            if ($configured.ContainsKey($name)) { $configured[$name] }
+            else { [pscustomobject]@{ target = $name; model = $null; note = $null; allowNoCommits = $false } }
+        })
     }
 
     if (-not $Config.autoSequence -or $Config.autoSequence.Count -eq 0) {
@@ -772,8 +794,8 @@ function Get-AutoSequence {
     }
 
     return @($Config.autoSequence | ForEach-Object {
-        if ($_ -is [string]) { [pscustomobject]@{ target = $_; model = $null; note = $null } }
-        else { [pscustomobject]@{ target = $_.target; model = $_.model; note = $_.note } }
+        if ($_ -is [string]) { [pscustomobject]@{ target = $_; model = $null; note = $null; allowNoCommits = $false } }
+        else { [pscustomobject]@{ target = $_.target; model = $_.model; note = $_.note; allowNoCommits = [bool]$_.allowNoCommits } }
     })
 }
 
@@ -789,17 +811,33 @@ function Test-TargetDone {
 
     $escaped = [regex]::Escape($Target)
     $boxes = @()
-    if (Test-Path $Config.plan) {
+    $hasPlan = Test-Path $Config.plan
+    if ($hasPlan) {
         foreach ($line in Get-Content -LiteralPath $Config.plan) {
             # "4.2" matches its own box; a phase like "4" matches every 4.x box.
             if ($line -match "^\s*- \[( |x)\]\s+$escaped(\.|\s)") { $boxes += $Matches[1] }
         }
     }
-    if ($boxes.Count -eq 0) { return $false }
-    if ($boxes -contains ' ') { return $false }
+
+    # No plan file at all is not the same as an unticked box. A plan is deleted once it is
+    # finished — that is the last task in this very workflow — and reading its absence as
+    # "nothing has been done" would have `auto` redo the entire refactor from the first
+    # target. With no ledger there is no ledger-versus-repository disagreement to catch,
+    # so the repository alone decides.
+    if ($hasPlan) {
+        if ($boxes.Count -eq 0) { return $false }
+        if ($boxes -contains ' ') { return $false }
+    }
 
     $branch = "$($Config.branchPrefix)$Target"
-    if (-not (git -C $Config.codeDir rev-parse --verify --quiet $branch)) { return $true }
+    if (-not (git -C $Config.codeDir rev-parse --verify --quiet $branch)) {
+        # With a ledger, a missing branch means merged and tidied away — the tick is the
+        # evidence and the branch was only ever a working area. With no ledger there is no
+        # evidence at all, and a target that was never started looks exactly the same. So
+        # the two cases part here: no plan, no branch, not done. Redoing finished work
+        # wastes a session; skipping unfinished work builds everything after it on sand.
+        return $hasPlan
+    }
 
     $main = Get-MainBranch -Config $Config
     git -C $Config.codeDir merge-base --is-ancestor $branch $main 2>$null
