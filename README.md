@@ -18,9 +18,28 @@ bad run look like a good one.
 
 ## Requirements
 
-- PowerShell 7+
+- PowerShell 7+ (Windows, macOS or Linux)
 - `claude` on `PATH` ([Claude Code](https://claude.com/claude-code))
 - git
+
+### Platform support
+
+Running phases, verifying, merging, waiting out usage limits, detaching and following
+logs work the same everywhere. Two things are the operating system's to provide, and
+phasekit uses whatever is there:
+
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| Keep the machine awake during a long wait | `SetThreadExecutionState` | `caffeinate -s` | `systemd-inhibit` |
+| Notify when a sequence ends or stops | sound + tray balloon | `afplay` + `osascript` | terminal bell + `notify-send` |
+
+Neither is required. If the mechanism is missing, phasekit says so once and carries on —
+a machine with no notification daemon must not take a run down, and a run that cannot
+prevent sleep is still a run. The terminal bell is the fallback everywhere, which is
+also the one that survives ssh.
+
+`tools/resume-at-logon.ps1` registers a **Windows** Task Scheduler task. Elsewhere it
+refuses and prints the launchd or systemd equivalent to set up by hand.
 
 ## Install
 

@@ -219,11 +219,16 @@ function Start-Detached {
     $pwsh = (Get-Process -Id $PID).Path
     $quote = { param($a) if ($a -match '\s') { '"' + $a + '"' } else { $a } }
 
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (& $quote $PSCommandPath)) +
+    # -ExecutionPolicy and -WindowStyle are Windows concepts. pwsh elsewhere has no
+    # execution policy to bypass and no window to hide, and rejects both rather than
+    # ignoring them, which would turn detaching into an instant crash.
+    $policy = if ($IsWindows) { @('-ExecutionPolicy', 'Bypass') } else { @() }
+    $argList = @('-NoProfile') + $policy + @('-File', (& $quote $PSCommandPath)) +
                ($ForwardArgs | ForEach-Object { & $quote $_ })
 
     $env:PHASEKIT_DETACHED = '1'
-    $proc = Start-Process -FilePath $pwsh -ArgumentList $argList -WindowStyle Hidden -PassThru
+    $proc = if ($IsWindows) { Start-Process -FilePath $pwsh -ArgumentList $argList -WindowStyle Hidden -PassThru }
+            else { Start-Process -FilePath $pwsh -ArgumentList $argList -PassThru }
     $env:PHASEKIT_DETACHED = $null
 
     # A child that dies instantly is the normal failure here, and it dies silently

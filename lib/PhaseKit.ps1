@@ -224,18 +224,37 @@ function Get-ResumeArgs {
 # Telling the person
 # ---------------------------------------------------------------------------
 
+function ConvertTo-AppleScriptLiteral {
+    <#
+        Escapes a string for use inside a double-quoted AppleScript literal, which is
+        source code by the time `osascript -e` sees it. A backslash must be doubled first,
+        or the backslash added in front of a quote would itself be escaped by a backslash
+        that was already there.
+    #>
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Text)
+
+    # .Replace, not -replace: its arguments are literal strings, so there is no second
+    # escaping layer to reason about. A backslash written as a regex would have to be
+    # doubled on the pattern side and not on the replacement side, which is exactly the
+    # asymmetry that makes this kind of code wrong on the first try.
+    return $Text.Replace('\', '\\').Replace('"', '\"')
+}
+
 function Send-PhaseKitNotice {
     <#
         Sound and a desktop notice, for the two moments that are worth interrupting
         someone: the sequence finished, or it stopped and needs an answer.
 
         The second is the one that pays for this. A stopped sequence costs nothing to fix
-        and everything to not notice — the run that waited three hours for a person to
+        and everything to not notice - the run that waited three hours for a person to
         walk past a terminal is the most expensive thing this tool can do.
 
-        Sound first and separately from the notice: a balloon can be suppressed by focus
-        assist or a full-screen window, and neither is a reason to fail silently. Every
-        part is best-effort — a machine with no audio device must not take a run down.
+        Sound first and separately from the notice: a notification can be suppressed by
+        do-not-disturb or a full-screen window, and neither is a reason to fail silently.
+        Every part is best-effort on every platform - a machine with no audio device, no
+        notification daemon, or no desktop at all must not take a run down. The terminal
+        bell is the last resort, and it is the one that works over ssh, which is where an
+        unattended run often actually lives.
     #>
     param(
         [Parameter(Mandatory)] [string] $Title,
@@ -243,28 +262,49 @@ function Send-PhaseKitNotice {
         [ValidateSet('done', 'attention')] [string] $Kind = 'done'
     )
 
-    try {
-        foreach ($i in 1..3) {
-            if ($Kind -eq 'attention') { [System.Media.SystemSounds]::Exclamation.Play() }
-            else { [System.Media.SystemSounds]::Asterisk.Play() }
-            Start-Sleep -Milliseconds 800
-        }
-    } catch { }
+    $bell = { foreach ($i in 1..3) { [Console]::Out.Write("`a"); Start-Sleep -Milliseconds 800 } }
 
     try {
-        Add-Type -AssemblyName System.Windows.Forms
-        Add-Type -AssemblyName System.Drawing
-        $tray = New-Object System.Windows.Forms.NotifyIcon
-        $tray.Icon = [System.Drawing.SystemIcons]::Information
-        $tray.Visible = $true
-        $tray.BalloonTipTitle = $Title
-        $tray.BalloonTipText = $Message
-        $tray.BalloonTipIcon = if ($Kind -eq 'attention') { 'Warning' } else { 'Info' }
-        $tray.ShowBalloonTip(30000)
-        # The notice is drawn by this process; disposing immediately takes it away again.
-        Start-Sleep -Seconds 12
-        $tray.Visible = $false
-        $tray.Dispose()
+        if ($IsWindows) {
+            foreach ($i in 1..3) {
+                if ($Kind -eq 'attention') { [System.Media.SystemSounds]::Exclamation.Play() }
+                else { [System.Media.SystemSounds]::Asterisk.Play() }
+                Start-Sleep -Milliseconds 800
+            }
+        } elseif ($IsMacOS -and (Get-Command afplay -ErrorAction SilentlyContinue)) {
+            $sound = if ($Kind -eq 'attention') { '/System/Library/Sounds/Sosumi.aiff' }
+                     else { '/System/Library/Sounds/Glass.aiff' }
+            foreach ($i in 1..3) { & afplay $sound 2>$null; Start-Sleep -Milliseconds 200 }
+        } else {
+            & $bell
+        }
+    } catch { try { & $bell } catch { } }
+
+    try {
+        if ($IsWindows) {
+            Add-Type -AssemblyName System.Windows.Forms
+            Add-Type -AssemblyName System.Drawing
+            $tray = New-Object System.Windows.Forms.NotifyIcon
+            $tray.Icon = [System.Drawing.SystemIcons]::Information
+            $tray.Visible = $true
+            $tray.BalloonTipTitle = $Title
+            $tray.BalloonTipText = $Message
+            $tray.BalloonTipIcon = if ($Kind -eq 'attention') { 'Warning' } else { 'Info' }
+            $tray.ShowBalloonTip(30000)
+            # The notice is drawn by this process; disposing immediately takes it away again.
+            Start-Sleep -Seconds 12
+            $tray.Visible = $false
+            $tray.Dispose()
+        } elseif ($IsMacOS -and (Get-Command osascript -ErrorAction SilentlyContinue)) {
+            # Both strings reach AppleScript as source, so an unescaped quote in a stop
+            # reason would close the literal and the rest would be read as code.
+            & osascript -e "display notification `"$(ConvertTo-AppleScriptLiteral $Message)`" with title `"$(ConvertTo-AppleScriptLiteral $Title)`"" 2>$null
+        } elseif (Get-Command notify-send -ErrorAction SilentlyContinue) {
+            # notify-send takes its arguments as arguments, so nothing needs escaping - but
+            # a leading dash would be read as an option, hence --.
+            $urgency = if ($Kind -eq 'attention') { 'critical' } else { 'normal' }
+            & notify-send --urgency=$urgency --expire-time=30000 -- $Title $Message 2>$null
+        }
     } catch { }
 }
 
@@ -278,32 +318,81 @@ function Set-MachineAwake {
     <#
         Keeps the machine from suspending for as long as an unattended run is in flight.
 
-        A sequence that waits three hours for a usage limit is exactly the workload
-        Windows decides is idle, and a suspended machine runs nothing. The display is
-        deliberately left alone: this asks the system to stay up, not the screen to stay
-        on. Nested callers are counted, so a run inside a sequence releasing the request
-        does not let the machine sleep under the rest of the sequence.
+        A sequence that waits three hours for a usage limit is exactly the workload an
+        operating system decides is idle, and a suspended machine runs nothing. The
+        display is deliberately left alone everywhere: this asks the system to stay up,
+        not the screen to stay on. Nested callers are counted, so a run inside a sequence
+        releasing the request does not let the machine sleep under the rest of it.
+
+        Each platform has its own mechanism and none of them is required. A machine that
+        offers no way to ask is not a reason to fail: the run proceeds, and sleeps if the
+        power settings say so. Say so once rather than silently, so nobody is surprised
+        by a wait that died overnight.
     #>
     param([switch] $Off)
 
-    if (-not ('PhaseKit.Power' -as [type])) {
-        Add-Type -Namespace PhaseKit -Name Power -MemberDefinition @'
-[DllImport("kernel32.dll", SetLastError = true)]
-public static extern uint SetThreadExecutionState(uint esFlags);
-'@
-    }
-
-    $ES_CONTINUOUS = [uint32] '0x80000000'
-    $ES_SYSTEM_REQUIRED = [uint32] '0x00000001'
-
     if ($Off) {
         $script:AwakeDepth = [Math]::Max(0, $script:AwakeDepth - 1)
-        if ($script:AwakeDepth -eq 0) { [void][PhaseKit.Power]::SetThreadExecutionState($ES_CONTINUOUS) }
+        if ($script:AwakeDepth -gt 0) { return }
+
+        if ($IsWindows) {
+            try { [void][PhaseKit.Power]::SetThreadExecutionState([uint32] '0x80000000') } catch { }
+        } elseif ($script:AwakeProcess) {
+            # macOS and Linux hold the request in a child process; ending it releases it.
+            try { Stop-Process -Id $script:AwakeProcess -Force -ErrorAction Stop } catch { }
+            $script:AwakeProcess = $null
+        }
         return
     }
 
     $script:AwakeDepth++
-    [void][PhaseKit.Power]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED)
+    if ($script:AwakeDepth -gt 1) { return }
+
+    if ($IsWindows) {
+        try {
+            if (-not ('PhaseKit.Power' -as [type])) {
+                Add-Type -Namespace PhaseKit -Name Power -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern uint SetThreadExecutionState(uint esFlags);
+'@
+            }
+            $ES_CONTINUOUS = [uint32] '0x80000000'
+            $ES_SYSTEM_REQUIRED = [uint32] '0x00000001'
+            [void][PhaseKit.Power]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED)
+        } catch {
+            Write-Host '  Could not ask Windows to stay awake - a long wait may be cut short by sleep.' -ForegroundColor DarkYellow
+        }
+        return
+    }
+
+    # `caffeinate -s` and `systemd-inhibit` both hold the request for as long as the
+    # process they wrap lives, so the idle child process IS the request. Both are asked
+    # for the system and not the display, matching what the Windows flag does.
+    $holder = if ($IsMacOS) {
+        @{ exe = 'caffeinate'; args = @('-s', '-w', $PID) }
+    } elseif ($IsLinux) {
+        @{ exe = 'systemd-inhibit'; args = @('--what=idle:sleep', '--who=phasekit',
+                                             '--why=unattended run', '--mode=block',
+                                             'sleep', 'infinity') }
+    } else { $null }
+
+    if (-not $holder -or -not (Get-Command $holder.exe -ErrorAction SilentlyContinue)) {
+        if (-not $script:AwakeWarned) {
+            $what = if ($holder) { "$($holder.exe) is not installed" } else { 'this platform offers no way to ask' }
+            Write-Host "  Cannot keep the machine awake ($what). A long wait may be cut short by sleep." -ForegroundColor DarkYellow
+            $script:AwakeWarned = $true
+        }
+        return
+    }
+
+    try {
+        # No -WindowStyle: this branch only ever runs off Windows, where Start-Process
+        # rejects that parameter outright rather than ignoring it.
+        $p = Start-Process -FilePath $holder.exe -ArgumentList $holder.args -PassThru -ErrorAction Stop
+        $script:AwakeProcess = $p.Id
+    } catch {
+        Write-Host "  $($holder.exe) would not start - a long wait may be cut short by sleep." -ForegroundColor DarkYellow
+    }
 }
 
 function Wait-UntilDeadline {
