@@ -167,11 +167,24 @@ function Build-PhasePrompt {
         }
     }
 
+    # Where the files actually are. A prompt block says "Read CLAUDE.md and PLAN.md" —
+    # bare names, which the agent resolves against its working directory. In the split
+    # layout that directory is the common parent of the two repositories and holds
+    # neither file, so every task opened by reading two paths that do not exist and then
+    # spent turns hunting for them. Naming the full path costs one line and removes the
+    # hunt; it also keeps a same-named file in the working directory from winning.
+    $whereLines = New-Object System.Collections.Generic.List[string]
+    if (Test-Path $Config.plan) { $whereLines.Add("  $planName is at $($Config.plan)") }
+    $whereLines.Add("  $promptsName is at $($Config.prompts)")
+    $whereLines.Add("  the code repository is $($Config.codeDir)")
+    $where = "Paths, because your working directory is not where these files live:`n" +
+             ($whereLines -join "`n") + "`n`n"
+
     if (-not $block) {
         # No block for this phase: fall back to pointing at the file. Say so loudly,
         # because a missing block is usually a typo in the phase id, not a design choice.
         Write-Host "No '## Phase $Phase' block in $promptsName — falling back to a pointer prompt." -ForegroundColor Yellow
-        return "Read $planName and $promptsName, then carry out the Phase $Phase prompt from $promptsName exactly as it is written there, including its CHECK FIRST step. Do not go beyond that phase."
+        return $where + "Read $planName and $promptsName, then carry out the Phase $Phase prompt from $promptsName exactly as it is written there, including its CHECK FIRST step. Do not go beyond that phase."
     }
 
     $what = if ($isTask) { "task $Phase" } else { "phase $Phase" }
@@ -182,7 +195,7 @@ function Build-PhasePrompt {
               "The instructions below are the prompt for it, copied verbatim from $promptsName.`n" +
               "Follow them exactly. Do not go beyond what they ask for.`n`n"
 
-    return $header + $block
+    return $header + $where + $block
 }
 
 # ---------------------------------------------------------------------------
