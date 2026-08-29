@@ -755,6 +755,62 @@ function Get-MainBranch {
     throw 'Cannot work out the main branch. Set "mainBranch" in phasekit.json.'
 }
 
+function Invoke-GitPushWithRetry {
+    <#
+        A push during an unattended run, retried when the failure is the network
+        and refused immediately when it is a decision.
+
+        The two are not the same thing and must not share an outcome. A dropped
+        connection or a momentarily unreachable host is worth another attempt in
+        fifteen seconds; it cost an entire 32-target sequence once, stopped at the
+        first task with "push failed" while the very next `git push` by hand
+        succeeded. A rejected push is the opposite: the remote has moved, or the
+        branch is protected, or the credentials are gone. Retrying that is at best
+        noise and at worst the beginning of an argument with a diverged remote
+        that only a person should settle — so it stops on the first answer.
+
+        Returns the exit code as the ONLY thing written to the output stream:
+        everything the user reads goes through Write-Host. Read it at the call
+        site as @(Invoke-GitPushWithRetry ...)[-1], the way the merge result is.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $RepoDir,
+        [int] $MaxAttempts = 4
+    )
+
+    # Everything here is a decision, a misconfiguration or a missing credential:
+    # the second attempt fails exactly like the first, so a retry only delays the
+    # report. "Could not resolve host" is deliberately NOT in this list — a name
+    # that will not resolve now often resolves a minute later, which is the whole
+    # case this retry exists for.
+    $refused = 'rejected|non-fast-forward|fetch first|protected branch|pre-receive hook declined|' +
+               'Permission denied|Authentication failed|could not read Username|' +
+               'has no upstream branch|No configured push destination|src refspec|Repository not found|' +
+               'does not appear to be a git repository'
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $out = (git -C $RepoDir push 2>&1 | Out-String)
+        $code = $LASTEXITCODE
+        if ($out.Trim()) { Write-Host $out.TrimEnd() }
+        if ($code -eq 0) { return 0 }
+
+        if ($out -match $refused) {
+            Write-Host '  The remote refused the push. Not retrying: this needs a person.' -ForegroundColor Yellow
+            return $code
+        }
+        if ($attempt -eq $MaxAttempts) {
+            Write-Host ("  Push failed {0} times; giving up." -f $MaxAttempts) -ForegroundColor Yellow
+            return $code
+        }
+
+        $wait = 15 * $attempt
+        Write-Host ("  Push failed (attempt {0} of {1}) and the reason looks transient; retrying in {2}s." `
+                    -f $attempt, $MaxAttempts, $wait) -ForegroundColor Yellow
+        Start-Sleep -Seconds $wait
+    }
+    return 1
+}
+
 function Get-NotesRepo {
     <#
         The working repository, when it is a different one from the code repository — the

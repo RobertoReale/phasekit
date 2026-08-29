@@ -655,9 +655,10 @@ What to do: $Next
         }
 
         if ($Push) {
-            git -C $cfg.codeDir push | Out-Host
-            if ($LASTEXITCODE -ne 0) {
-                Stop-Auto -Target $target -Why 'push failed' -Next 'push by hand, then rerun phasekit auto'
+            $pushed = @(Invoke-GitPushWithRetry -RepoDir $cfg.codeDir)[-1]
+            if ($pushed -ne 0) {
+                Stop-Auto -Target $target -Why 'push failed, and retrying did not help' `
+                    -Next "git -C `"$($cfg.codeDir)`" push   to see what the remote says, then rerun phasekit auto"
                 return 1
             }
 
@@ -665,10 +666,10 @@ What to do: $Next
             # output. Pushing only the code repo leaves that with no copy anywhere else.
             $notes = Get-NotesRepo -Config $cfg
             if ($notes -and (git -C $notes rev-parse --abbrev-ref '@{upstream}' 2>$null)) {
-                git -C $notes push | Out-Host
-                if ($LASTEXITCODE -ne 0) {
-                    Stop-Auto -Target $target -Why 'push of the notes repository failed' `
-                        -Next "git -C `"$notes`" push   by hand, then rerun phasekit auto"
+                $notesPushed = @(Invoke-GitPushWithRetry -RepoDir $notes)[-1]
+                if ($notesPushed -ne 0) {
+                    Stop-Auto -Target $target -Why 'push of the notes repository failed, and retrying did not help' `
+                        -Next "git -C `"$notes`" push   to see what the remote says, then rerun phasekit auto"
                     return 1
                 }
             }
