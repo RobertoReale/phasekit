@@ -967,9 +967,23 @@ function Get-AutoSequence {
         throw 'Nothing to run. Add "autoSequence" to phasekit.json, or pass -Targets 4.2,4.3'
     }
 
+    $i = -1
     return @($Config.autoSequence | ForEach-Object {
+        $i++
         if ($_ -is [string]) { [pscustomobject]@{ target = $_; model = $null; note = $null; allowNoCommits = $false } }
-        else { [pscustomobject]@{ target = $_.target; model = $_.model; note = $_.note; allowNoCommits = [bool]$_.allowNoCommits } }
+        else {
+            # Say which entry is wrong and what it is missing. Without this the run
+            # walks on with an empty target and dies several frames later on
+            # "Cannot bind argument to parameter 'Target'", which names neither the
+            # file nor the entry — a config typo reported as an internal error.
+            if (-not $_.target) {
+                $keys = @($_.PSObject.Properties.Name) -join ', '
+                throw ("autoSequence entry $i has no `"target`". It has: $keys. " +
+                       'Each entry is either a bare string ("4.2") or an object with a ' +
+                       '"target" key ({ "target": "4.2", "note": "..." }).')
+            }
+            [pscustomobject]@{ target = $_.target; model = $_.model; note = $_.note; allowNoCommits = [bool]$_.allowNoCommits }
+        }
     })
 }
 
