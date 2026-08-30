@@ -612,11 +612,28 @@ What to do: $Next
         # did not finish — a reboot, a killed process, a machine that slept through the
         # usage-limit wait. Starting it over would throw away everything that session did
         # and, worse, refuse outright, because the half-done work makes the tree dirty.
+        # ...but a pin and a branch are only evidence of an ATTEMPT, not of work. A target
+        # that stopped before committing anything — a failed precondition, a question asked
+        # in its first minute — leaves both behind while having produced nothing. Resuming
+        # that session re-asks a question the world may have answered since, and does it on
+        # a branch still pointing where the main branch stood back then. Commits on the
+        # branch are the only honest evidence there is something to resume.
         $sessionFile = Get-SessionFile -Config $cfg -Phase $target
-        $started = (Test-Path $sessionFile) -and
-                   (git -C $cfg.codeDir rev-parse --verify --quiet "$($cfg.branchPrefix)$target")
+        $branchName = "$($cfg.branchPrefix)$target"
+        $branchExists = [bool] (git -C $cfg.codeDir rev-parse --verify --quiet $branchName)
+        $ownCommits = if ($branchExists) {
+            [int] (git -C $cfg.codeDir rev-list --count "$(Get-MainBranch -Config $cfg)..$branchName")
+        } else { 0 }
+
+        $started = (Test-Path $sessionFile) -and $branchExists -and $ownCommits -gt 0
         if ($started) {
             Write-Host "  $target was already started - resuming that session, not restarting the phase." -ForegroundColor Yellow
+        }
+        elseif (Test-Path $sessionFile) {
+            # Drop the pin: leaving it would make the next run take this same wrong turn,
+            # and there is no session worth keeping behind a branch with nothing on it.
+            Write-Host "  $target left a session behind but committed nothing - starting it fresh." -ForegroundColor Yellow
+            Remove-Item -LiteralPath $sessionFile -Force -ErrorAction SilentlyContinue
         }
 
         $exit = @(Invoke-Run -Mode $(if ($started) { 'continue' } else { 'run' }))[-1]
