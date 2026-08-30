@@ -398,7 +398,10 @@ function Invoke-Run {
         }
         'reply' {
             if ($File) {
-                if (-not (Test-Path $File)) { throw "Answer file not found: $File" }
+                if (-not (Test-Path $File)) {
+                    throw "Answer file not found: $File. Write the answer into that file first, " +
+                          'or pass the answer inline with -Text "...".'
+                }
                 $Text = Get-Content -LiteralPath $File -Raw
             }
             if (-not $Text) { throw 'Nothing to say. Pass -Text "..." or -File path.' }
@@ -679,7 +682,9 @@ What to do: $Next
         if (-not $report.ok) {
             Stop-Auto -Target $target `
                 -Why ($report.problems -join '; ') `
-                -Next "Read the log, then:  phasekit reply $target -File answer.txt   (or  phasekit continue $target)"
+                -Next ("Read the log, then answer in the same conversation:`n" +
+                       "    phasekit reply $target -Text `"your answer`"`n" +
+                       "  ...or -File <path> for a long one, or  phasekit continue $target  to just carry on.")
             return 1
         }
 
