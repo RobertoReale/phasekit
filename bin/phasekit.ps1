@@ -269,7 +269,28 @@ function Assert-CleanTreeAndBranch {
 
     $branch = "$($Config.branchPrefix)$Phase"
     $exists = git -C $Config.codeDir rev-parse --verify --quiet $branch
-    if ($exists) { git -C $Config.codeDir checkout $branch | Out-Null }
+    if ($exists) {
+        # A leftover branch that committed nothing is not work in progress, it is a
+        # stale starting point: it still points where the main branch stood when that
+        # attempt began. Checking it out verbatim runs the task against a tree missing
+        # everything merged since -- which is exactly how a target that stopped early,
+        # and was rerun hours later, would quietly build on superseded code and then
+        # merge that back.
+        #
+        # A branch that DOES carry commits is real half-done work. Leave it precisely
+        # where it is: moving it would throw that work away, and `phasekit continue`
+        # is the path that belongs to it.
+        $main = Get-MainBranch -Config $Config
+        $own = [int] (git -C $Config.codeDir rev-list --count "$main..$branch")
+        $behind = [int] (git -C $Config.codeDir rev-list --count "$branch..$main")
+        if ($own -eq 0 -and $behind -gt 0) {
+            Write-Host ("  {0} carried no commits and was {1} behind {2}; re-pointing it at {2}." `
+                        -f $branch, $behind, $main) -ForegroundColor DarkGray
+            git -C $Config.codeDir checkout $main | Out-Null
+            git -C $Config.codeDir branch -f $branch $main | Out-Null
+        }
+        git -C $Config.codeDir checkout $branch | Out-Null
+    }
     else { git -C $Config.codeDir checkout -b $branch | Out-Null }
 
     $base = (git -C $Config.codeDir rev-parse HEAD).Trim()
