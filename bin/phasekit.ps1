@@ -586,7 +586,36 @@ What to do: $Next
         }
     }
 
-    foreach ($item in $sequence) {
+    # Re-resolved on every iteration instead of walked once, so a target appended to
+    # autoSequence WHILE the run is going is picked up rather than silently skipped. That
+    # skip is not hypothetical: 0.4 was inserted mid-run, never ran, and the target after
+    # it then stopped the whole sequence because its predecessor carried no commits.
+    # `-Targets` is the exception - an explicit list belongs to the caller, and the config
+    # file must not be able to extend it behind their back.
+    $attempted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    while ($true) {
+        if (-not $Targets) {
+            try {
+                $fresh = Get-AutoSequence -Config (Get-PhaseKitConfig -Path $Config)
+                $known = @($sequence | ForEach-Object { $_.target })
+                $added = @($fresh | Where-Object { $known -notcontains $_.target })
+                if ($added.Count -gt 0) {
+                    Write-Host ''
+                    Write-Host ("  autoSequence grew while this run was walking it: {0}" -f `
+                                (($added | ForEach-Object { $_.target }) -join ', ')) -ForegroundColor Cyan
+                }
+                $sequence = $fresh
+            }
+            catch {
+                # A half-written config is a normal thing to catch mid-save. Keep walking the
+                # list this run started with rather than dying on somebody's open editor.
+                Write-Host (("  autoSequence could not be re-read ({0}) - continuing with the " +
+                             "sequence this run started with.") -f $_.Exception.Message) -ForegroundColor Yellow
+            }
+        }
+        $item = @($sequence | Where-Object { -not $attempted.Contains($_.target) })[0]
+        if (-not $item) { break }
+        [void] $attempted.Add($item.target)
         $target = $item.target
         if ($item.model) { $Model = $item.model } else { $Model = $null }
 
