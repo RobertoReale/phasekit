@@ -557,9 +557,15 @@ function Get-ResetWaitMinutes {
 $script:ContinuePrompt = @'
 Continue where you stopped. First re-read the progress ledger and run the gates to
 establish what actually landed before the interruption — check `git log` and `git status`,
-because a task can be half-done with edits on disk and no commit. Then carry on with the
-remaining tasks of this phase under the same rules. Do not redo work that is already
-committed, and do not start the next phase.
+because a task can be half-done with edits on disk and no commit. Then finish the target
+you were interrupted on, under the same rules, and nothing beyond it. Do not redo work
+that is already committed.
+
+Stop as soon as that target is committed and its ledger box is ticked. Do not start the
+next target, and do not create a branch for it: the runner merges this branch into the
+main branch before the next target begins, and a branch stacked on one that has not been
+merged yet leaves the runner verifying a branch it is no longer on, which stops the
+sequence and needs a person.
 '@
 
 function Write-StreamLine {
