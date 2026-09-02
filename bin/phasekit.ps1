@@ -1069,8 +1069,20 @@ function Show-Dashboard {
 
     # What is happening right now, which is the one line that changes between refreshes.
     $running = @($Frame.rows | Where-Object { $_.state -eq 'running' })
+    $merging = @($Frame.rows | Where-Object { $_.state -eq 'merging' })
     $stalled = @($Frame.rows | Where-Object { $_.state -eq 'stalled' })
-    if ($running.Count -gt 0) {
+    if ($merging.Count -gt 0 -and $running.Count -eq 0) {
+        # Committed, gates running, no log growing. Without this the longest gate in
+        # the list outlives the quiet window and every successful merge reads as a
+        # stall — which is how an alarm stops being read at all.
+        foreach ($r in $merging) {
+            Write-Host ('  now       ') -NoNewline
+            Write-Host ("{0,-6}" -f $r.target) -ForegroundColor Cyan -NoNewline
+            Write-Host ("{0,-44}" -f (Limit-Text $r.label 43)) -NoNewline
+            Write-Host ("committed, merging" -f $r.commits) -ForegroundColor Green
+        }
+    }
+    elseif ($running.Count -gt 0) {
         foreach ($r in $running) {
             $for = Format-Duration ($Frame.now - $r.latest).TotalMinutes
             Write-Host ('  now       ') -NoNewline

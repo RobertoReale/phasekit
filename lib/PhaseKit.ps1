@@ -1073,6 +1073,17 @@ function New-RepoSnapshot {
         if ($b) { $merged[$b.Trim()] = $true }
     }
 
+    # How many commits each unmerged branch is carrying. Only the unmerged ones are
+    # asked — usually one or two — because that is the whole question: a branch with
+    # commits that has not landed yet is work waiting on its gates, and a dashboard
+    # that could not tell it apart from an abandoned one would report every merge as
+    # a stall. The gates take longer than the window that decides a run is quiet.
+    $ahead = @{}
+    foreach ($b in $branches.Keys) {
+        if ($merged.ContainsKey($b)) { continue }
+        $ahead[$b] = [int] (git -C $Config.codeDir rev-list --count "$main..$b" 2>$null)
+    }
+
     $hasPlan = Test-Path $Config.plan
     $planLines = if ($hasPlan) { @(Get-Content -LiteralPath $Config.plan) } else { @() }
 
@@ -1080,6 +1091,7 @@ function New-RepoSnapshot {
         main      = $main
         branches  = $branches
         merged    = $merged
+        ahead     = $ahead
         hasPlan   = $hasPlan
         planLines = $planLines
     }
@@ -1335,9 +1347,13 @@ function Get-DashboardFrame {
         $log = if ($stats.Contains($name)) { $stats[$name] } else { $null }
         $done = Test-TargetDone -Config $Config -Target $item.target -Snapshot $snapshot
 
+        $branch = "$($Config.branchPrefix)$($item.target)"
+        $carries = if ($snapshot.ahead.ContainsKey($branch)) { $snapshot.ahead[$branch] } else { 0 }
+
         $state = 'queued'
         if ($done) { $state = 'done' }
         elseif ($log -and ($now - $log.last).TotalMinutes -lt $LiveMinutes) { $state = 'running' }
+        elseif ($carries -gt 0) { $state = 'merging' }
         elseif ($log) { $state = 'stalled' }
 
         $label = if ($labels.ContainsKey($item.target)) { $labels[$item.target] } else { '' }
@@ -1347,6 +1363,7 @@ function Get-DashboardFrame {
             label    = $label
             note     = $item.note
             state    = $state
+            commits  = $carries
             attempts = $(if ($log) { $log.attempts } else { 0 })
             minutes  = $(if ($log) { $log.minutes } else { $null })
             latest   = $(if ($log) { $log.latest } else { $null })
@@ -1413,6 +1430,6 @@ function Get-DashboardFrame {
         phases    = @($phases.Values)
         stop      = $stop
         finished  = (Test-Path $doneFile)
-        live      = [bool] @($rows | Where-Object { $_.state -eq 'running' })
+        live      = [bool] @($rows | Where-Object { $_.state -in @('running', 'merging') })
     }
 }
