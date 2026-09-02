@@ -20,6 +20,7 @@
     phasekit reply 0 -File answer.txt   # answer a question the agent stopped to ask
     phasekit continue 0                 # pick up an interrupted phase
     phasekit status                     # what actually landed
+    phasekit dashboard -Watch           # progress and time left, refreshing
     phasekit logs -Follow               # watch a detached run
 #>
 
@@ -59,6 +60,9 @@ param(
     # logs: tail the newest log as it grows.
     [switch] $Follow,
 
+    # dashboard: redraw every few seconds instead of printing once and returning.
+    [switch] $Watch,
+
     # -Detach normally hands the terminal straight back to following the run. This leaves
     # you at the prompt instead.
     [switch] $NoFollow,
@@ -79,6 +83,11 @@ $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $root 'lib' 'PhaseKit.ps1')
 
 $script:SessionId = $Session
+
+# How often `phasekit dashboard -Watch` redraws. Slower than it looks: a frame costs
+# three git processes and a directory listing, and nothing on it moves faster than a
+# target, which is measured in tens of minutes.
+$script:DashboardRefresh = 20
 
 # Paths the user typed are relative to the directory they typed them in. Resolve them
 # now, because a run later moves to workingDir — which for a two-repo layout is the
@@ -107,12 +116,14 @@ phasekit — plan-driven, unattended agent runs
   phasekit check <phase>           are the merge preconditions met? changes nothing
   phasekit merge <phase>           verify, show the commits, then merge into main
   phasekit status [<phase>]        branch, commits, dirty files, pinned session
+  phasekit dashboard [-Watch]      how far along, what is running, how much is left
   phasekit gates                   run the project's gates locally, no agent
   phasekit auto [-Push]            walk autoSequence unattended: run, verify, merge, next
   phasekit logs [-Follow]          follow the run, rolling over as each phase starts
 
 Options
   -Detach          run in a process that survives this terminal closing, then follow it
+  -Watch           dashboard: redraw every 20s instead of printing once
   -NoFollow        with -Detach, return to the prompt instead of following
   -DryRun          print the prompt and the claude command, run nothing
   -NoBranch        stay on the current branch
@@ -555,9 +566,12 @@ function Invoke-Auto {
 
     Write-Host ''
     Write-Host "  Unattended sequence — $($sequence.Count) target(s)" -ForegroundColor Cyan
+    # One reading for the whole listing. Asking per target was three git processes each,
+    # which a fifty-target sequence spends half a minute on before it starts working.
+    $listing = New-RepoSnapshot -Config $cfg
     foreach ($s in $sequence) {
         $m = if ($s.model) { $s.model } else { $cfg.model }
-        $done = Test-TargetDone -Config $cfg -Target $s.target
+        $done = Test-TargetDone -Config $cfg -Target $s.target -Snapshot $listing
         $mark = if ($done) { 'done' } else { '    ' }
         Write-Host ("    [{0}] {1,-6} {2}{3}" -f $mark, $s.target, $m, $(if ($s.note) { "   ($($s.note))" } else { '' }))
     }
@@ -836,6 +850,7 @@ function Invoke-Status {
     } else {
         Write-Host '  claude    : none running (a run waiting out a usage limit also looks like this)' -ForegroundColor DarkGray
     }
+    Write-Host '  How far along, and how much longer:  phasekit dashboard' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -1014,6 +1029,166 @@ if ($Detach -and -not $env:PHASEKIT_DETACHED) {
     exit (Invoke-Logs)
 }
 
+# ---------------------------------------------------------------------------
+# dashboard
+# ---------------------------------------------------------------------------
+
+function Get-ProgressBar {
+    param([int] $Done, [int] $Total, [int] $Width)
+    if ($Total -le 0) { return '' }
+    $filled = [int] [Math]::Round($Width * $Done / $Total)
+    if ($filled -gt $Width) { $filled = $Width }
+    return (([string][char]0x2588) * $filled) + (([string][char]0x2591) * ($Width - $filled))
+}
+
+function Limit-Text {
+    param([string] $Text, [int] $Width)
+    if (-not $Text) { return '' }
+    if ($Text.Length -le $Width) { return $Text }
+    return $Text.Substring(0, [Math]::Max(1, $Width - 1)) + [string][char]0x2026
+}
+
+function Show-Dashboard {
+    <#
+        One screen, and it fits in one screen on purpose. Anything that needs scrolling is
+        already `phasekit status` or `phasekit logs`; what belongs here is the three things
+        somebody walking past the machine wants: how far, what now, how much longer.
+    #>
+    param([Parameter(Mandatory)] $Frame)
+
+    $pct = if ($Frame.total -gt 0) { [int] [Math]::Round(100 * $Frame.doneCount / $Frame.total) } else { 0 }
+
+    Write-Host ''
+    Write-Host ("  phasekit  {0}" -f $Frame.name) -ForegroundColor Cyan -NoNewline
+    Write-Host ("{0,$([Math]::Max(1, 62 - $Frame.name.Length))}" -f $Frame.now.ToString('dd/MM HH:mm')) -ForegroundColor DarkGray
+
+    Write-Host ''
+    Write-Host ('  ' + (Get-ProgressBar -Done $Frame.doneCount -Total $Frame.total -Width 50)) -ForegroundColor Green -NoNewline
+    Write-Host ("   {0} / {1}   {2}%" -f $Frame.doneCount, $Frame.total, $pct)
+    Write-Host ''
+
+    # What is happening right now, which is the one line that changes between refreshes.
+    $running = @($Frame.rows | Where-Object { $_.state -eq 'running' })
+    $stalled = @($Frame.rows | Where-Object { $_.state -eq 'stalled' })
+    if ($running.Count -gt 0) {
+        foreach ($r in $running) {
+            $for = Format-Duration ($Frame.now - $r.latest).TotalMinutes
+            Write-Host ('  now       ') -NoNewline
+            Write-Host ("{0,-6}" -f $r.target) -ForegroundColor Cyan -NoNewline
+            Write-Host ("{0,-44}" -f (Limit-Text $r.label 43)) -NoNewline
+            Write-Host ("running {0}" -f $for) -ForegroundColor Green
+        }
+    }
+    elseif ($stalled.Count -gt 0) {
+        foreach ($r in $stalled) {
+            $quiet = Format-Duration ($Frame.now - $r.last).TotalMinutes
+            Write-Host ('  now       ') -NoNewline
+            Write-Host ("{0,-6}" -f $r.target) -ForegroundColor Yellow -NoNewline
+            Write-Host ("{0,-44}" -f (Limit-Text $r.label 43)) -NoNewline
+            Write-Host ("quiet for {0}" -f $quiet) -ForegroundColor Yellow
+        }
+    }
+    elseif ($Frame.remaining -gt 0) {
+        Write-Host '  now       nothing running' -ForegroundColor DarkGray
+    }
+
+    $next = @($Frame.rows | Where-Object { $_.state -eq 'queued' } | Select-Object -First 3 | ForEach-Object { $_.target })
+    if ($next.Count -gt 0) {
+        Write-Host ('  next      ' + ($next -join '  ')) -ForegroundColor DarkGray
+    }
+
+    # The estimate. Two numbers rather than one, because the gap between them IS the
+    # answer: when they are close the sequence is running freely, and when they are a
+    # factor of ten apart the thing to fix is the allowance, not the work.
+    $p = $Frame.pace
+    if ($p.samples -gt 0) {
+        Write-Host ''
+        Write-Host ('  pace      typical target {0}   quickest quarter {1}   ({2} measured)' -f `
+                    (Format-Duration $p.typicalMinutes), (Format-Duration $p.quickMinutes), $p.samples)
+        if ($null -ne $p.observedMinutes) {
+            Write-Host ('            {0} per target as it has actually gone, waits included' -f `
+                        (Format-Duration $p.observedMinutes)) -ForegroundColor DarkGray
+        }
+
+        Write-Host ''
+        if ($Frame.remaining -eq 0) {
+            Write-Host '  left      nothing — every target in the sequence has landed' -ForegroundColor Green
+        }
+        else {
+            $word = if ($Frame.remaining -eq 1) { 'target' } else { 'targets' }
+            Write-Host ('  left      {0} {1}' -f $Frame.remaining, $word) -NoNewline
+            Write-Host ('   ~{0} of work' -f (Format-Duration $p.workingLeft)) -ForegroundColor Green -NoNewline
+            if ($null -ne $p.observedLeft) {
+                Write-Host ('   ~{0} at the observed pace' -f (Format-Duration $p.observedLeft)) -ForegroundColor Yellow
+            } else { Write-Host '' }
+        }
+    }
+
+    if ($Frame.started) {
+        Write-Host ('  since     {0}   ({1} elapsed)' -f $Frame.started.ToString('dd/MM HH:mm'), (Format-Duration $Frame.elapsed)) -ForegroundColor DarkGray
+    }
+
+    # Per phase, so a long sequence reads as a shape rather than a number.
+    Write-Host ''
+    $line = '  '
+    foreach ($ph in $Frame.phases) {
+        $cell = '{0} {1} {2}/{3}   ' -f $ph.phase, (Get-ProgressBar -Done $ph.done -Total $ph.total -Width $ph.total), $ph.done, $ph.total
+        if (($line.Length + $cell.Length) -gt 78) { Write-Host $line.TrimEnd(); $line = '  ' }
+        $line += $cell
+    }
+    if ($line.Trim()) { Write-Host $line.TrimEnd() }
+
+    if ($Frame.finished) {
+        Write-Host ''
+        Write-Host '  FINISHED  the sequence walked every target it was given.' -ForegroundColor Green
+    }
+
+    if ($Frame.stop) {
+        Write-Host ''
+        $why = @($Frame.stop.text | Where-Object { $_ -match '^Why:' } | Select-Object -First 1)
+        $text = if ($why) { $why[0] } else { 'see auto-stopped.txt' }
+        if ($Frame.stop.stale) {
+            Write-Host ('  note      a stop marker from {0} is still lying around, but work has ' -f $Frame.stop.when.ToString('dd/MM HH:mm')) -ForegroundColor DarkGray
+            Write-Host '            happened since — the next sequence clears it.' -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host ('  STOPPED   {0}  {1}' -f $Frame.stop.when.ToString('dd/MM HH:mm'), (Limit-Text $text 60)) -ForegroundColor Red
+            Write-Host ('            full reason: {0}' -f (Join-Path $Frame.logDir 'auto-stopped.txt')) -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host ''
+}
+
+function Invoke-Dashboard {
+    <#
+        How far the sequence has got, what it is doing now, and roughly how much is left.
+
+        Everything on it is read fresh from the repository, the plan and the logs. The
+        dashboard writes nothing and remembers nothing, so it is equally honest about a
+        run it never saw start, one that died without saying so, and a target somebody
+        finished by hand between sequences.
+    #>
+    $cfg = Get-PhaseKitConfig -Path $Config
+
+    while ($true) {
+        $frame = Get-DashboardFrame -Config $cfg -Targets $Targets
+        $frame | Add-Member -NotePropertyName logDir -NotePropertyValue $cfg.logDir -Force
+
+        # Clearing the screen needs a real console. Redirected to a file or through a
+        # pipe there is no cursor to move, and Clear-Host takes the whole command down
+        # with it on the very first frame — so a redirected watch scrolls instead.
+        if ($Watch) { try { Clear-Host } catch { Write-Host '' } }
+        Show-Dashboard -Frame $frame
+
+        if (-not $Watch) { break }
+        Write-Host ('  refreshing every {0}s — Ctrl+C to stop watching, which stops nothing else.' -f $script:DashboardRefresh) -ForegroundColor DarkGray
+        Start-Sleep -Seconds $script:DashboardRefresh
+    }
+
+    return 0
+}
+
 switch ($Command.ToLowerInvariant()) {
     'init' { Invoke-Init; exit 0 }
     'merge' { exit (Invoke-Merge) }
@@ -1033,6 +1208,8 @@ switch ($Command.ToLowerInvariant()) {
     'reply' { Set-MachineAwake; try { exit (Invoke-Run -Mode 'reply') } finally { Set-MachineAwake -Off } }
     'continue' { Set-MachineAwake; try { exit (Invoke-Run -Mode 'continue') } finally { Set-MachineAwake -Off } }
     'status' { Invoke-Status; exit 0 }
+    'dashboard' { exit (Invoke-Dashboard) }
+    'dash' { exit (Invoke-Dashboard) }
     'gates' {
         $cfg = Get-PhaseKitConfig -Path $Config
         Write-Host ''

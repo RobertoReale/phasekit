@@ -1049,6 +1049,42 @@ function Get-AutoSequence {
     })
 }
 
+function New-RepoSnapshot {
+    <#
+        One reading of the two things that decide whether a target has landed: the plan's
+        ledger, and which branches exist and are already contained in the main branch.
+
+        Asking those questions one target at a time costs three git processes and a file
+        read each, which is invisible for a sequence of five and half a minute for a
+        sequence of fifty. Taken once and passed around, the same answers cost three
+        processes in total.
+    #>
+    param([Parameter(Mandatory)] $Config)
+
+    $main = Get-MainBranch -Config $Config
+
+    $branches = @{}
+    foreach ($b in @(git -C $Config.codeDir for-each-ref --format='%(refname:short)' "refs/heads/$($Config.branchPrefix)*")) {
+        if ($b) { $branches[$b.Trim()] = $true }
+    }
+
+    $merged = @{}
+    foreach ($b in @(git -C $Config.codeDir branch --merged $main --format='%(refname:short)')) {
+        if ($b) { $merged[$b.Trim()] = $true }
+    }
+
+    $hasPlan = Test-Path $Config.plan
+    $planLines = if ($hasPlan) { @(Get-Content -LiteralPath $Config.plan) } else { @() }
+
+    return [pscustomobject]@{
+        main      = $main
+        branches  = $branches
+        merged    = $merged
+        hasPlan   = $hasPlan
+        planLines = $planLines
+    }
+}
+
 function Test-TargetDone {
     <#
         Whether a target has already landed, so a rerun of the sequence picks up where it
@@ -1057,16 +1093,23 @@ function Test-TargetDone {
         the main branch. One without the other is the ledger-versus-repository
         disagreement this whole tool exists to surface, so it counts as not done.
     #>
-    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Target)
+    param(
+        [Parameter(Mandatory)] $Config,
+        [Parameter(Mandatory)] [string] $Target,
+        # A reading of the repository and the plan taken once by the caller. Left out, one
+        # is taken for this call alone — so every existing caller keeps working and there
+        # is still only one set of rules for what "done" means.
+        $Snapshot
+    )
+
+    if (-not $Snapshot) { $Snapshot = New-RepoSnapshot -Config $Config }
 
     $escaped = [regex]::Escape($Target)
     $boxes = @()
-    $hasPlan = Test-Path $Config.plan
-    if ($hasPlan) {
-        foreach ($line in Get-Content -LiteralPath $Config.plan) {
-            # "4.2" matches its own box; a phase like "4" matches every 4.x box.
-            if ($line -match "^\s*- \[( |x)\]\s+$escaped(\.|\s)") { $boxes += $Matches[1] }
-        }
+    $hasPlan = $Snapshot.hasPlan
+    foreach ($line in $Snapshot.planLines) {
+        # "4.2" matches its own box; a phase like "4" matches every 4.x box.
+        if ($line -match "^\s*- \[( |x)\]\s+$escaped(\.|\s)") { $boxes += $Matches[1] }
     }
 
     # No plan file at all is not the same as an unticked box. A plan is deleted once it is
@@ -1080,7 +1123,7 @@ function Test-TargetDone {
     }
 
     $branch = "$($Config.branchPrefix)$Target"
-    if (-not (git -C $Config.codeDir rev-parse --verify --quiet $branch)) {
+    if (-not $Snapshot.branches.ContainsKey($branch)) {
         # With a ledger, a missing branch means merged and tidied away — the tick is the
         # evidence and the branch was only ever a working area. With no ledger there is no
         # evidence at all, and a target that was never started looks exactly the same. So
@@ -1089,9 +1132,7 @@ function Test-TargetDone {
         return $hasPlan
     }
 
-    $main = Get-MainBranch -Config $Config
-    git -C $Config.codeDir merge-base --is-ancestor $branch $main 2>$null
-    return ($LASTEXITCODE -eq 0)
+    return $Snapshot.merged.ContainsKey($branch)
 }
 
 function Test-TransientFailure {
@@ -1102,4 +1143,276 @@ function Test-TransientFailure {
     #>
     param([Parameter(Mandatory)] [string] $LogTail)
     return ($LogTail -match '(?i)api error|stalled mid-stream|connection (reset|closed|error)|ECONNRESET|ETIMEDOUT|socket hang up|502|503|504|overloaded')
+}
+
+# ---------------------------------------------------------------------------
+# How far along, and how much longer
+# ---------------------------------------------------------------------------
+
+function Format-Duration {
+    <#
+        Minutes as something a person reads at a glance. Anything past a day is quoted in
+        days, because "4103m" and "2d 20h" are the same number and only one of them
+        answers "do I go to bed".
+    #>
+    param([AllowNull()] [System.Nullable[double]] $Minutes)
+
+    if ($null -eq $Minutes) { return '--' }
+    if ($Minutes -lt 1) { return '<1m' }
+
+    $total = [int] [Math]::Round($Minutes)
+    if ($total -lt 60) { return "${total}m" }
+
+    $hours = [int] [Math]::Floor($total / 60)
+    $mins = $total % 60
+    if ($hours -lt 24) {
+        if ($mins -gt 0) { return "${hours}h ${mins}m" }
+        return "${hours}h"
+    }
+
+    $days = [int] [Math]::Floor($hours / 24)
+    $rest = $hours % 24
+    if ($rest -gt 0) { return "${days}d ${rest}h" }
+    return "${days}d"
+}
+
+function Get-Percentile {
+    <#
+        Linear-interpolated percentile over an unsorted set. The number this tool reports
+        as "typical" is a median rather than a mean on purpose: one target that sat out a
+        weekend waiting for an allowance to reset would drag a mean far enough that the
+        estimate stops meaning anything.
+    #>
+    param([double[]] $Values, [Parameter(Mandatory)] [double] $P)
+
+    $sorted = @($Values | Sort-Object)
+    if ($sorted.Count -eq 0) { return $null }
+    if ($sorted.Count -eq 1) { return [double] $sorted[0] }
+
+    $index = ($sorted.Count - 1) * $P
+    $low = [int] [Math]::Floor($index)
+    $high = [int] [Math]::Ceiling($index)
+    if ($low -eq $high) { return [double] $sorted[$low] }
+    return [double] ($sorted[$low] + ($sorted[$high] - $sorted[$low]) * ($index - $low))
+}
+
+function Get-TargetLogStats {
+    <#
+        What the log directory knows about each target: how many attempts it took, when it
+        was first and last worked on, and how many minutes those attempts spanned.
+
+        A target's cost is the SUM of its attempts, not the span from the first to the
+        last. Attempts interleave - a target answered by hand days later still belongs to
+        itself - and the span would quietly bill it for every other target's work done in
+        between.
+
+        Keyed by the sanitised name the log files carry, which is what New-LogPath writes.
+    #>
+    param([Parameter(Mandatory)] [string] $LogDir)
+
+    $stats = [ordered]@{}
+    if (-not (Test-Path $LogDir)) { return $stats }
+
+    foreach ($file in Get-ChildItem -Path $LogDir -Filter 'phase-*.log' -File -ErrorAction SilentlyContinue) {
+        if ($file.Name -notmatch '^phase-(?<target>.+)-(?<stamp>\d{8}-\d{6})\.log$') { continue }
+
+        $name = $Matches['target']
+        $start = [datetime]::ParseExact($Matches['stamp'], 'yyyyMMdd-HHmmss', $null)
+        # A copied or restored log can carry a write time older than its own name. Clamping
+        # keeps one such file from subtracting hours from the estimate.
+        $end = if ($file.LastWriteTime -lt $start) { $start } else { $file.LastWriteTime }
+
+        if (-not $stats.Contains($name)) {
+            $stats[$name] = [pscustomobject]@{
+                target   = $name
+                attempts = 0
+                minutes  = 0.0
+                first    = $start
+                last     = $end
+                latest   = $start
+            }
+        }
+
+        $entry = $stats[$name]
+        $entry.attempts++
+        $entry.minutes += ($end - $start).TotalMinutes
+        if ($start -lt $entry.first) { $entry.first = $start }
+        if ($end -gt $entry.last) { $entry.last = $end }
+        if ($start -gt $entry.latest) { $entry.latest = $start }
+    }
+
+    return $stats
+}
+
+function Get-RunPace {
+    <#
+        Two honest answers to "how much longer", because there are two clocks and they
+        disagree by an order of magnitude.
+
+        `working` is the median target projected over what is left: what a target costs
+        when the sequence is actually allowed to run. `observed` is the wall clock since
+        the first target started, divided by the targets finished within it: what it has
+        really cost, allowance resets, dropped links and sleeping laptops included.
+        Quoting only the first is a promise the tool cannot keep; quoting only the second
+        hides that most of the wait was never work.
+    #>
+    param(
+        [double[]] $TargetMinutes,
+        [AllowNull()] [System.Nullable[double]] $ElapsedMinutes,
+        [int] $Finished,
+        [int] $Remaining
+    )
+
+    $typical = Get-Percentile -Values $TargetMinutes -P 0.5
+    $quick = Get-Percentile -Values $TargetMinutes -P 0.25
+
+    $observed = $null
+    if ($Finished -gt 0 -and $null -ne $ElapsedMinutes -and $ElapsedMinutes -gt 0) {
+        $observed = [double] $ElapsedMinutes / $Finished
+    }
+
+    $workingLeft = $null
+    if ($null -ne $typical) { $workingLeft = [double] $typical * $Remaining }
+
+    $observedLeft = $null
+    if ($null -ne $observed) { $observedLeft = [double] $observed * $Remaining }
+
+    return [pscustomobject]@{
+        samples         = @($TargetMinutes).Count
+        typicalMinutes  = $typical
+        quickMinutes    = $quick
+        observedMinutes = $observed
+        workingLeft     = $workingLeft
+        observedLeft    = $observedLeft
+    }
+}
+
+function Get-LedgerLabels {
+    <#
+        The plan's own words for each target, so the dashboard names a target the way its
+        author does rather than printing "G.8" twice.
+    #>
+    param([string[]] $PlanLines)
+
+    $labels = @{}
+    foreach ($line in @($PlanLines)) {
+        if ($line -match '^\s*- \[( |x)\]\s+(?<target>\S+)\s+(?<label>.+?)\s*$') {
+            $key = $Matches['target']
+            if (-not $labels.ContainsKey($key)) { $labels[$key] = $Matches['label'] }
+        }
+    }
+    return $labels
+}
+
+function Get-DashboardFrame {
+    <#
+        Everything one screen of `phasekit dashboard` shows, read fresh.
+
+        It is derived entirely from the repository, the plan and the log directory. The
+        dashboard keeps no state of its own, which is the point: it is honest about a run
+        it never saw start, about one that died without saying so, and about work done by
+        hand between sequences - none of which a progress file written by the runner would
+        have known about.
+    #>
+    param(
+        [Parameter(Mandatory)] $Config,
+        [string[]] $Targets,
+        # How recently a log must have been written to for the run to count as alive. Long
+        # enough to cover a slow gate, short enough that a killed process is not drawn as
+        # work in progress.
+        [int] $LiveMinutes = 6
+    )
+
+    $sequence = Get-AutoSequence -Config $Config -Targets $Targets
+    $snapshot = New-RepoSnapshot -Config $Config
+    $stats = Get-TargetLogStats -LogDir $Config.logDir
+    $labels = Get-LedgerLabels -PlanLines $snapshot.planLines
+    $now = Get-Date
+
+    $rows = @()
+    foreach ($item in $sequence) {
+        $name = $item.target -replace '[^\w.-]', '_'
+        $log = if ($stats.Contains($name)) { $stats[$name] } else { $null }
+        $done = Test-TargetDone -Config $Config -Target $item.target -Snapshot $snapshot
+
+        $state = 'queued'
+        if ($done) { $state = 'done' }
+        elseif ($log -and ($now - $log.last).TotalMinutes -lt $LiveMinutes) { $state = 'running' }
+        elseif ($log) { $state = 'stalled' }
+
+        $label = if ($labels.ContainsKey($item.target)) { $labels[$item.target] } else { '' }
+
+        $rows += [pscustomobject]@{
+            target   = $item.target
+            label    = $label
+            note     = $item.note
+            state    = $state
+            attempts = $(if ($log) { $log.attempts } else { 0 })
+            minutes  = $(if ($log) { $log.minutes } else { $null })
+            latest   = $(if ($log) { $log.latest } else { $null })
+            first    = $(if ($log) { $log.first } else { $null })
+            last     = $(if ($log) { $log.last } else { $null })
+        }
+    }
+
+    $doneRows = @($rows | Where-Object { $_.state -eq 'done' })
+    $remaining = $rows.Count - $doneRows.Count
+
+    # Only logs belonging to THIS sequence set the clock. A log directory outlives the
+    # cycle that filled it, and dating the run from a previous cycle's first target would
+    # report a pace nobody is working at.
+    $starts = @($rows | Where-Object { $null -ne $_.first } | ForEach-Object { $_.first })
+    $started = if ($starts.Count -gt 0) { @($starts | Sort-Object)[0] } else { $null }
+    $elapsed = if ($started) { ($now - $started).TotalMinutes } else { $null }
+
+    $samples = @($doneRows | Where-Object { $null -ne $_.minutes } | ForEach-Object { [double] $_.minutes })
+    $pace = Get-RunPace -TargetMinutes $samples -ElapsedMinutes $elapsed -Finished $doneRows.Count -Remaining $remaining
+
+    # Phases, in the order the sequence first reaches them. The part before the first dot
+    # is what `phasekit run <phase>` already treats as a phase, so this grouping is the
+    # tool's own and not a second idea of what a target name means.
+    $phases = [ordered]@{}
+    foreach ($row in $rows) {
+        $key = ($row.target -split '\.')[0]
+        if (-not $phases.Contains($key)) {
+            $phases[$key] = [pscustomobject]@{ phase = $key; total = 0; done = 0 }
+        }
+        $phases[$key].total++
+        if ($row.state -eq 'done') { $phases[$key].done++ }
+    }
+
+    $stopFile = Join-Path $Config.logDir 'auto-stopped.txt'
+    $doneFile = Join-Path $Config.logDir 'auto-finished.txt'
+    $activity = @($rows | Where-Object { $null -ne $_.last } | ForEach-Object { $_.last } | Sort-Object -Descending)
+
+    $stop = $null
+    if (Test-Path $stopFile) {
+        $marker = Get-Item -LiteralPath $stopFile
+        # A stop marker is only cleared when the next sequence starts. Answering a stopped
+        # run by hand - a reply, a merge - leaves it behind, and a dashboard that shouted
+        # about it would be raising an alarm the owner has already dealt with. Work carried
+        # on after it was written is the evidence that they did.
+        $stale = ($activity.Count -gt 0 -and $activity[0] -gt $marker.LastWriteTime)
+        $stop = [pscustomobject]@{
+            when  = $marker.LastWriteTime
+            stale = $stale
+            text  = @(Get-Content -LiteralPath $stopFile -ErrorAction SilentlyContinue)
+        }
+    }
+
+    return [pscustomobject]@{
+        name      = Split-Path -Leaf $Config.codeDir
+        now       = $now
+        rows      = $rows
+        total     = $rows.Count
+        doneCount = $doneRows.Count
+        remaining = $remaining
+        started   = $started
+        elapsed   = $elapsed
+        pace      = $pace
+        phases    = @($phases.Values)
+        stop      = $stop
+        finished  = (Test-Path $doneFile)
+        live      = [bool] @($rows | Where-Object { $_.state -eq 'running' })
+    }
 }

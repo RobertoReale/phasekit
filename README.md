@@ -88,13 +88,14 @@ phasekit run 0
 | `phasekit reply <phase> -File answer.txt` | The same, from a file — easier to edit, survives shell quoting |
 | `phasekit continue <phase>` | Pick up an interrupted phase where it stopped |
 | `phasekit status [<phase>]` | Branch, dirty files, commits on the phase, ledger vs git log |
+| `phasekit dashboard [-Watch]` | How far along, what is running, roughly how much is left |
 | `phasekit gates` | Run the gates yourself, no agent, no cost |
 | `phasekit auto [-Push]` | Walk `autoSequence` unattended: run, verify, merge, next |
 | `phasekit logs [-Follow]` | Follow the run, rolling over to each new phase's log |
 
 Useful flags: `-Detach` (survives closing the terminal), `-DryRun` (print the prompt and
-the exact `claude` command, run nothing), `-NoBranch`, `-Model`, `-Effort`, `-MaxRetries`,
-`-WaitMinutes`.
+the exact `claude` command, run nothing), `-Watch` (redraw the dashboard), `-NoBranch`,
+`-Model`, `-Effort`, `-MaxRetries`, `-WaitMinutes`.
 
 `-Detach` then hands the terminal straight back to following the run, so one command both
 starts it and shows it. `Ctrl+C` there stops the *following*; the run is a separate process
@@ -139,6 +140,53 @@ tools/resume-at-logon.ps1 -Install -Push -Config path\to\phasekit.json
 That registers a logon task which resumes the sequence, and does nothing once it has
 finished. Resuming is safe to repeat: merged targets are skipped, and a target with a
 pinned session is continued rather than restarted.
+
+## How far along, and how much longer
+
+```powershell
+phasekit dashboard          # one screen, then back to the prompt
+phasekit dashboard -Watch   # the same, redrawn every 20 seconds
+```
+
+```
+  phasekit  real-estate-search                                 02/09 13:53
+
+  ██████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   15 / 53   28%
+
+  now       G.8   coordinates on the first run                running 9m
+  next      G.9  H.1  H.2
+
+  pace      typical target 25m   quickest quarter 19m   (14 measured)
+            5h 52m per target as it has actually gone, waits included
+
+  left      38 targets   ~16h 4m of work   ~9d 6h at the observed pace
+  since     29/08 21:59   (3d 15h elapsed)
+
+  0 ████ 4/4   A ██████ 6/6   G █████░░░░░ 5/10   H ░░░░ 0/4   B ░░░░░ 0/5
+  C ░░░░ 0/4   D ░░░░░░░░░ 0/9   E ░░░░░░ 0/6   F ░░░░░ 0/5
+```
+
+Two estimates, because there are two clocks and on a subscription they disagree by an
+order of magnitude. **Of work** is the median target projected over what is left: what the
+sequence costs when it is allowed to run. **At the observed pace** is the wall clock since
+the first target started, divided by the targets finished within it — allowance resets,
+dropped connections and sleeping laptops included.
+
+The gap between the two *is* the reading. Close together, the sequence is running freely
+and the estimate is the work. A factor of ten apart, what stands between you and the end
+is the allowance, and writing a faster plan would change nothing.
+
+The typical target is a median rather than a mean on purpose: one target that sat out a
+weekend waiting for a limit to reset moves a mean by a factor of nine, and an estimate
+built on that quotes months.
+
+The dashboard writes nothing and remembers nothing — every number is read fresh from the
+repository, the plan and the log directory. That is what makes it honest about a run it
+never saw start, one that died without saying so, and a target somebody finished by hand
+between sequences, none of which a progress file kept by the runner would have known
+about. It is also why a stop marker left behind by a run that was since answered by hand
+is reported as probably stale rather than as an alarm: work happening after the marker was
+written is the evidence that somebody dealt with it.
 
 ## Configuration
 
