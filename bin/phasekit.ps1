@@ -657,9 +657,18 @@ What to do: $Next
             [int] (git -C $cfg.codeDir rev-list --count "$(Get-MainBranch -Config $cfg)..$branchName")
         } else { 0 }
 
-        $started = (Test-Path $sessionFile) -and $branchExists -and $ownCommits -gt 0
+        # ...but commits are not the only honest evidence. A session cut off by a usage
+        # limit, a dropped connection or a closed laptop can leave a complete change set
+        # on disk with nothing committed yet. Dropping the pin there restarts a task that
+        # is nearly done, and the fresh run cannot even begin, because it demands a clean
+        # tree and the uncommitted work is exactly what makes it dirty.
+        $treeDirty = [bool] @(git -C $cfg.codeDir status --porcelain)
+
+        $started = (Test-Path $sessionFile) -and $branchExists -and ($ownCommits -gt 0 -or $treeDirty)
         if ($started) {
-            Write-Host "  $target was already started - resuming that session, not restarting the phase." -ForegroundColor Yellow
+            $evidence = if ($ownCommits -gt 0) { "$ownCommits commit(s) on the branch" }
+                        else { 'uncommitted work on disk' }
+            Write-Host "  $target was already started ($evidence) - resuming that session, not restarting the phase." -ForegroundColor Yellow
         }
         elseif (Test-Path $sessionFile) {
             # Drop the pin: leaving it would make the next run take this same wrong turn,
