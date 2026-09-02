@@ -1171,7 +1171,21 @@ function Invoke-Dashboard {
     #>
     $cfg = Get-PhaseKitConfig -Path $Config
 
+    # Pin the resolved path. The walk-up search starts from the current directory, and a
+    # watch that re-read by name would find a different config if anything moved.
+    $configPath = $cfg.configPath
+
     while ($true) {
+        # `auto` re-reads autoSequence on every iteration, because a sequence can grow
+        # while it is being walked. A watch that read it once keeps drawing the list as it
+        # stood hours ago and quietly disagrees with the runner about how much is left —
+        # which is the one number somebody leaves this on screen for.
+        if ($Watch) {
+            # A half-written config is a normal thing to catch mid-save. Keep the last
+            # good one rather than dying on somebody's open editor.
+            try { $cfg = Get-PhaseKitConfig -Path $configPath } catch { }
+        }
+
         $frame = Get-DashboardFrame -Config $cfg -Targets $Targets
         $frame | Add-Member -NotePropertyName logDir -NotePropertyValue $cfg.logDir -Force
 
