@@ -1614,7 +1614,10 @@ function Get-PlanOutline {
                 continue
             }
             if ($current.Count -eq 0 -and $trim -match '^(\*\*)?(Files|Vincolo|Constraint|Acceptance|Scope)\b') { $skip = $true }
-            if ($current.Count -eq 0 -and $trim -match '^[-*>|#]') { $skip = $true }
+            # A list, a quote, a table row or a heading - but NOT bold prose. "**This
+            # task**" opens half the sections in a well-written plan, and reading its
+            # leading asterisks as a bullet skipped exactly the paragraph worth showing.
+            if ($current.Count -eq 0 -and $trim -match '^(?:[-+>|#]\s|\*\s|\|)') { $skip = $true }
             $current.Add($trim)
         }
         if ($para.Count -gt 0) {
