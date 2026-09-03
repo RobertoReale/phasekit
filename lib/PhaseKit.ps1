@@ -59,6 +59,9 @@ function Get-PhaseKitConfig {
         requireCleanTree = $true
         maxRetries       = 6
         waitMinutes      = 20
+        # How many times one target may be picked up in a fresh conversation after its
+        # context window filled. Small on purpose: see Invoke-AgentWithLimitRetry.
+        maxContextRestarts = 2
         # Sound and a desktop notice when the sequence ends or stops to ask. On by
         # default: an unattended run nobody is watching is exactly the one whose stop
         # costs hours before anyone notices.
@@ -80,6 +83,9 @@ function Get-PhaseKitConfig {
     if ($raw.usageLimit) {
         if ($raw.usageLimit.maxRetries) { $cfg.maxRetries = [int] $raw.usageLimit.maxRetries }
         if ($raw.usageLimit.waitMinutes) { $cfg.waitMinutes = [int] $raw.usageLimit.waitMinutes }
+        if ($null -ne $raw.usageLimit.maxContextRestarts) {
+            $cfg.maxContextRestarts = [int] $raw.usageLimit.maxContextRestarts
+        }
     }
     if ($raw.gates) { $cfg.gates = @($raw.gates) }
     if ($raw.autoSequence) { $cfg.autoSequence = @($raw.autoSequence) }
@@ -457,6 +463,22 @@ $script:NoteMarker = '[phasekit]'
 # times hides it eight times.
 $script:TransientPattern = 'Connection closed mid-response|connection error|ECONNRESET|ETIMEDOUT|EPIPE|socket hang up|Overloaded|\b(502|503|504|529)\b|Internal server error'
 
+# A conversation that outgrows its window is a third kind of ending, and it is the one
+# that used to stop an unattended sequence dead. It is neither a spent allowance nor a
+# dropped link: waiting changes nothing, and resuming makes it worse, because --resume
+# replays the very transcript that overflowed and overflows again on the first turn.
+#
+# The recovery is the opposite of a resume - a NEW conversation, given the continue
+# prompt, which is written to re-establish reality from the gates and the git log rather
+# than from a memory it no longer has. Nothing is lost by that, because the branch, the
+# commits and the ledger are on disk: the transcript was never where the progress lived.
+#
+# Matched only against text the runtime wrote, never against the agent's own prose. An
+# agent that remarks it is "running low on context" is describing its situation, not
+# ending, and restarting it on the strength of that would throw away a session that was
+# still working.
+$script:ContextPattern = 'prompt is too long|input length and .{0,16}max_tokens.{0,16} exceed|exceeds? (?:the )?(?:maximum )?context (?:window|limit|length)|context_length_exceeded|context length exceeded|conversation is too long|compaction failed|failed to compact'
+
 function Get-LimitSignal {
     <#
         The log is JSONL, and most of its bulk is tool results — whatever the agent read,
@@ -470,8 +492,16 @@ function Get-LimitSignal {
         lines the CLI wrote outside the JSON stream (its own limit banner lands here),
         the `result` field of a result record, and assistant prose. Tool results, tool
         inputs and thinking blocks are excluded — that is where quoted numbers live.
+
+        -RuntimeOnly drops the assistant's prose as well, leaving only what the CLI and
+        the API said. Some verdicts must not be reachable by anything the agent can type:
+        a context restart throws a live conversation away, so it is decided on the
+        runtime's word alone.
     #>
-    param([Parameter(Mandatory)] [string] $LogTail)
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $LogTail,
+        [switch] $RuntimeOnly
+    )
 
     $parts = [System.Collections.Generic.List[string]]::new()
 
@@ -492,6 +522,7 @@ function Get-LimitSignal {
                 if ($d.result) { $parts.Add([string] $d.result) }
             }
             'assistant' {
+                if ($RuntimeOnly) { break }
                 foreach ($c in $d.message.content) {
                     if ($c.type -eq 'text' -and $c.text) { $parts.Add([string] $c.text) }
                 }
@@ -500,6 +531,35 @@ function Get-LimitSignal {
     }
 
     return ($parts -join "`n")
+}
+
+function Get-StopReason {
+    <#
+        Why the agent stopped, in one word, read from the tail of its own log. The retry
+        loop and the tests both call this, so what the tests assert is what actually runs.
+
+            limit      the subscription allowance ran out. Wait it out and resume the
+                       same conversation - nothing is lost, the work is mid-thought
+            transient  the link dropped. Back off briefly and resume
+            context    the conversation outgrew its window. A resume would replay the
+                       transcript that overflowed, so the same target is picked up in a
+                       fresh conversation instead
+            stop       everything else, including the agent stopping to ask a question -
+                       which from the outside looks exactly like a failure, and must
+                       reach a person rather than be retried into silence
+
+        The order is not arbitrary. Context is decided first because "the context limit"
+        contains the word limit: read as a spent allowance it would sleep for half an
+        hour and then resume straight back into the same overflow.
+    #>
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $LogTail)
+
+    if ((Get-LimitSignal -LogTail $LogTail -RuntimeOnly) -match $script:ContextPattern) { return 'context' }
+
+    $signal = Get-LimitSignal -LogTail $LogTail
+    if ($signal -match $script:LimitPattern) { return 'limit' }
+    if ($signal -match $script:TransientPattern) { return 'transient' }
+    return 'stop'
 }
 
 function Get-ResetWaitMinutes {
@@ -670,6 +730,13 @@ function Invoke-AgentWithLimitRetry {
         instead of restarting the phase. Any other exit stops immediately and shows the
         tail of the log, because "the agent stopped to ask a question" looks exactly like
         a failure from the outside and needs to be readable.
+
+        Three endings are recovered from, and each one needs a different move -
+        Get-StopReason names them. The awkward one is a full context window: it is the
+        only case where resuming is worse than starting over, because the resume replays
+        the transcript that overflowed. There the same target is picked up in a fresh
+        conversation, which is safe precisely because phasekit keeps progress in the
+        branch, the commits and the ledger rather than in the transcript.
     #>
     param(
         [Parameter(Mandatory)] $Config,
@@ -683,16 +750,29 @@ function Invoke-AgentWithLimitRetry {
     $exit = Invoke-Agent -ClaudeArgs $FirstArgs -LogPath $LogPath -SessionFile $SessionFile
 
     $attempt = 0
+    $restarts = 0
     while ($exit -ne 0 -and $attempt -lt $Config.maxRetries) {
 
         # -Tail and -Raw are mutually exclusive on Get-Content, so join the lines by hand.
         $tail = if (Test-Path $LogPath) { (Get-Content -LiteralPath $LogPath -Tail 40) -join "`n" } else { '' }
         $signal = Get-LimitSignal -LogTail $tail
+        $reason = Get-StopReason -LogTail $tail
 
-        $isLimit = $signal -match $script:LimitPattern
-        $isTransient = -not $isLimit -and $signal -match $script:TransientPattern
+        # A restart that overflows again is not a recovery, it is a loop that spends the
+        # whole allowance re-reading the same plan. Two restarts cover a target that
+        # genuinely needs more than one window; a third means the target is too big to be
+        # done this way, and resizing it is a person's decision, not a retry's.
+        if ($reason -eq 'context' -and $restarts -ge $Config.maxContextRestarts) {
+            Write-Host ''
+            Write-Host "The conversation outgrew its context window $restarts times on this target." -ForegroundColor Red
+            Write-Host 'Starting it again would spend the allowance re-reading the same plan.' -ForegroundColor Red
+            Write-Host 'Split the target, or narrow what it has to read, then run it again.' -ForegroundColor Red
+            Write-Host ''
+            Write-Host "Full log: $LogPath" -ForegroundColor Red
+            return $exit
+        }
 
-        if (-not $isLimit -and -not $isTransient) {
+        if ($reason -eq 'stop') {
             Write-Host ''
             Write-Host "Stopped for a reason that is neither a usage limit nor a dropped connection (exit $exit)." -ForegroundColor Red
             Write-Host 'Last lines of the log — an agent that stops to ask a question looks like this too:' -ForegroundColor Red
@@ -705,7 +785,30 @@ function Invoke-AgentWithLimitRetry {
 
         $attempt++
 
-        if ($isTransient) {
+        if ($reason -eq 'context') {
+            # Not a resume. --resume replays the transcript that overflowed, so it would
+            # fail again on the first turn and burn a retry doing it. A fresh conversation
+            # with the continue prompt reads the ledger, the gates and the git log, which
+            # is where the progress actually is.
+            $restarts++
+            $note = "$script:NoteMarker Context window full. Picking the same target up in a fresh " +
+                    "conversation (restart $restarts of $($Config.maxContextRestarts)) - the branch, " +
+                    'the commits and the ledger carry what was done.'
+            Write-Host ''
+            Write-Host $note -ForegroundColor Yellow
+            Add-Content -LiteralPath $LogPath -Value ''
+            Add-Content -LiteralPath $LogPath -Value $note
+
+            # Clearing the pinned id makes the stream reader record the new conversation's
+            # id the moment it arrives, so a later `phasekit reply` reaches the live one
+            # rather than the transcript that was abandoned.
+            $script:SessionId = $null
+            $exit = Invoke-Agent -ClaudeArgs (@('-p', $script:ContinuePrompt) + $Common) `
+                -LogPath $LogPath -SessionFile $SessionFile
+            continue
+        }
+
+        if ($reason -eq 'transient') {
             # The link dropped, not the allowance. Waiting out a usage-limit interval here
             # would idle half an hour over a fault that is usually gone in seconds, and
             # stopping would hand an unattended sequence back to someone who is asleep.
@@ -1161,6 +1264,114 @@ function Test-TransientFailure {
 # How far along, and how much longer
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Is a runner actually running
+# ---------------------------------------------------------------------------
+
+<#
+    An unattended sequence has exactly one failure it cannot report: being killed. A run
+    that stops writes auto-stopped.txt, sounds the notice and says why. A run that is
+    killed - the terminal that launched it closes, the machine is logged out, the process
+    tree it happened to be parented to goes away - writes nothing at all, because nothing
+    ran to write it. It cost three hours on 2026-09-02: the sequence was waiting out a
+    usage limit, the launcher died, and the only reason anybody found out was a dashboard
+    reporting the target as quiet.
+
+    So the runner leaves a mark saying which process it is, and anything that reports on
+    the sequence can ask that process whether it is alive. Two facts are recorded, not
+    one: the pid, and the moment that pid started. Windows hands pids out again, and a
+    stale mark whose number now belongs to a browser would report a dead sequence as
+    healthy - which is the exact lie this exists to prevent.
+#>
+
+function Get-RunnerFile {
+    param([Parameter(Mandatory)] $Config)
+    return (Join-Path $Config.logDir 'auto-running.json')
+}
+
+function Set-RunnerMark {
+    <#
+        Records this process as the runner, and which target it is on. Called again at
+        every target, so a mark left behind by a killed run names the target it died on.
+    #>
+    param(
+        [Parameter(Mandatory)] $Config,
+        [string] $Target
+    )
+
+    $me = Get-Process -Id $PID
+    $mark = [ordered]@{
+        pid       = $PID
+        # ISO 8601 round-trip: parsed back by the reader, and readable by a person who
+        # opens the file to see what is holding the sequence.
+        pidStart  = $me.StartTime.ToString('o')
+        started   = (Get-Date).ToString('o')
+        target    = $Target
+        machine   = [System.Net.Dns]::GetHostName()
+        config    = $Config.configPath
+    }
+    $dir = Split-Path -Parent (Get-RunnerFile -Config $Config)
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Set-Content -LiteralPath (Get-RunnerFile -Config $Config) -Value ($mark | ConvertTo-Json)
+}
+
+function Clear-RunnerMark {
+    <#
+        Removes the mark, but only if it is this process's. A second runner that refused
+        to start must not delete the mark belonging to the one it refused to disturb.
+    #>
+    param([Parameter(Mandatory)] $Config)
+
+    $state = Get-RunnerState -Config $Config
+    if ($state -and $state.pid -ne $PID) { return }
+    Remove-Item -LiteralPath (Get-RunnerFile -Config $Config) -ErrorAction SilentlyContinue
+}
+
+function Get-RunnerState {
+    <#
+        Who, if anyone, is running this sequence.
+
+            $null    no mark - no sequence has run since the last one finished cleanly
+            alive    that process is still there and still is a runner
+            dead     the mark is there and the process is not: the run was killed, and
+                     nothing else anywhere records that it was
+
+        A mark from another machine is reported as such rather than guessed at: the pid
+        means nothing here, and calling it dead would be a claim this machine cannot make.
+    #>
+    param([Parameter(Mandatory)] $Config)
+
+    $file = Get-RunnerFile -Config $Config
+    if (-not (Test-Path $file)) { return $null }
+
+    try { $m = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json } catch { return $null }
+    if (-not $m.pid) { return $null }
+
+    $here = ($m.machine -eq [System.Net.Dns]::GetHostName())
+    $alive = $false
+    if ($here) {
+        $proc = Get-Process -Id ([int] $m.pid) -ErrorAction SilentlyContinue
+        if ($proc) {
+            # The pid alone is not evidence. A recycled pid belonging to something else
+            # would report a killed sequence as healthy, so the start time must match too.
+            try { $alive = ([datetime] $m.pidStart - $proc.StartTime).Duration().TotalSeconds -lt 2 }
+            catch { $alive = $true }
+        }
+    }
+
+    $started = $null
+    try { $started = [datetime] $m.started } catch { }
+
+    return [pscustomobject]@{
+        pid     = [int] $m.pid
+        target  = [string] $m.target
+        started = $started
+        machine = [string] $m.machine
+        here    = $here
+        alive   = $alive
+    }
+}
+
 function Format-Duration {
     <#
         Minutes as something a person reads at a glance. Anything past a day is quoted in
@@ -1316,6 +1527,115 @@ function Get-LedgerLabels {
     return $labels
 }
 
+function Get-PlanOutline {
+    <#
+        The plan, read as a table of contents: what each phase is for, what each target
+        inside it is called, and the sentence its author opened it with.
+
+        The ledger at the bottom of a plan is a list of one-line labels, which is enough
+        to draw a progress bar and not enough to answer "what is this cycle actually
+        doing". That answer is already written - in the headings and the opening line of
+        every section - and until now nothing read it. Nobody should have to open a
+        two-thousand-line plan to find out what H.5 was about.
+
+        Parsed, deliberately, from the shape a plan already has rather than from markup
+        invented for this: `## <n>. PHASE <key> - <title>` for a phase, `### <target> -
+        <title>` for a target. A heading naming several phases at once ("PHASE E and F")
+        gives its title to each of them.
+
+        Returns:
+            phases    key -> title
+            targets   target -> @{ title; summary; line; body }
+    #>
+    param([string[]] $PlanLines)
+
+    $lines = @($PlanLines)
+    $phases = @{}
+    $targets = @{}
+    $order = [System.Collections.Generic.List[string]]::new()
+    $starts = @{}
+
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+
+        if ($line -match '^##\s+(?:[\w]+\.\s*)?PHASE\s+(?<keys>[^—–-]+?)\s*[—–-]+\s*(?<title>.+?)\s*$') {
+            $title = $Matches['title']
+            foreach ($key in ($Matches['keys'] -split '(?:\s+and\s+|\s*,\s*|\s*/\s*)')) {
+                $k = $key.Trim()
+                if ($k) { $phases[$k] = $title }
+            }
+            continue
+        }
+
+        if ($line -match '^###\s+(?<target>[A-Za-z0-9]+\.\d+)\s*[—–-]*\s*(?<title>.*?)\s*$') {
+            $t = $Matches['target']
+            if (-not $targets.ContainsKey($t)) {
+                $targets[$t] = [pscustomobject]@{
+                    target  = $t
+                    title   = $Matches['title']
+                    summary = ''
+                    line    = $i
+                    body    = @()
+                }
+                [void] $order.Add($t)
+                $starts[$t] = $i
+            }
+        }
+    }
+
+    # A section runs to the next heading of any level. Done in a second pass because the
+    # end of one section is only known once the next has been found.
+    for ($n = 0; $n -lt $order.Count; $n++) {
+        $t = $order[$n]
+        $from = $starts[$t] + 1
+        $to = $lines.Count - 1
+        for ($j = $from; $j -lt $lines.Count; $j++) {
+            if ($lines[$j] -match '^#{1,3}\s') { $to = $j - 1; break }
+        }
+        if ($to -lt $from) { $targets[$t].body = @() }
+        else { $targets[$t].body = $lines[$from..$to] }
+
+        # The opening sentence, which in a well-written plan is the one that says why the
+        # task exists. The file list and the constraint blocks are answers to other
+        # questions, so they are skipped rather than summarised.
+        $sentence = ''
+        $para = [System.Collections.Generic.List[string]]::new()
+        $current = [System.Collections.Generic.List[string]]::new()
+        $skip = $false
+        foreach ($b in (@($targets[$t].body) + @(''))) {
+            $trim = $b.Trim()
+            if (-not $trim) {
+                # End of a paragraph. A file list or a constraint block answers a
+                # different question, so it is dropped whole rather than line by line —
+                # reading it line by line is how the tail of a path list became a summary.
+                if (-not $skip -and $current.Count -gt 0) { foreach ($c in $current) { $para.Add($c) }; break }
+                $current.Clear()
+                $skip = $false
+                continue
+            }
+            if ($current.Count -eq 0 -and $trim -match '^(\*\*)?(Files|Vincolo|Constraint|Acceptance|Scope)\b') { $skip = $true }
+            if ($current.Count -eq 0 -and $trim -match '^[-*>|#]') { $skip = $true }
+            $current.Add($trim)
+        }
+        if ($para.Count -gt 0) {
+            $text = ($para -join ' ') -replace '\s+', ' '
+            $text = $text -replace '`', '' -replace '\*\*', '' -replace '\*', ''
+            # Whole sentences, up to a couple of lines of terminal. Cutting at the first
+            # full stop reads badly when a section opens with a four-word one; cutting at
+            # a character count reads worse, because it stops mid-clause.
+            $sentence = $text
+            if ($text.Length -gt 170) {
+                $cuts = [regex]::Matches($text.Substring(0, 170), '[.:;]\s')
+                $sentence = if ($cuts.Count -gt 0) { $text.Substring(0, $cuts[$cuts.Count - 1].Index + 1) }
+                            else { $text.Substring(0, 170) }
+            }
+        }
+        $targets[$t].summary = $sentence
+    }
+
+    return [pscustomobject]@{ phases = $phases; targets = $targets }
+}
+
 function Get-DashboardFrame {
     <#
         Everything one screen of `phasekit dashboard` shows, read fresh.
@@ -1339,6 +1659,7 @@ function Get-DashboardFrame {
     $snapshot = New-RepoSnapshot -Config $Config
     $stats = Get-TargetLogStats -LogDir $Config.logDir
     $labels = Get-LedgerLabels -PlanLines $snapshot.planLines
+    $outline = Get-PlanOutline -PlanLines $snapshot.planLines
     $now = Get-Date
 
     $rows = @()
@@ -1356,11 +1677,18 @@ function Get-DashboardFrame {
         elseif ($carries -gt 0) { $state = 'merging' }
         elseif ($log) { $state = 'stalled' }
 
-        $label = if ($labels.ContainsKey($item.target)) { $labels[$item.target] } else { '' }
+        # The ledger's own words first: they are the shortest, and they are what the
+        # author chose to see in a list. The section heading is the fallback for a target
+        # the ledger has not caught up with, which during a cycle is a normal state.
+        $label = if ($labels.ContainsKey($item.target)) { $labels[$item.target] }
+                 elseif ($outline.targets.ContainsKey($item.target)) { $outline.targets[$item.target].title }
+                 else { '' }
+        $about = if ($outline.targets.ContainsKey($item.target)) { $outline.targets[$item.target].summary } else { '' }
 
         $rows += [pscustomobject]@{
             target   = $item.target
             label    = $label
+            about    = $about
             note     = $item.note
             state    = $state
             commits  = $carries
@@ -1392,11 +1720,17 @@ function Get-DashboardFrame {
     foreach ($row in $rows) {
         $key = ($row.target -split '\.')[0]
         if (-not $phases.Contains($key)) {
-            $phases[$key] = [pscustomobject]@{ phase = $key; total = 0; done = 0 }
+            $title = if ($outline.phases.ContainsKey($key)) { $outline.phases[$key] } else { '' }
+            $phases[$key] = [pscustomobject]@{ phase = $key; title = $title; total = 0; done = 0 }
         }
         $phases[$key].total++
         if ($row.state -eq 'done') { $phases[$key].done++ }
     }
+
+    # Whether a runner is actually there. Everything else on the dashboard is inferred
+    # from files that outlive the process, so without this a sequence killed an hour ago
+    # and one merely between targets draw exactly the same.
+    $runner = Get-RunnerState -Config $Config
 
     $stopFile = Join-Path $Config.logDir 'auto-stopped.txt'
     $doneFile = Join-Path $Config.logDir 'auto-finished.txt'
@@ -1429,6 +1763,9 @@ function Get-DashboardFrame {
         pace      = $pace
         phases    = @($phases.Values)
         stop      = $stop
+        runner    = $runner
+        outline   = $outline
+        logDir    = $Config.logDir
         finished  = (Test-Path $doneFile)
         live      = [bool] @($rows | Where-Object { $_.state -in @('running', 'merging') })
     }

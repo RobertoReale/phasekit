@@ -64,6 +64,51 @@ The run then lives in its own process, and closing the window it was launched fr
 nothing to it. To check whether it is alive: `phasekit status` reports running `claude`
 processes.
 
+**Ask the dashboard, which does not guess.** Everything else on it is inferred from files
+that outlive the process that wrote them, so a sequence killed an hour ago and one merely
+between targets draw identically. The `runner` line is the exception — the runner records
+which process it is, so the answer is a fact rather than an inference:
+
+```
+  runner    process 36108, since 03/09 18:12
+  runner    no process — the runner was killed on H.5, it did not stop
+```
+
+The second line is the one worth waiting for. A killed run writes no `auto-stopped.txt`
+and sounds no notice, because the process that would have done both is the one that died —
+this line is the only place it is ever said.
+
+## The context window filled up
+
+The log ends with something like `prompt is too long: 214431 tokens > 200000 maximum`, or
+`input length and max_tokens exceed context limit`, or a failed compaction.
+
+This is handled, and it is handled differently from the other two recoverable endings:
+phasekit starts a **fresh** conversation on the same target rather than resuming the one
+that overflowed. Resuming would replay the transcript that was too long in the first
+place, fail again on the first turn, and burn a retry doing it. The new conversation gets
+the continue prompt, which re-establishes what landed from the gates, `git status` and the
+git log — safe precisely because the progress is in the branch, the commits and the
+ledger, and never in the transcript.
+
+You will see it in the log:
+
+```
+[phasekit] Context window full. Picking the same target up in a fresh conversation
+(restart 1 of 2) - the branch, the commits and the ledger carry what was done.
+```
+
+If it happens twice on the same target, phasekit stops and asks for you. A third restart
+would be a loop spending the whole allowance re-reading the same plan, and that is the
+plan's problem, not the runner's: the target is too big, or it is asking the agent to read
+more than it needs. Split it. `"usageLimit": { "maxContextRestarts": 2 }` sets the count if
+you disagree.
+
+One thing it deliberately does **not** do: treat the agent's own words as the signal. An
+agent that writes "my context is getting long" is describing its situation, not ending,
+and restarting a session that was still working is worse than the problem. Only the
+runtime's own error counts.
+
 ## The run stopped and left work uncommitted
 
 An interruption mid-task leaves edits on disk with no commit. `git status` is dirty and the

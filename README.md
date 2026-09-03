@@ -89,6 +89,7 @@ phasekit run 0
 | `phasekit continue <phase>` | Pick up an interrupted phase where it stopped |
 | `phasekit status [<phase>]` | Branch, dirty files, commits on the phase, ledger vs git log |
 | `phasekit dashboard [-Watch]` | How far along, what is running, roughly how much is left |
+| `phasekit steps [<phase>\|<target>]` | What every phase and target is, in the plan's own words |
 | `phasekit gates` | Run the gates yourself, no agent, no cost |
 | `phasekit auto [-Push]` | Walk `autoSequence` unattended: run, verify, merge, next |
 | `phasekit logs [-Follow]` | Follow the run, rolling over to each new phase's log |
@@ -141,6 +142,53 @@ That registers a logon task which resumes the sequence, and does nothing once it
 finished. Resuming is safe to repeat: merged targets are skipped, and a target with a
 pinned session is continued rather than restarted.
 
+### How a run ends, and what happens next
+
+Four endings, and each needs a different move. Getting them confused is expensive in both
+directions: waiting out something that will never come back, or restarting something that
+was one turn from finishing.
+
+| Ending | What phasekit does | Why not the obvious thing |
+|---|---|---|
+| **The allowance ran out** | Reads the announced reset time, sleeps until it, resumes the *same* conversation | A fixed twenty-minute wait spends every retry before a three-hour reset arrives |
+| **The connection dropped** | Backs off a minute or so and resumes the same conversation | Waiting out a usage-limit interval idles half an hour over a fault that is usually gone in seconds |
+| **The context window filled** | Picks the same target up in a **fresh** conversation, given the continue prompt | A resume replays the transcript that overflowed, so it fails again on the first turn. Nothing is lost: the progress is in the branch, the commits and the ledger, never in the transcript |
+| **Anything else** | Stops, shows the log tail, says how to answer | An agent that stops to ask a question looks exactly like a crash from the outside, and retrying it just re-asks |
+
+The classifier reads only text the runtime wrote — the CLI's own output and the API's
+error — never a tool result and, for the context verdict, never the agent's prose either.
+An agent that *mentions* being low on context is describing its situation, not ending, and
+throwing away a working session over that sentence is worse than the problem.
+
+A target may be picked up in a fresh conversation twice before phasekit stops and asks for
+a person. A third would be a loop spending the whole allowance re-reading the same plan,
+and resizing the target is a decision, not a retry. Set it with
+`"usageLimit": { "maxContextRestarts": 2 }`.
+
+### Is anyone actually running it
+
+A sequence that *stops* says so. A sequence that is *killed* says nothing at all, because
+the process that would have said it is the one that died — no marker, no notification,
+nothing. That is the one failure an unattended run cannot report on its own, and it once
+cost three hours: the run was waiting out a usage limit, the terminal that launched it
+went away, and the wait simply never ended.
+
+So the runner records which process it is and which target it is on, and every screen that
+reports on the sequence can ask that process whether it is still there:
+
+```
+  runner    process 36108, since 03/09 18:12
+  runner    no process — the runner was killed on H.5, it did not stop
+```
+
+Two facts are recorded rather than one — the pid and the moment that pid started — because
+pids get handed out again, and a stale mark whose number now belongs to a browser would
+report a dead sequence as healthy. That is the exact lie the mark exists to prevent.
+
+The mark is also how two runners see each other: starting `phasekit auto` while another
+one is alive on the same repository is refused, since both would merge, both would push,
+and the second would verify branches the first is still writing.
+
 ## How far along, and how much longer
 
 ```powershell
@@ -188,6 +236,32 @@ about. It is also why a stop marker left behind by a run that was since answered
 is reported as probably stale rather than as an alarm: work happening after the marker was
 written is the evidence that somebody dealt with it.
 
+## What the steps actually are
+
+The dashboard answers *how far* and *how long*. `phasekit steps` answers the other
+question somebody has while watching it — what **is** G.2, and why does it come after
+phase D:
+
+```
+  PHASE B  the foundations                                          0/5
+    [>] B.1   generated API types + drift gate
+           Generate TypeScript from the FastAPI OpenAPI document
+           (openapi-typescript). The generated file is committed so the
+           frontend builds without a running backend.
+           note: Where the OpenAPI document is vague, fix the router's
+                 response_model - never paper over it with a hand-written type.
+```
+
+It is read out of the plan itself — the phase headings, the target headings, and the
+sentence each section opens with — so it cannot drift from the work the way a second
+description would. `phasekit steps G` narrows to one phase; `phasekit steps G.2` prints
+that target's section in full, which is the whole point: nobody should have to open a
+two-thousand-line file to find out what the target on screen is about.
+
+Summaries are printed for what is still ahead and not for what has landed. A finished
+target's rationale is in the git history; on this screen it would push the part that still
+matters off the bottom.
+
 ## Configuration
 
 `phasekit.json`, found by walking up from the current directory:
@@ -203,7 +277,7 @@ written is the evidence that somebody dealt with it.
   "effort": "high",
   "branchPrefix": "plan/phase-",
   "requireCleanTree": true,
-  "usageLimit": { "maxRetries": 6, "waitMinutes": 20 },
+  "usageLimit": { "maxRetries": 6, "waitMinutes": 20, "maxContextRestarts": 2 },
   "gates": [
     { "name": "tests", "cwd": "backend",  "run": "pytest -q" },
     { "name": "types", "cwd": "backend",  "run": "pyright" },
@@ -219,7 +293,7 @@ the branch and the commits. They differ when the plan lives in a separate notes 
 Every relative path is resolved against the config file, never against the shell's current
 directory, so the same command means the same thing wherever you type it.
 
-## The three things that make it work
+## What makes it work
 
 **One commit per task.** A phase you dislike is one `git branch -D` away. A task you
 dislike is one `git revert` away. Without this the only available verdict on an hour of
@@ -236,6 +310,12 @@ of the message and sleeps until it, then resumes the *same* conversation, so the
 carries on from the task it was on rather than restarting the phase. A run in that wait
 has no `claude` process and a log that stopped growing; it is alive, and it is the single
 most common thing to mistake for a crash.
+
+**A transcript is not where the progress is.** The branch, the commits and the ledger are,
+which is why a conversation that outgrows its context window can simply be abandoned and
+the same target picked up in a fresh one. Every other design here follows from that: one
+commit per task, a ledger checked against the git log, and gates that re-establish the
+truth from the repository rather than from anybody's memory of it.
 
 **Stopping is a success.** An agent that stops to say "this task's premise is false" has
 done the most valuable thing it can do. The runner shows the log tail when a run ends

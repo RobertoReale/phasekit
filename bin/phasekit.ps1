@@ -21,6 +21,8 @@
     phasekit continue 0                 # pick up an interrupted phase
     phasekit status                     # what actually landed
     phasekit dashboard -Watch           # progress and time left, refreshing
+    phasekit steps                      # what each phase and target is about
+    phasekit steps G.2                  # that one target, in full
     phasekit logs -Follow               # watch a detached run
 #>
 
@@ -117,6 +119,7 @@ phasekit — plan-driven, unattended agent runs
   phasekit merge <phase>           verify, show the commits, then merge into main
   phasekit status [<phase>]        branch, commits, dirty files, pinned session
   phasekit dashboard [-Watch]      how far along, what is running, how much is left
+  phasekit steps [G|G.2]           what every phase and target is, in the plan's words
   phasekit gates                   run the project's gates locally, no agent
   phasekit auto [-Push]            walk autoSequence unattended: run, verify, merge, next
   phasekit logs [-Follow]          follow the run, rolling over as each phase starts
@@ -564,6 +567,29 @@ function Invoke-Auto {
     Remove-Item -LiteralPath $stopFile -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $doneFile -ErrorAction SilentlyContinue
 
+    # Two runners on one repository is not a race worth having: both merge, both push,
+    # and the second one verifies branches the first is still writing. The mark is how
+    # they see each other - and how anything else can tell a live sequence from one that
+    # was killed without ever getting to say so.
+    $runner = Get-RunnerState -Config $cfg
+    if ($runner -and $runner.alive -and $runner.pid -ne $PID -and -not $Force) {
+        Write-Host ''
+        Write-Host ("  A sequence is already running here - process {0}, started {1}, on {2}." -f `
+                    $runner.pid, $runner.started.ToString('dd/MM HH:mm'), $runner.target) -ForegroundColor Red
+        Write-Host '  Watch it with  phasekit dashboard -Watch , or stop that process first.' -ForegroundColor Cyan
+        Write-Host '  -Force starts anyway, which is almost never what you want.' -ForegroundColor DarkGray
+        return 1
+    }
+    if ($runner -and -not $runner.alive -and $runner.here) {
+        # The one failure an unattended run cannot report, because the process that would
+        # have reported it is the one that died. Say it out loud rather than starting the
+        # next sequence as if nothing had happened.
+        Write-Host ''
+        Write-Host ("  The previous runner (process {0}) was killed while on {1} - it never stopped, it died." -f `
+                    $runner.pid, $runner.target) -ForegroundColor Yellow
+    }
+    Set-RunnerMark -Config $cfg -Target '(starting)'
+
     Write-Host ''
     Write-Host "  Unattended sequence — $($sequence.Count) target(s)" -ForegroundColor Cyan
     # One reading for the whole listing. Asking per target was three git processes each,
@@ -589,6 +615,10 @@ Why: $Why
 What to do: $Next
 "@
         Set-Content -LiteralPath $stopFile -Value $text
+        # A stop is the runner speaking; it is about to exit on purpose. Leaving the mark
+        # behind would report a deliberate stop as a killed process, and an alarm that
+        # cries wolf on every ordinary stop is one nobody reads.
+        Clear-RunnerMark -Config $cfg
         Write-Host ''
         Write-Host "STOPPED at $Target" -ForegroundColor Red
         Write-Host "  $Why" -ForegroundColor Red
@@ -649,6 +679,7 @@ What to do: $Next
         Write-Host ('=' * 72) -ForegroundColor Cyan
 
         $Phase = $target
+        Set-RunnerMark -Config $cfg -Target $target
 
         # -DryRun prints each target's prompt and stops there. Verifying and merging a
         # run that never happened would report every target as broken.
@@ -777,6 +808,7 @@ $(Get-Date -Format 'yyyy-MM-dd HH:mm')
 
 Every target ran, verified and merged.
 "@
+    Clear-RunnerMark -Config $cfg
     Write-Host ''
     Write-Host 'Sequence complete. Every target ran, verified and merged.' -ForegroundColor Green
     if ($cfg.notify) {
@@ -1104,6 +1136,33 @@ function Show-Dashboard {
         Write-Host '  now       nothing running' -ForegroundColor DarkGray
     }
 
+    # Everything above is inferred from files that outlive the process that wrote them,
+    # so a sequence killed an hour ago and one merely between targets look identical up
+    # to here. This is the line that tells them apart.
+    $rn = $Frame.runner
+    if ($rn -and -not $rn.alive) {
+        if ($rn.here) {
+            Write-Host ('  runner    no process — the runner was killed on {0}, it did not stop' -f $rn.target) -ForegroundColor Red
+            Write-Host '            nothing else records this: restart with  phasekit auto -Push -Detach' -ForegroundColor Cyan
+        }
+        else {
+            Write-Host ('  runner    marked as running on {0}, which is not this machine' -f $rn.machine) -ForegroundColor DarkGray
+        }
+    }
+    elseif ($rn -and $rn.alive) {
+        Write-Host ('  runner    process {0}, since {1}' -f $rn.pid, $rn.started.ToString('dd/MM HH:mm')) -ForegroundColor DarkGray
+    }
+    elseif ($Frame.live) {
+        # Work is visibly happening and nothing claimed it. A runner started before this
+        # mark existed, or one started some other way - either is fine, but saying "none"
+        # over a target that is plainly running is the kind of wrong that gets a line
+        # ignored forever after.
+        Write-Host '  runner    unmarked — something is running that did not leave a mark' -ForegroundColor DarkGray
+    }
+    elseif ($Frame.remaining -gt 0 -and -not $Frame.finished) {
+        Write-Host '  runner    none — no sequence is walking these targets' -ForegroundColor DarkGray
+    }
+
     $next = @($Frame.rows | Where-Object { $_.state -eq 'queued' } | Select-Object -First 3 | ForEach-Object { $_.target })
     if ($next.Count -gt 0) {
         Write-Host ('  next      ' + ($next -join '  ')) -ForegroundColor DarkGray
@@ -1150,6 +1209,9 @@ function Show-Dashboard {
     }
     if ($line.Trim()) { Write-Host $line.TrimEnd() }
 
+    Write-Host ''
+    Write-Host '            what each phase and target is:  phasekit steps' -ForegroundColor DarkGray
+
     if ($Frame.finished) {
         Write-Host ''
         Write-Host '  FINISHED  the sequence walked every target it was given.' -ForegroundColor Green
@@ -1170,6 +1232,152 @@ function Show-Dashboard {
     }
 
     Write-Host ''
+}
+
+function Get-StepMark {
+    <#
+        One character for the state, in a column, so a long plan reads down the left edge
+        rather than by reading every line.
+    #>
+    param([string] $State)
+    switch ($State) {
+        'done'    { return @{ mark = 'x'; colour = 'Green' } }
+        'running' { return @{ mark = '>'; colour = 'Cyan' } }
+        'merging' { return @{ mark = '>'; colour = 'Cyan' } }
+        'stalled' { return @{ mark = '!'; colour = 'Yellow' } }
+        default   { return @{ mark = ' '; colour = 'Gray' } }
+    }
+}
+
+function Show-Steps {
+    <#
+        The sequence written out: every phase with its title, every target inside it with
+        its own, and for the work that has not happened yet the sentence the plan opens it
+        with.
+
+        The dashboard answers "how far and how long". This answers the other question
+        somebody has while watching it — what IS G.2, and why is it after phase D — and it
+        answers it from the plan itself rather than from a second description that would
+        drift. Nobody should have to open a two-thousand-line file to find out what the
+        target on screen is about.
+
+        Summaries are printed for what is still ahead, not for what has landed. A finished
+        target's rationale is in the git history and in the plan; on this screen it would
+        push the part that still matters off the bottom.
+    #>
+    param(
+        [Parameter(Mandatory)] $Frame,
+        [string] $Only
+    )
+
+    $rows = @($Frame.rows)
+    if ($Only) {
+        $rows = @($rows | Where-Object { $_.target -eq $Only -or ($_.target -split '\.')[0] -eq $Only })
+        if ($rows.Count -eq 0) {
+            Write-Host ''
+            Write-Host "  Nothing in the sequence matches '$Only'." -ForegroundColor Yellow
+            Write-Host '  Try a phase (G) or a target (G.2), or run  phasekit steps  for all of them.' -ForegroundColor DarkGray
+            Write-Host ''
+            return
+        }
+    }
+
+    Write-Host ''
+    Write-Host ("  phasekit  {0} — the plan, step by step" -f $Frame.name) -ForegroundColor Cyan
+    Write-Host ''
+
+    # One target asked for by name gets its whole section, because that is the only way to
+    # ask "what does this task actually say" without opening the file.
+    if ($Only -and $Only -match '\.' -and $rows.Count -eq 1) {
+        $t = $Frame.outline.targets[$rows[0].target]
+        $state = $rows[0].state
+        Write-Host ("  {0}  {1}" -f $rows[0].target, $(if ($t) { $t.title } else { $rows[0].label })) -ForegroundColor Cyan
+        Write-Host ("  {0}" -f $state) -ForegroundColor DarkGray
+        Write-Host ''
+        if ($t) {
+            # The blank line under the heading is markdown's, not the author's.
+            $body = @($t.body)
+            while ($body.Count -gt 0 -and -not $body[0].Trim()) { $body = $body[1..($body.Count - 1)] }
+            while ($body.Count -gt 0 -and -not $body[-1].Trim()) { $body = $body[0..($body.Count - 2)] }
+            foreach ($line in $body) { Write-Host ("  {0}" -f $line) }
+        }
+        else { Write-Host '  The plan has no section for this target — it is in the sequence but not written up.' -ForegroundColor Yellow }
+        Write-Host ''
+        return
+    }
+
+    $seen = @{}
+    foreach ($row in $rows) {
+        $key = ($row.target -split '\.')[0]
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            $ph = @($Frame.phases | Where-Object { $_.phase -eq $key })[0]
+            $title = if ($ph -and $ph.title) { $ph.title } else { '' }
+            Write-Host ''
+            Write-Host ("  PHASE {0}" -f $key) -ForegroundColor Cyan -NoNewline
+            Write-Host ("  {0}" -f $title) -NoNewline
+            if ($ph) {
+                $pad = [Math]::Max(1, 66 - 8 - $key.Length - $title.Length)
+                Write-Host ("{0,$pad}{1}/{2}" -f '', $ph.done, $ph.total) -ForegroundColor DarkGray
+            } else { Write-Host '' }
+        }
+
+        $m = Get-StepMark -State $row.state
+        Write-Host ("    [{0}] " -f $m.mark) -ForegroundColor $m.colour -NoNewline
+        Write-Host ("{0,-6}" -f $row.target) -ForegroundColor $m.colour -NoNewline
+        Write-Host (Limit-Text $row.label 64)
+
+        if ($row.state -ne 'done' -and $row.about) {
+            foreach ($chunk in (Split-Wrapped -Text $row.about -Width 62)) {
+                Write-Host ("           {0}" -f $chunk) -ForegroundColor DarkGray
+            }
+        }
+
+        # The note on a sequence entry is the trap its author already knew about. It
+        # belongs next to the target, not in a config file nobody opens.
+        if ($row.note) {
+            $first = $true
+            foreach ($chunk in (Split-Wrapped -Text $row.note -Width 56)) {
+                Write-Host ("           {0}{1}" -f $(if ($first) { 'note: ' } else { '      ' }), $chunk) -ForegroundColor Yellow
+                $first = $false
+            }
+        }
+    }
+
+    Write-Host ''
+    Write-Host '  [x] landed   [>] running   [!] quiet   [ ] not started' -ForegroundColor DarkGray
+    Write-Host '  One target in full:  phasekit steps G.2' -ForegroundColor DarkGray
+    Write-Host ''
+}
+
+function Split-Wrapped {
+    <#
+        Wraps at word boundaries. A summary is a sentence, and a sentence cut at a fixed
+        column stops being one.
+    #>
+    param([string] $Text, [int] $Width)
+
+    $out = @()
+    $line = ''
+    foreach ($word in ($Text -split '\s+')) {
+        if (-not $word) { continue }
+        if ($line -and ($line.Length + 1 + $word.Length) -gt $Width) { $out += $line; $line = $word }
+        else { $line = if ($line) { "$line $word" } else { $word } }
+    }
+    if ($line) { $out += $line }
+    return $out
+}
+
+function Invoke-Steps {
+    <#
+        `phasekit steps` with no argument writes out the whole sequence; with a phase or a
+        target it narrows to that. It reads the same frame the dashboard does, so the two
+        can never disagree about what is running.
+    #>
+    $cfg = Get-PhaseKitConfig -Path $Config
+    $frame = Get-DashboardFrame -Config $cfg -Targets $Targets
+    Show-Steps -Frame $frame -Only $Phase
+    return 0
 }
 
 function Invoke-Dashboard {
@@ -1236,6 +1444,8 @@ switch ($Command.ToLowerInvariant()) {
     'status' { Invoke-Status; exit 0 }
     'dashboard' { exit (Invoke-Dashboard) }
     'dash' { exit (Invoke-Dashboard) }
+    'steps' { exit (Invoke-Steps) }
+    'plan' { exit (Invoke-Steps) }
     'gates' {
         $cfg = Get-PhaseKitConfig -Path $Config
         Write-Host ''

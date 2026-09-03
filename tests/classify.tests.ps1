@@ -1,19 +1,16 @@
 <#
-    How a finished run is classified: usage limit, dropped connection, or stop and show
-    the owner. Every case here is one that has actually happened to a sequence.
+    How a finished run is classified: usage limit, dropped connection, a context window
+    that filled, or stop and show the owner. Every case here is one that has actually
+    happened to a sequence.
 
         pwsh -NoProfile -File tests/classify.tests.ps1
 #>
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..' 'lib' 'PhaseKit.ps1')
 
-# The verdict the retry loop reaches, from the same two patterns over the same signal.
-function Get-Verdict([string] $tail) {
-    $signal = Get-LimitSignal -LogTail $tail
-    if ($signal -match $script:LimitPattern) { return 'limit' }
-    if ($signal -match $script:TransientPattern) { return 'transient' }
-    return 'stop'
-}
+# The shipped classifier, not a copy of it. This file used to reimplement the verdict,
+# which meant it could stay green over a retry loop that had stopped agreeing with it.
+function Get-Verdict([string] $tail) { return (Get-StopReason -LogTail $tail) }
 
 $fails = 0
 function Test-Case($name, $tail, $expected) {
@@ -61,6 +58,32 @@ Test-Case 'the agent stopping to ask a question' `
 
 Test-Case 'a red gate' `
     '{"type":"result","result":"pytest failed: 3 tests failed"}' 'stop'
+
+# --- the context window ------------------------------------------------------
+# The ending that used to stop an unattended sequence dead, because it is neither an
+# allowance nor a dropped link and so fell through to 'stop'.
+Test-Case 'the prompt outgrowing the window' `
+    '{"type":"result","is_error":true,"result":"API Error: 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 214431 tokens > 200000 maximum\"}}"}' 'context'
+
+Test-Case 'input plus max_tokens over the limit' `
+    '{"type":"result","result":"API Error: input length and `max_tokens` exceed context limit: 197000 + 8192 > 200000"}' 'context'
+
+Test-Case 'auto-compaction failing' `
+    '{"type":"result","is_error":true,"result":"Compaction failed: conversation is too long to summarise"}' 'context'
+
+# "context limit" contains the word limit. Read as a spent allowance this sleeps half an
+# hour and then resumes straight back into the same overflow - so context is decided first.
+Test-Case 'context beats limit when both words appear' `
+    '{"type":"result","result":"API Error: exceeds the context limit; rate limit not involved"}' 'context'
+
+# A restart throws a live conversation away, so it is decided on the runtime's word
+# alone. The agent noticing its own context is prose, not an ending.
+Test-Case 'the agent merely remarking on its context' `
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"my prompt is too long to keep going like this, so I will split it"}]}}' 'stop'
+
+# ...but the same phrase from the runtime still counts, which is what tells the two apart.
+Test-Case 'the CLI saying it outside the JSON stream' `
+    'API Error: prompt is too long: 204000 tokens > 200000 maximum' 'context'
 
 Write-Host ''
 if ($fails) {
