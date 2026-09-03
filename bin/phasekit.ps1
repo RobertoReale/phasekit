@@ -597,9 +597,10 @@ function Invoke-Auto {
     $listing = New-RepoSnapshot -Config $cfg
     foreach ($s in $sequence) {
         $m = if ($s.model) { $s.model } else { $cfg.model }
+        $e = if ($s.effort) { $s.effort } else { $cfg.effort }
         $done = Test-TargetDone -Config $cfg -Target $s.target -Snapshot $listing
         $mark = if ($done) { 'done' } else { '    ' }
-        Write-Host ("    [{0}] {1,-6} {2}{3}" -f $mark, $s.target, $m, $(if ($s.note) { "   ($($s.note))" } else { '' }))
+        Write-Host ("    [{0}] {1,-6} {2}/{3}{4}" -f $mark, $s.target, $m, $e, $(if ($s.note) { "   ($($s.note))" } else { '' }))
     }
     Write-Host ''
     if ($Push) { Write-Host '  Pushing after each merge.' -ForegroundColor Yellow }
@@ -636,6 +637,14 @@ What to do: $Next
     # it then stopped the whole sequence because its predecessor carried no commits.
     # `-Targets` is the exception - an explicit list belongs to the caller, and the config
     # file must not be able to extend it behind their back.
+    # -Model and -Effort on the command line are this run's defaults, and a sequence
+    # entry overrides them for its own target. They have to be captured before the loop,
+    # because the loop assigns to those same variables to pass the per-target choice down
+    # to Invoke-Run — which is how `auto -Model sonnet` used to lose its own argument on
+    # the first target that did not name a model.
+    $cliModel = $Model
+    $cliEffort = $Effort
+
     $attempted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     while ($true) {
         if (-not $Targets) {
@@ -661,7 +670,8 @@ What to do: $Next
         if (-not $item) { break }
         [void] $attempted.Add($item.target)
         $target = $item.target
-        if ($item.model) { $Model = $item.model } else { $Model = $null }
+        $Model = if ($item.model) { $item.model } else { $cliModel }
+        $Effort = if ($item.effort) { $item.effort } else { $cliEffort }
 
         if (Test-TargetDone -Config $cfg -Target $target) {
             Write-Host "  $target already done — skipping." -ForegroundColor DarkGray
@@ -1112,6 +1122,7 @@ function Show-Dashboard {
             Write-Host ("{0,-6}" -f $r.target) -ForegroundColor Cyan -NoNewline
             Write-Host ("{0,-44}" -f (Limit-Text $r.label 43)) -NoNewline
             Write-Host ("committed, merging" -f $r.commits) -ForegroundColor Green
+            Write-Host ("            on {0} / effort {1}" -f $r.model, $r.effort) -ForegroundColor DarkGray
         }
     }
     elseif ($running.Count -gt 0) {
@@ -1121,6 +1132,7 @@ function Show-Dashboard {
             Write-Host ("{0,-6}" -f $r.target) -ForegroundColor Cyan -NoNewline
             Write-Host ("{0,-44}" -f (Limit-Text $r.label 43)) -NoNewline
             Write-Host ("running {0}" -f $for) -ForegroundColor Green
+            Write-Host ("            on {0} / effort {1}" -f $r.model, $r.effort) -ForegroundColor DarkGray
         }
     }
     elseif ($stalled.Count -gt 0) {
@@ -1130,6 +1142,7 @@ function Show-Dashboard {
             Write-Host ("{0,-6}" -f $r.target) -ForegroundColor Yellow -NoNewline
             Write-Host ("{0,-44}" -f (Limit-Text $r.label 43)) -NoNewline
             Write-Host ("quiet for {0}" -f $quiet) -ForegroundColor Yellow
+            Write-Host ("            on {0} / effort {1}" -f $r.model, $r.effort) -ForegroundColor DarkGray
         }
     }
     elseif ($Frame.remaining -gt 0) {
@@ -1171,6 +1184,18 @@ function Show-Dashboard {
     # The estimate. Two numbers rather than one, because the gap between them IS the
     # answer: when they are close the sequence is running freely, and when they are a
     # factor of ten apart the thing to fix is the allowance, not the work.
+    # What the sequence is spending, which is the other half of "how much longer": the
+    # estimate below is in hours, and hours of an allowance are what the model and the
+    # effort actually cost. A target that overrides either is named, because an
+    # unexplained difference in the finished code usually traces back to one.
+    $off = @($Frame.rows | Where-Object { $_.custom -and $_.state -ne 'done' })
+    Write-Host ('  model     {0} / effort {1}' -f $Frame.model, $Frame.effort) -ForegroundColor DarkGray -NoNewline
+    if ($off.Count -gt 0) {
+        $named = @($off | Select-Object -First 4 | ForEach-Object { '{0} {1}/{2}' -f $_.target, $_.model, $_.effort })
+        $more = if ($off.Count -gt 4) { ", +$($off.Count - 4)" } else { '' }
+        Write-Host ('   except ' + ($named -join ', ') + $more) -ForegroundColor Yellow
+    } else { Write-Host '' }
+
     $p = $Frame.pace
     if ($p.samples -gt 0) {
         Write-Host ''

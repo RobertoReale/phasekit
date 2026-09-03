@@ -114,9 +114,25 @@ gates fully cover the change, the expensive one where a mistake would be silent:
 "autoSequence": [
   { "target": "4.2", "model": "sonnet", "note": "mechanical move, fully covered by tests" },
   { "target": "4.3", "model": "opus",   "note": "riskiest task in the plan" },
-  { "target": "7.2", "model": "sonnet" }
+  { "target": "7.2", "effort": "medium" }
 ]
 ```
+
+**`model` and `effort` are not the same lever, and the difference decides which one you
+can actually use.** A different model writes differently. On an isolated mechanical task
+nobody minds; across half a codebase it reads as two authors, and on a product one person
+will review end to end that is a real cost. The same model at lower effort thinks less
+about the same problem and still writes in one voice.
+
+So: the cheap model where the output is not code somebody will later copy the style of —
+a CI workflow, generated types, baseline screenshots — and lower effort where the code is
+product code but the task contains no decisions. Both default to the values at the top of
+`phasekit.json`, and `-Model` / `-Effort` on the command line set the default for one run
+without touching what an entry asks for by name.
+
+`phasekit dashboard` prints what the sequence is spending and names every target that
+differs from it, because an unexplained difference in the finished code usually traces
+back to one of these two lines.
 
 It **stops at the first target that needs a person** and writes the reason to
 `auto-stopped.txt`. Skipping ahead would build every later target on top of something

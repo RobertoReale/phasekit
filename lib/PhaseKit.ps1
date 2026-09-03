@@ -1098,11 +1098,20 @@ function Get-AutoSequence {
             "autoSequence": [
               "4.2",
               { "target": "4.3", "model": "opus" },
+              { "target": "4.4", "effort": "medium" },
               { "target": "6.1", "note": "needs an API key you must obtain yourself" }
             ]
 
-        A bare string uses the configured default model. An object may override the model
-        per target, which is where the cheap-model-for-mechanical-work decision lives.
+        A bare string uses the configured defaults. An object may override the model or
+        the effort per target, which is where the cheap-work-for-mechanical-work decision
+        lives.
+
+        The two are not the same lever, and the difference matters on a product one
+        person will read end to end. A different model writes differently: on a
+        mechanical task nobody minds, but across half a codebase it reads as two authors.
+        The same model at lower effort thinks less about the same problem and still
+        writes in one voice — so effort is the safer of the two wherever the output is
+        code somebody will later copy the style of.
     #>
     param([Parameter(Mandatory)] $Config, [string[]] $Targets)
 
@@ -1117,14 +1126,14 @@ function Get-AutoSequence {
         # allowNoCommits flag still apply.
         $configured = @{}
         foreach ($e in @($Config.autoSequence)) {
-            if ($e -is [string]) { $configured[$e] = [pscustomobject]@{ target = $e; model = $null; note = $null; allowNoCommits = $false } }
-            elseif ($e.target)   { $configured[$e.target] = [pscustomobject]@{ target = $e.target; model = $e.model; note = $e.note; allowNoCommits = [bool]$e.allowNoCommits } }
+            if ($e -is [string]) { $configured[$e] = [pscustomobject]@{ target = $e; model = $null; effort = $null; note = $null; allowNoCommits = $false } }
+            elseif ($e.target)   { $configured[$e.target] = [pscustomobject]@{ target = $e.target; model = $e.model; effort = $e.effort; note = $e.note; allowNoCommits = [bool]$e.allowNoCommits } }
         }
 
         return @($flat | ForEach-Object {
             $name = $_.Trim()
             if ($configured.ContainsKey($name)) { $configured[$name] }
-            else { [pscustomobject]@{ target = $name; model = $null; note = $null; allowNoCommits = $false } }
+            else { [pscustomobject]@{ target = $name; model = $null; effort = $null; note = $null; allowNoCommits = $false } }
         })
     }
 
@@ -1135,7 +1144,7 @@ function Get-AutoSequence {
     $i = -1
     return @($Config.autoSequence | ForEach-Object {
         $i++
-        if ($_ -is [string]) { [pscustomobject]@{ target = $_; model = $null; note = $null; allowNoCommits = $false } }
+        if ($_ -is [string]) { [pscustomobject]@{ target = $_; model = $null; effort = $null; note = $null; allowNoCommits = $false } }
         else {
             # Say which entry is wrong and what it is missing. Without this the run
             # walks on with an empty target and dies several frames later on
@@ -1147,7 +1156,7 @@ function Get-AutoSequence {
                        'Each entry is either a bare string ("4.2") or an object with a ' +
                        '"target" key ({ "target": "4.2", "note": "..." }).')
             }
-            [pscustomobject]@{ target = $_.target; model = $_.model; note = $_.note; allowNoCommits = [bool]$_.allowNoCommits }
+            [pscustomobject]@{ target = $_.target; model = $_.model; effort = $_.effort; note = $_.note; allowNoCommits = [bool]$_.allowNoCommits }
         }
     })
 }
@@ -1688,10 +1697,20 @@ function Get-DashboardFrame {
                  else { '' }
         $about = if ($outline.targets.ContainsKey($item.target)) { $outline.targets[$item.target].summary } else { '' }
 
+        # Resolved here rather than in the view, and resolved the same way the runner
+        # resolves it: a sequence entry overrides the configured default, and nothing
+        # else does. A dashboard that printed the config's model would be right about
+        # the file and wrong about the target actually running.
+        $model = if ($item.model) { $item.model } else { $Config.model }
+        $effort = if ($item.effort) { $item.effort } else { $Config.effort }
+
         $rows += [pscustomobject]@{
             target   = $item.target
             label    = $label
             about    = $about
+            model    = $model
+            effort   = $effort
+            custom   = [bool] ($item.model -or $item.effort)
             note     = $item.note
             state    = $state
             commits  = $carries
@@ -1768,6 +1787,8 @@ function Get-DashboardFrame {
         stop      = $stop
         runner    = $runner
         outline   = $outline
+        model     = $Config.model
+        effort    = $Config.effort
         logDir    = $Config.logDir
         finished  = (Test-Path $doneFile)
         live      = [bool] @($rows | Where-Object { $_.state -in @('running', 'merging') })

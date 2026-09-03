@@ -79,6 +79,30 @@ $labels = Get-LedgerLabels -PlanLines $plan
 Test-Case 'the ledger still yields its own short labels' $labels['D.1'] 'the shell'
 
 # ---------------------------------------------------------------------------
+# What a target is run with
+# ---------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'what a target is run with'
+
+$seqCfg = [pscustomobject]@{ autoSequence = @(
+    '4.2'
+    [pscustomobject]@{ target = '4.3'; model = 'sonnet' }
+    [pscustomobject]@{ target = '4.4'; effort = 'medium' }
+) }
+$seq = Get-AutoSequence -Config $seqCfg
+
+Test-Case 'a bare string names neither' "$($seq[0].model)/$($seq[0].effort)" '/'
+Test-Case 'an entry may name the model alone' "$($seq[1].model)/$($seq[1].effort)" 'sonnet/'
+Test-Case 'an entry may name the effort alone' "$($seq[2].model)/$($seq[2].effort)" '/medium'
+
+# Naming a target on the command line says WHICH to run, not that everything the config
+# knows about it should be forgotten. Effort had to join model, the note and
+# allowNoCommits here, or `phasekit auto -Targets C.4` would silently run at the default.
+$picked = Get-AutoSequence -Config $seqCfg -Targets '4.4'
+Test-Case '-Targets keeps the entry it was given' $picked[0].effort 'medium'
+
+# ---------------------------------------------------------------------------
 # Whether a runner is actually running
 # ---------------------------------------------------------------------------
 
