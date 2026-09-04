@@ -120,6 +120,7 @@ phasekit — plan-driven, unattended agent runs
   phasekit status [<phase>]        branch, commits, dirty files, pinned session
   phasekit dashboard [-Watch]      how far along, what is running, how much is left
   phasekit steps [G|G.2]           what every phase and target is, in the plan's words
+  phasekit spend                   what each target cost: requests, peak context, weight
   phasekit gates                   run the project's gates locally, no agent
   phasekit auto [-Push]            walk autoSequence unattended: run, verify, merge, next
   phasekit logs [-Follow]          follow the run, rolling over as each phase starts
@@ -210,13 +211,24 @@ function New-LogPath {
 
 function Get-CommonArgs {
     param($Config)
-    return @(
+
+    $a = @(
         '--permission-mode', 'bypassPermissions'
         '--model', $Config.model
         '--effort', $Config.effort
         '--output-format', 'stream-json'
         '--verbose'
     )
+
+    # The ceiling on the conversation. Passed on every invocation, resumes included: a
+    # resumed session is the one that has been growing all along and is exactly the one
+    # that needs it. 'auto' leaves the decision to the CLI, which is the behaviour this
+    # replaced - see the autoCompact note in Get-PhaseKitConfig for what that cost.
+    if ($Config.autoCompact -and "$($Config.autoCompact)" -notin @('off', 'none')) {
+        $a += @('--autocompact', "$($Config.autoCompact)")
+    }
+
+    return $a
 }
 
 function Start-Detached {
@@ -454,6 +466,7 @@ function Invoke-Run {
     if ($branch) { Write-Host "  Branch      : $($branch.name)" }
     if ($script:SessionId) { Write-Host "  Session     : $($script:SessionId)" }
     Write-Host "  Model       : $($cfg.model) / effort $($cfg.effort)"
+    Write-Host "  Context     : compacts at $($cfg.autoCompact)"
     Write-Host "  Log         : $log"
     Write-Host "  Usage limit : wait $($cfg.waitMinutes) min, resume, up to $($cfg.maxRetries) times."
     Write-Host ''
@@ -1090,6 +1103,69 @@ function Limit-Text {
     return $Text.Substring(0, [Math]::Max(1, $Width - 1)) + [string][char]0x2026
 }
 
+function Show-Spend {
+    <#
+        What each target has cost, read back out of the logs.
+
+        Wall clock is what `dashboard` already answers, and on a subscription it is the
+        wrong question: two targets that took the same afternoon can differ tenfold in
+        what they spent, because the cost of a request is the size of the context it
+        carries and a long session's context only grows. This is the view that makes a
+        runaway target visible while there are still targets left to run.
+    #>
+    param($Config, [string[]] $Targets)
+
+    $stats = Get-TargetLogStats -LogDir $Config.logDir
+    $sequence = Get-AutoSequence -Config $Config -Targets $Targets
+
+    Write-Host ''
+    Write-Host "  phasekit  $(Split-Path -Leaf $Config.codeDir) - what the sequence has spent" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  target   attempts  requests   peak ctx    weighted' -ForegroundColor DarkGray
+
+    $total = [int64] 0
+    $rows = 0
+    foreach ($item in $sequence) {
+        $name = $item.target -replace '[^\w.-]', '_'
+        if (-not $stats.Contains($name)) { continue }
+
+        # Every attempt, not just the last: a target restarted three times was paid for
+        # three times, and reporting only the surviving log would flatter it.
+        $spend = [pscustomobject]@{ requests = 0; peak = 0; weighted = 0 }
+        foreach ($f in Get-ChildItem -Path $Config.logDir -Filter "phase-$name-*.log" -File -ErrorAction SilentlyContinue) {
+            $one = Get-LogSpend -LogPath $f.FullName
+            $spend.requests += $one.requests
+            $spend.weighted += $one.weighted
+            if ($one.peak -gt $spend.peak) { $spend.peak = $one.peak }
+        }
+        if ($spend.requests -eq 0) { continue }
+
+        $total += $spend.weighted
+        $rows++
+        # Loud above half a million tokens of context: that is where a request costs three
+        # times what the same request cost at the start of the same task.
+        $colour = if ($spend.peak -ge 450000) { 'Yellow' } else { 'Gray' }
+        Write-Host ('  {0,-8} {1,8} {2,9} {3,10} {4,11}' -f
+            $item.target,
+            $stats[$name].attempts,
+            $spend.requests,
+            ('{0}k' -f [math]::Round($spend.peak / 1000)),
+            ('{0:N1}M' -f ($spend.weighted / 1e6))) -ForegroundColor $colour
+    }
+
+    Write-Host ''
+    Write-Host ('  {0} targets measured, {1:N1}M in total, {2:N1}M each on average' -f
+        $rows, ($total / 1e6), $(if ($rows) { $total / $rows / 1e6 } else { 0 })) -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  weighted: one unit is a full-price input token. A cached read counts a tenth,' -ForegroundColor DarkGray
+    Write-Host '  writing the cache a quarter more, output five. Only the ratios are real -' -ForegroundColor DarkGray
+    Write-Host '  the number is for putting two targets next to each other.' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host "  context compacts at $($Config.autoCompact); a target that peaks far above it" -ForegroundColor DarkGray
+    Write-Host '  was run before that ceiling existed.' -ForegroundColor DarkGray
+    Write-Host ''
+}
+
 function Show-Dashboard {
     <#
         One screen, and it fits in one screen on purpose. Anything that needs scrolling is
@@ -1122,7 +1198,10 @@ function Show-Dashboard {
             Write-Host ("{0,-6}" -f $r.target) -ForegroundColor Cyan -NoNewline
             Write-Host ("{0,-44}" -f (Limit-Text $r.label 43)) -NoNewline
             Write-Host ("committed, merging" -f $r.commits) -ForegroundColor Green
-            Write-Host ("            on {0} / effort {1}" -f $r.model, $r.effort) -ForegroundColor DarkGray
+            $spent = if ($r.context -gt 0) {
+                ('   context {0}k' -f [math]::Round($r.context / 1000))
+            } else { '' }
+            Write-Host ("            on {0} / effort {1}{2}" -f $r.model, $r.effort, $spent) -ForegroundColor DarkGray
         }
     }
     elseif ($running.Count -gt 0) {
@@ -1132,7 +1211,10 @@ function Show-Dashboard {
             Write-Host ("{0,-6}" -f $r.target) -ForegroundColor Cyan -NoNewline
             Write-Host ("{0,-44}" -f (Limit-Text $r.label 43)) -NoNewline
             Write-Host ("running {0}" -f $for) -ForegroundColor Green
-            Write-Host ("            on {0} / effort {1}" -f $r.model, $r.effort) -ForegroundColor DarkGray
+            $spent = if ($r.context -gt 0) {
+                ('   context {0}k' -f [math]::Round($r.context / 1000))
+            } else { '' }
+            Write-Host ("            on {0} / effort {1}{2}" -f $r.model, $r.effort, $spent) -ForegroundColor DarkGray
         }
     }
     elseif ($stalled.Count -gt 0) {
@@ -1142,7 +1224,10 @@ function Show-Dashboard {
             Write-Host ("{0,-6}" -f $r.target) -ForegroundColor Yellow -NoNewline
             Write-Host ("{0,-44}" -f (Limit-Text $r.label 43)) -NoNewline
             Write-Host ("quiet for {0}" -f $quiet) -ForegroundColor Yellow
-            Write-Host ("            on {0} / effort {1}" -f $r.model, $r.effort) -ForegroundColor DarkGray
+            $spent = if ($r.context -gt 0) {
+                ('   context {0}k' -f [math]::Round($r.context / 1000))
+            } else { '' }
+            Write-Host ("            on {0} / effort {1}{2}" -f $r.model, $r.effort, $spent) -ForegroundColor DarkGray
         }
     }
     elseif ($Frame.remaining -gt 0) {
@@ -1405,6 +1490,16 @@ function Invoke-Steps {
     return 0
 }
 
+function Invoke-Spend {
+    <#
+        `phasekit spend`. Reads every log in full, so it is slower than the dashboard and
+        deliberately not part of it.
+    #>
+    $cfg = Get-PhaseKitConfig -Path $Config
+    Show-Spend -Config $cfg -Targets $Targets
+    return 0
+}
+
 function Invoke-Dashboard {
     <#
         How far the sequence has got, what it is doing now, and roughly how much is left.
@@ -1470,6 +1565,7 @@ switch ($Command.ToLowerInvariant()) {
     'dashboard' { exit (Invoke-Dashboard) }
     'dash' { exit (Invoke-Dashboard) }
     'steps' { exit (Invoke-Steps) }
+    'spend' { exit (Invoke-Spend) }
     'plan' { exit (Invoke-Steps) }
     'gates' {
         $cfg = Get-PhaseKitConfig -Path $Config

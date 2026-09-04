@@ -103,6 +103,65 @@ $picked = Get-AutoSequence -Config $seqCfg -Targets '4.4'
 Test-Case '-Targets keeps the entry it was given' $picked[0].effort 'medium'
 
 # ---------------------------------------------------------------------------
+# What a session is handed, and what it costs
+# ---------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'the size of a conversation'
+
+$tmpPlan = Join-Path ([System.IO.Path]::GetTempPath()) ("phasekit-plan-" + [guid]::NewGuid().ToString('N') + '.md')
+Set-Content -LiteralPath $tmpPlan -Value $plan
+$planCfg = [pscustomobject]@{ plan = $tmpPlan }
+
+try {
+    # Quoting the section is the whole point: a real plan is over a hundred kilobytes, and
+    # a prompt that says "read PLAN.md" pays for it on every request the session makes
+    # afterwards, not once.
+    $section = Get-PlanSectionText -Config $planCfg -Phase 'D.1'
+    Test-Case 'the section carries its own heading' ($section -split "`n")[0] '### D.1 - The shell'
+    Test-Case 'the section carries the task body' `
+        ([bool] ($section -match 'the nav jumps by two pixels')) $true
+    Test-Case 'the section stops at the next task' ([bool] ($section -match 'PHASE E')) $false
+    Test-Case 'a target the plan does not have yields nothing' `
+        (Get-PlanSectionText -Config $planCfg -Phase 'Z.9') ''
+}
+finally {
+    Remove-Item -LiteralPath $tmpPlan -Force -ErrorAction SilentlyContinue
+}
+
+# A log line per request, shaped like the real stream. Two events for one request_id is
+# the normal case for a streamed message and must be counted once, or every number here
+# is inflated by however many chunks the message arrived in.
+$tmpLog = Join-Path ([System.IO.Path]::GetTempPath()) ("phasekit-log-" + [guid]::NewGuid().ToString('N') + '.log')
+$events = @(
+    '{"type":"system","subtype":"init","session_id":"s1"}'
+    '{"type":"assistant","request_id":"r1","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":0,"output_tokens":5}}}'
+    '{"type":"assistant","request_id":"r1","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":0,"output_tokens":40}}}'
+    '{"type":"assistant","request_id":"r2","message":{"usage":{"input_tokens":2,"cache_creation_input_tokens":500,"cache_read_input_tokens":90000,"output_tokens":20}}}'
+    'not json at all, which a log picks up from stderr'
+    '{"type":"assistant","request_id":"r3","message":{"usage":{"input_tokens":2,"cache_creation_input_tokens":300,"cache_read_input_tokens":240000,"output_tokens":10}}}'
+)
+Set-Content -LiteralPath $tmpLog -Value $events
+
+try {
+    $spend = Get-LogSpend -LogPath $tmpLog
+    Test-Case 'a streamed message is one request, not two' $spend.requests 3
+    Test-Case 'peak context is the largest a request carried' $spend.peak 240302
+    Test-Case 'the last context is what a live run is sitting at' $spend.last 240302
+    Test-Case 'reads are summed once per request' $spend.read 330000
+    # 14 fresh + 330000 read at a tenth + 1800 written at 1.25 + 70 out at 5 = 35614
+    Test-Case 'the weighting is reads a tenth, writes 1.25, output 5' $spend.weighted 35614
+
+    # The tail is what the dashboard reads on every refresh; it must agree with the whole
+    # file about where the context is now, which is the only number it shows.
+    Test-Case 'the tail agrees about the current context' (Get-LogSpend -LogPath $tmpLog -TailLines 2).last 240302
+    Test-Case 'a log that does not exist is zero, not an error' (Get-LogSpend -LogPath ($tmpLog + '.nope')).requests 0
+}
+finally {
+    Remove-Item -LiteralPath $tmpLog -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
 # Whether a runner is actually running
 # ---------------------------------------------------------------------------
 

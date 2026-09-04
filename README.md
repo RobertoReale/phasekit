@@ -90,6 +90,7 @@ phasekit run 0
 | `phasekit status [<phase>]` | Branch, dirty files, commits on the phase, ledger vs git log |
 | `phasekit dashboard [-Watch]` | How far along, what is running, roughly how much is left |
 | `phasekit steps [<phase>\|<target>]` | What every phase and target is, in the plan's own words |
+| `phasekit spend` | What each target cost: requests, peak context, one weighted number |
 | `phasekit gates` | Run the gates yourself, no agent, no cost |
 | `phasekit auto [-Push]` | Walk `autoSequence` unattended: run, verify, merge, next |
 | `phasekit logs [-Follow]` | Follow the run, rolling over to each new phase's log |
@@ -293,6 +294,7 @@ matters off the bottom.
   "effort": "high",
   "branchPrefix": "plan/phase-",
   "requireCleanTree": true,
+  "autoCompact": 200000,
   "usageLimit": { "maxRetries": 6, "waitMinutes": 20, "maxContextRestarts": 2 },
   "gates": [
     { "name": "tests", "cwd": "backend",  "run": "pytest -q" },
@@ -308,6 +310,45 @@ the branch and the commits. They differ when the plan lives in a separate notes 
 
 Every relative path is resolved against the config file, never against the shell's current
 directory, so the same command means the same thing wherever you type it.
+
+## What a target costs, and why it is not the clock
+
+Wall clock is what the dashboard answers. On a subscription it is the wrong question:
+two targets that each took an afternoon can differ tenfold in what they spent.
+
+The reason is that **a request costs what its context carries**, and a session's context
+only grows. Measured over one real cycle, a typical target ran 60–120 requests and peaked
+around 250k tokens of context. One target ran 374 requests and climbed to 542k, spending
+its last 174 requests above 460k — and cost eight times the typical one. Nothing in that
+tail was harder than the work at the start. It was the same work, carrying every earlier
+turn again.
+
+```
+$ phasekit spend
+
+  target   attempts  requests   peak ctx    weighted
+  H.5             1        95       293k        2.5M
+  B.1             1       162       313k        4.1M
+  B.2             1       374       543k       16.4M
+```
+
+`weighted` is one number in units of a full-price input token — a cached read counts a
+tenth, writing the cache a quarter more, output five. Only the ratios are real; the
+number exists to put two targets next to each other honestly.
+
+Two things keep that curve flat, and both are on by default:
+
+- **`autoCompact`** (default `200000`) is passed to every session, resumes included, and
+  caps the conversation instead of leaving the ceiling to the CLI. The context then
+  sawtooths under the ceiling rather than climbing past half a million.
+- **`{{SECTION}}` in a prompt block** is replaced with that target's own section of the
+  plan. A prompt that says "read PLAN.md" costs about 16k tokens on a real plan — and
+  unlike a one-off cost it is then re-read by every request the session goes on to make.
+  Quote the section; leave the file for the rare task that needs its neighbours.
+
+A target that peaks far above the ceiling either ran before it existed or is a task that
+was planned too large. The second is a planning finding, not a runner bug: 374 requests
+is not one unit of work.
 
 ## What makes it work
 

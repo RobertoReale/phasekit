@@ -62,6 +62,13 @@ function Get-PhaseKitConfig {
         # How many times one target may be picked up in a fresh conversation after its
         # context window filled. Small on purpose: see Invoke-AgentWithLimitRetry.
         maxContextRestarts = 2
+        # Where the conversation is compacted, in tokens. Left to the CLI's own default a
+        # long task grows its context monotonically - one measured target reached 542k and
+        # spent its last 174 requests above 460k. Nothing in that tail was harder than the
+        # work at the start; it was just carrying every earlier turn again, and a request
+        # costs what its context costs. Compacting at a ceiling turns that curve into a
+        # sawtooth. Set 'auto' to hand the decision back to the CLI.
+        autoCompact      = 200000
         # Sound and a desktop notice when the sequence ends or stops to ask. On by
         # default: an unattended run nobody is watching is exactly the one whose stop
         # costs hours before anyone notices.
@@ -86,6 +93,9 @@ function Get-PhaseKitConfig {
         if ($null -ne $raw.usageLimit.maxContextRestarts) {
             $cfg.maxContextRestarts = [int] $raw.usageLimit.maxContextRestarts
         }
+    }
+    if ($raw.PSObject.Properties.Name -contains 'autoCompact' -and $raw.autoCompact) {
+        $cfg.autoCompact = $raw.autoCompact
     }
     if ($raw.gates) { $cfg.gates = @($raw.gates) }
     if ($raw.autoSequence) { $cfg.autoSequence = @($raw.autoSequence) }
@@ -151,6 +161,32 @@ function Read-PhasePrompt {
     return ($body -join "`n").Trim()
 }
 
+function Get-PlanSectionText {
+    <#
+        One target's own section of the plan, headline included, as the prompt can quote
+        it verbatim.
+
+        This exists because of what a prompt saying "read PLAN.md" actually costs. The
+        plan for a real cycle is 126 KB; reading it spends about 16k tokens, and unlike a
+        one-off cost it then sits in the context of every request the session goes on to
+        make. Over a long target that is several million tokens re-read to hold a document
+        the agent needed four hundred words of. The section is quoted instead, and the
+        file stays there for the rare task that genuinely needs its neighbours.
+    #>
+    param(
+        [Parameter(Mandatory)] $Config,
+        [Parameter(Mandatory)] [string] $Phase
+    )
+
+    if (-not (Test-Path $Config.plan)) { return '' }
+    $outline = Get-PlanOutline -PlanLines (Get-Content -LiteralPath $Config.plan)
+    if (-not $outline.targets.ContainsKey($Phase)) { return '' }
+
+    $t = $outline.targets[$Phase]
+    $head = if ($t.title) { "### $Phase - $($t.title)" } else { "### $Phase" }
+    return (@($head) + @($t.body)) -join "`n"
+}
+
 function Build-PhasePrompt {
     param(
         [Parameter(Mandatory)] $Config,
@@ -191,6 +227,20 @@ function Build-PhasePrompt {
         # because a missing block is usually a typo in the phase id, not a design choice.
         Write-Host "No '## Phase $Phase' block in $promptsName — falling back to a pointer prompt." -ForegroundColor Yellow
         return $where + "Read $planName and $promptsName, then carry out the Phase $Phase prompt from $promptsName exactly as it is written there, including its CHECK FIRST step. Do not go beyond that phase."
+    }
+
+    # {{SECTION}} is opt-in: a prompt that does not use it keeps whatever it says today.
+    # String.Replace, not -replace, because the plan is prose and a '$' in it would be
+    # read as a capture-group reference and vanish.
+    if ($block -match '\{\{SECTION\}\}') {
+        $section = Get-PlanSectionText -Config $Config -Phase $Phase
+        if ($section) {
+            $block = $block.Replace('{{SECTION}}', $section)
+        }
+        else {
+            Write-Host "No section for $Phase in $planName - the prompt will point at the file instead." -ForegroundColor Yellow
+            $block = $block.Replace('{{SECTION}}', "(Not found in $planName. Read the file and find $Phase yourself.)")
+        }
     }
 
     $what = if ($isTask) { "task $Phase" } else { "phase $Phase" }
@@ -1462,6 +1512,7 @@ function Get-TargetLogStats {
                 first    = $start
                 last     = $end
                 latest   = $start
+                latestLog = $file.FullName
             }
         }
 
@@ -1470,10 +1521,84 @@ function Get-TargetLogStats {
         $entry.minutes += ($end - $start).TotalMinutes
         if ($start -lt $entry.first) { $entry.first = $start }
         if ($end -gt $entry.last) { $entry.last = $end }
-        if ($start -gt $entry.latest) { $entry.latest = $start }
+        if ($start -gt $entry.latest) { $entry.latest = $start; $entry.latestLog = $file.FullName }
     }
 
     return $stats
+}
+
+function Get-LogSpend {
+    <#
+        What one attempt cost, read back from its own log.
+
+        Every request carries its usage, so the log already knows the two numbers that
+        decide the bill and nothing else reports: how many requests the target took, and
+        how large the context had grown by the end. They multiply. A target that runs four
+        hundred requests at half a million tokens of context is not four times a target
+        that runs a hundred at two hundred thousand - it is ten.
+
+        Streamed messages repeat their usage across events, so requests are counted by
+        request_id and each one is recorded once.
+
+        -TailLines reads only the end of the file, which is all that is needed to answer
+        "how big is the context right now" for a run in progress. Parsing a finished 5 MB
+        log takes a moment, so `spend` asks for it and the dashboard does not.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $LogPath,
+        [int] $TailLines = 0
+    )
+
+    $empty = [pscustomobject]@{ requests = 0; peak = 0; last = 0; read = 0; write = 0; output = 0; weighted = 0 }
+    if (-not (Test-Path $LogPath)) { return $empty }
+
+    $lines = if ($TailLines -gt 0) { Get-Content -LiteralPath $LogPath -Tail $TailLines -ErrorAction SilentlyContinue }
+             else { Get-Content -LiteralPath $LogPath -ErrorAction SilentlyContinue }
+
+    $seen = @{}
+    $lastCtx = 0
+    foreach ($line in $lines) {
+        if ($line -notmatch '"request_id"') { continue }
+        try { $ev = $line | ConvertFrom-Json } catch { continue }
+        if ($ev.type -ne 'assistant') { continue }
+        $rid = [string] $ev.request_id
+        $u = $ev.message.usage
+        if (-not $rid -or -not $u) { continue }
+        $rec = [pscustomobject]@{
+            ctx   = [int64] $u.input_tokens + [int64] $u.cache_creation_input_tokens + [int64] $u.cache_read_input_tokens
+            read  = [int64] $u.cache_read_input_tokens
+            write = [int64] $u.cache_creation_input_tokens
+            fresh = [int64] $u.input_tokens
+            out   = [int64] $u.output_tokens
+        }
+        $seen[$rid] = $rec
+        $lastCtx = $rec.ctx
+    }
+
+    if ($seen.Count -eq 0) { return $empty }
+
+    $vals = @($seen.Values)
+    $read = ($vals | Measure-Object -Property read -Sum).Sum
+    $write = ($vals | Measure-Object -Property write -Sum).Sum
+    $fresh = ($vals | Measure-Object -Property fresh -Sum).Sum
+    $out = ($vals | Measure-Object -Property out -Sum).Sum
+    $peak = ($vals | Measure-Object -Property ctx -Maximum).Maximum
+
+    # One comparable number, in units of a full-price input token: a cached read is a
+    # tenth of one, writing the cache is a quarter more, and output is five. The ratios
+    # are the published ones and the absolute number is meaningless - what it is for is
+    # putting two targets next to each other honestly.
+    $weighted = [int64] ($fresh + $read * 0.1 + $write * 1.25 + $out * 5)
+
+    return [pscustomobject]@{
+        requests = $seen.Count
+        peak     = [int64] $peak
+        last     = [int64] $lastCtx
+        read     = [int64] $read
+        write    = [int64] $write
+        output   = [int64] $out
+        weighted = $weighted
+    }
 }
 
 function Get-RunPace {
@@ -1704,12 +1829,21 @@ function Get-DashboardFrame {
         $model = if ($item.model) { $item.model } else { $Config.model }
         $effort = if ($item.effort) { $item.effort } else { $Config.effort }
 
+        # Only for the row actually being worked on, and only from the tail of its log:
+        # this runs on every dashboard refresh, and the answer is in the last few
+        # requests. A queued target has no context and a finished one no longer has one.
+        $context = 0
+        if ($state -in @('running', 'stalled') -and $log -and $log.latestLog) {
+            $context = (Get-LogSpend -LogPath $log.latestLog -TailLines 400).last
+        }
+
         $rows += [pscustomobject]@{
             target   = $item.target
             label    = $label
             about    = $about
             model    = $model
             effort   = $effort
+            context  = $context
             custom   = [bool] ($item.model -or $item.effort)
             note     = $item.note
             state    = $state
@@ -1789,6 +1923,7 @@ function Get-DashboardFrame {
         outline   = $outline
         model     = $Config.model
         effort    = $Config.effort
+        autoCompact = $Config.autoCompact
         logDir    = $Config.logDir
         finished  = (Test-Path $doneFile)
         live      = [bool] @($rows | Where-Object { $_.state -in @('running', 'merging') })
