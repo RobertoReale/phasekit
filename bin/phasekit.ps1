@@ -619,13 +619,23 @@ function Invoke-Auto {
     if ($Push) { Write-Host '  Pushing after each merge.' -ForegroundColor Yellow }
 
     function Stop-Auto {
-        param([string] $Target, [string] $Why, [string] $Next)
+        param([string] $Target, [string] $Why, [string] $Next, $Detail)
+
+        # The last lines of whatever failed, in the file itself. The terminal that printed
+        # them belongs to a detached process nobody is watching, and telling a reader to go
+        # and reproduce a fifteen-minute suite to see one assertion is not a stop note.
+        $body = ''
+        foreach ($d in @($Detail)) {
+            if (-not $d) { continue }
+            $body += "`n--- $($d.name) (exit $($d.code)) ---`n$($d.tail)`n"
+        }
+
         $text = @"
 Unattended sequence stopped at $Target
 $(Get-Date -Format 'yyyy-MM-dd HH:mm')
 
 Why: $Why
-
+$body
 What to do: $Next
 "@
         Set-Content -LiteralPath $stopFile -Value $text
@@ -798,7 +808,8 @@ What to do: $Next
         # again, this reads the exit code rather than the noise in front of it.
         $merged = @(Invoke-Merge -Quiet -AllowNoCommits:$item.allowNoCommits)[-1]
         if ($merged -ne 0) {
-            Stop-Auto -Target $target -Why 'the merge preconditions or the gates failed on the branch' `
+            $why = Format-GateFailures -Failures (Get-LastGateFailures)
+            Stop-Auto -Target $target -Why $why -Detail (Get-LastGateFailures) `
                 -Next "phasekit merge $target   to see what blocked it"
             return 1
         }

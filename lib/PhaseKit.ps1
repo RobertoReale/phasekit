@@ -1088,12 +1088,23 @@ function Test-PhaseReady {
 # Gates
 # ---------------------------------------------------------------------------
 
+# What the last Invoke-Gates found, kept so a caller can say WHICH gate failed. A run that
+# stops at 21:43 saying "the gates failed" and nothing more costs whoever reads it another
+# full gate cycle to learn what the runner already knew, and on a project whose suite
+# includes a browser run that is fifteen minutes to recover one line.
+$script:LastGateFailures = @()
+
 function Invoke-Gates {
     <#
         Runs the project's gates without an agent, so a human can check the state of the
         tree for free instead of spending a turn asking.
+
+        Returns the number that failed. The names, exit codes and last output lines are
+        left in $script:LastGateFailures for a caller that has to explain itself later.
     #>
     param([Parameter(Mandatory)] $Config)
+
+    $script:LastGateFailures = @()
 
     if (-not $Config.gates -or $Config.gates.Count -eq 0) {
         Write-Host 'No gates defined in phasekit.json.' -ForegroundColor Yellow
@@ -1106,6 +1117,7 @@ function Invoke-Gates {
         if (-not (Test-Path $cwd)) {
             Write-Host ("  FAIL  {0,-22} directory not found: {1}" -f $g.name, $cwd) -ForegroundColor Red
             $failed++
+            $script:LastGateFailures += [pscustomobject]@{ name = $g.name; code = -1; tail = "directory not found: $cwd" }
             continue
         }
 
@@ -1132,9 +1144,34 @@ function Invoke-Gates {
             Write-Host ("  FAIL  {0,-22} {1}  (exit {2})" -f $g.name, $g.run, $code) -ForegroundColor Red
             $lastLines = ($out | Select-Object -Last 8) -join "`n"
             if ($lastLines.Trim()) { Write-Host $lastLines -ForegroundColor DarkGray }
+            $script:LastGateFailures += [pscustomobject]@{ name = $g.name; code = $code; tail = $lastLines }
         }
     }
     return $failed
+}
+
+function Get-LastGateFailures {
+    <#
+        The failures the last Invoke-Gates found, in the order they were run.
+    #>
+    return $script:LastGateFailures
+}
+
+function Format-GateFailures {
+    <#
+        The failing gates as one line, for a stop note somebody reads hours later without
+        the terminal that produced it.
+    #>
+    param($Failures)
+
+    # Where-Object, not just @(): an empty array arrives at a parameter as $null, and
+    # @($null) is a one-element array holding nothing - which reads as "1 gate failing"
+    # with no name after it. The stop note is read when nobody is watching; it cannot
+    # invent a failure.
+    $f = @($Failures | Where-Object { $_ })
+    if ($f.Count -eq 0) { return 'the merge preconditions failed on the branch' }
+    $named = ($f | ForEach-Object { "$($_.name) (exit $($_.code))" }) -join ', '
+    return "$($f.Count) gate(s) failing on the branch: $named"
 }
 
 # ---------------------------------------------------------------------------

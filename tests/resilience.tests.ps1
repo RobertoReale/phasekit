@@ -162,6 +162,58 @@ finally {
 }
 
 # ---------------------------------------------------------------------------
+# Saying which gate failed
+# ---------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'what a stop note can say'
+
+$gateDir = Join-Path ([System.IO.Path]::GetTempPath()) ("phasekit-gates-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $gateDir -Force | Out-Null
+
+try {
+    $gateCfg = [pscustomobject]@{
+        configDir  = $gateDir
+        workingDir = $gateDir
+        gates      = @(
+            [pscustomobject]@{ name = 'tests'; cwd = '.'; run = 'cmd /c exit 0' }
+            [pscustomobject]@{ name = 'browser suite'; cwd = '.'; run = 'cmd /c exit 3' }
+            [pscustomobject]@{ name = 'nowhere'; cwd = 'no-such-dir'; run = 'cmd /c exit 0' }
+        )
+    }
+
+    $failed = Invoke-Gates -Config $gateCfg
+    Test-Case 'the count is still what Invoke-Gates returns' $failed 2
+
+    $f = @(Get-LastGateFailures)
+    Test-Case 'only the failures are remembered' $f.Count 2
+    Test-Case 'a failure keeps its name' $f[0].name 'browser suite'
+    Test-Case 'a failure keeps its exit code' $f[0].code 3
+    Test-Case 'a missing directory is a failure too' $f[1].name 'nowhere'
+
+    # This string is the whole point: it is what somebody reads hours later, out of a file,
+    # with no terminal and no memory of what was running.
+    Test-Case 'the stop note names them' `
+        (Format-GateFailures -Failures $f) `
+        '2 gate(s) failing on the branch: browser suite (exit 3), nowhere (exit -1)'
+
+    # A green run must clear the previous one, or the next stop quotes a failure that has
+    # since been fixed - which is worse than saying nothing.
+    $green = [pscustomobject]@{
+        configDir = $gateDir; workingDir = $gateDir
+        gates = @([pscustomobject]@{ name = 'tests'; cwd = '.'; run = 'cmd /c exit 0' })
+    }
+    $null = Invoke-Gates -Config $green
+    Test-Case 'a green run forgets the last failures' @(Get-LastGateFailures).Count 0
+    Test-Case 'nothing failing is said plainly' `
+        (Format-GateFailures -Failures (Get-LastGateFailures)) `
+        'the merge preconditions failed on the branch'
+}
+finally {
+    Remove-Item -LiteralPath $gateDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
 # Whether a runner is actually running
 # ---------------------------------------------------------------------------
 
