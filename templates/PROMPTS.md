@@ -80,18 +80,33 @@ Used automatically by `phasekit run <task>` whenever the target has a dot in it 
 `phasekit run 4.2` sends this block with `{{TASK}}` replaced by `4.2`. One generic block
 instead of one per task, which would be twenty near-identical copies waiting to drift.
 
+`{{SECTION}}` is replaced with that target's own section of the plan. Use it, and do not
+ask the agent to read the plan: a real plan reaches a hundred kilobytes, and what a
+session reads it does not read once — it carries it in the context of every request it
+makes afterwards.
+
 ```
-Read AGENT-RULES.md and PLAN.md.
+Read AGENT-RULES.md.
+
+The task itself is quoted at the end of this prompt. Do not read all of PLAN.md:
+grep it for the one line you need (the ledger row, a neighbouring task) instead.
 
 CHECK FIRST: the gates are green, the working tree is clean, and the task
 immediately before {{TASK}} in the ledger is both ticked and backed by a commit in
 git log. Report each; if any fails, STOP and tell me.
 
-THEN: execute task {{TASK}} from PLAN.md and nothing else. Respect every constraint
-listed under it — those are the invariants the task is most likely to break.
+THEN: execute task {{TASK}} and nothing else. Respect every constraint listed under
+it — those are the invariants the task is most likely to break.
 
 One commit. Gates green before it. Documentation updated in the same commit. Tick
 the ledger. Then stop.
+
+Keep the context small as you work: read the part of a file you need rather than
+the whole file, pipe long command output through `tail`, and never read a lock file.
+
+--- the task, quoted from PLAN.md ---
+
+{{SECTION}}
 ```
 
 ---

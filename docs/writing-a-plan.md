@@ -54,6 +54,13 @@ because you cannot tell which half broke the thing that broke.
 **A "done when" that is a feeling.** "Done when the code is cleaner" is not checkable, so
 the box gets ticked on vibes.
 
+**Too large, which you can only see afterwards.** `phasekit spend` reports how many
+requests each target took. A typical one lands between sixty and a hundred and twenty. One
+that took several hundred was not a unit of work, whatever the section heading claimed —
+and it costs disproportionately, because a session's context grows as it goes and every
+request pays for what came before. Treat the number as a note for the next plan: that
+task should have been two.
+
 ## Order the phases by dependency
 
 Ask of each phase: *if I do this after that one instead, does it get more expensive?*

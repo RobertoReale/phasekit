@@ -109,6 +109,42 @@ agent that writes "my context is getting long" is describing its situation, not 
 and restarting a session that was still working is worse than the problem. Only the
 runtime's own error counts.
 
+## The allowance goes far faster than the work explains
+
+Nothing has failed. The sequence is merging targets and the gates are green — and the
+day's allowance is gone by lunchtime, on work that does not look like it should have cost
+that.
+
+Ask the logs rather than guessing:
+
+```
+$ phasekit spend
+
+  target   attempts  requests   peak ctx    weighted
+  H.5             1        95       293k        2.5M
+  B.1             1       162       313k        4.1M
+  B.2             1       374       543k       16.4M
+```
+
+The column that explains it is **peak ctx**, not requests. A request costs what its
+context carries, and a session's context only grows: the target above spent its last 174
+requests above 460k tokens, so the same work cost three times at the end of the session
+what it cost at the start. Wall clock cannot see this at all, which is why a target can
+take an ordinary afternoon and cost eight times an ordinary target.
+
+Two settings hold it down, and both are on by default:
+
+- **`"autoCompact": 200000`** in `phasekit.json` is passed to every session, resumes
+  included. Set it lower on a small allowance; `"auto"` hands the ceiling back to the CLI,
+  which is what produced the 542k above.
+- **`{{SECTION}}` in the task prompt block.** If your prompt still says "read PLAN.md",
+  every request that session makes is re-reading the whole plan. Quote the section
+  instead — see `templates/PROMPTS.md`.
+
+If a target still peaks far above the ceiling, the finding is not in the runner. A task
+that takes several hundred requests is a task that was planned too large: see
+[writing-a-plan.md](writing-a-plan.md).
+
 ## The run stopped and left work uncommitted
 
 An interruption mid-task leaves edits on disk with no commit. `git status` is dirty and the

@@ -1116,7 +1116,17 @@ function Show-Spend {
     param($Config, [string[]] $Targets)
 
     $stats = Get-TargetLogStats -LogDir $Config.logDir
-    $sequence = Get-AutoSequence -Config $Config -Targets $Targets
+
+    # The sequence is the order worth reading this in, but it is not what makes a target
+    # measurable - the log is. A project with no autoSequence, or one that has run targets
+    # by hand, still has logs and still deserves an answer, so fall back to what the log
+    # directory holds rather than to the error `auto` would rightly give.
+    $sequence = @()
+    try { $sequence = @(Get-AutoSequence -Config $Config -Targets $Targets) } catch { }
+    if ($sequence.Count -eq 0) {
+        $sequence = @($stats.Keys | Sort-Object { $stats[$_].first } |
+                      ForEach-Object { [pscustomobject]@{ target = $_ } })
+    }
 
     Write-Host ''
     Write-Host "  phasekit  $(Split-Path -Leaf $Config.codeDir) - what the sequence has spent" -ForegroundColor Cyan
