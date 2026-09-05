@@ -145,6 +145,32 @@ If a target still peaks far above the ceiling, the finding is not in the runner.
 that takes several hundred requests is a task that was planned too large: see
 [writing-a-plan.md](writing-a-plan.md).
 
+## A task ended with its work uncommitted and nothing had failed
+
+The stop note says "N uncommitted change(s) - a task ended without committing; the branch
+has no commits on it", the gates were all green, and the log's last message reads like the
+task was nearly done: *"the suite is running, I'll report the result when it completes"*.
+
+Nothing failed. The session ended its turn to wait, and a `-p` session has no next turn:
+ending the turn ends the process. Whatever it started in the background outlives it for a
+few minutes as an orphan writing into a closed pipe, and then that too is gone. The work is
+on disk and safe; the commit that would have kept it never happened.
+
+The fix is in the prompt, not the runner. The task block in `templates/PROMPTS.md` carries
+the rule — run suites in the foreground and let the call block; poll anything backgrounded
+to completion inside the same turn. Check yours has it, in those words: a prompt that only
+says "wait for the tests to pass" leaves the agent free to wait the wrong way.
+
+To recover, answer in the same conversation rather than committing by hand — the session
+still has everything it knows:
+
+```
+phasekit reply <target> -File answer.txt
+```
+
+Kill the orphaned run first if one is still alive, or it will fight the new one for the
+test port.
+
 ## The run stopped and left work uncommitted
 
 An interruption mid-task leaves edits on disk with no commit. `git status` is dirty and the

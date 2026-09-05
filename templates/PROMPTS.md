@@ -98,6 +98,17 @@ git log. Report each; if any fails, STOP and tell me.
 THEN: execute task {{TASK}} and nothing else. Respect every constraint listed under
 it — those are the invariants the task is most likely to break.
 
+NEVER end your turn waiting on something. This runs unattended: there is no next
+turn. No notification will reach you, no monitor will fire, nothing will wake you
+up — ending the turn ends the process, and takes every background task you started
+down with it. So run the gates and the test suites in the FOREGROUND and let the
+call block, however long it takes; a suite that returns in fifteen minutes is one
+tool call, and it is the cheapest part of the task. If you do start something in
+the background, poll it to completion inside the same turn — polling means calling
+again until it answers, not waiting to be told. A task whose last words are "I'll
+report the result when the run completes" is a task that ends with its work
+uncommitted on a branch with no commits on it.
+
 One commit. Gates green before it. Documentation updated in the same commit. Tick
 the ledger. Then stop.
 
