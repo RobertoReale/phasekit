@@ -294,7 +294,7 @@ matters off the bottom.
   "effort": "high",
   "branchPrefix": "plan/phase-",
   "requireCleanTree": true,
-  "autoCompact": 200000,
+  "autoCompact": 150000,
   "usageLimit": { "maxRetries": 6, "waitMinutes": 20, "maxContextRestarts": 2 },
   "gates": [
     { "name": "tests", "cwd": "backend",  "run": "pytest -q" },
@@ -338,7 +338,7 @@ number exists to put two targets next to each other honestly.
 
 Two things keep that curve flat, and both are on by default:
 
-- **`autoCompact`** (default `200000`) is passed to every session, resumes included, and
+- **`autoCompact`** (default `150000`) is passed to every session, resumes included, and
   caps the conversation instead of leaving the ceiling to the CLI. The context then
   sawtooths under the ceiling rather than climbing past half a million.
 - **`{{SECTION}}` in a prompt block** is replaced with that target's own section of the

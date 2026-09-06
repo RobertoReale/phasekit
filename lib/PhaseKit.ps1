@@ -68,7 +68,7 @@ function Get-PhaseKitConfig {
         # work at the start; it was just carrying every earlier turn again, and a request
         # costs what its context costs. Compacting at a ceiling turns that curve into a
         # sawtooth. Set 'auto' to hand the decision back to the CLI.
-        autoCompact      = 200000
+        autoCompact      = 150000
         # Sound and a desktop notice when the sequence ends or stops to ask. On by
         # default: an unattended run nobody is watching is exactly the one whose stop
         # costs hours before anyone notices.

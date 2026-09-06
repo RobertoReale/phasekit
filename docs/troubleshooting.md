@@ -37,6 +37,27 @@ To confirm which conversation a run is in, look at the `init` line at the top of
 If you ever see `No pinned session id — falling back to -c`, stop and pass `-Session <id>`
 explicitly instead.
 
+## `No conversation found with session ID`
+
+The log says exactly that, the target exits 1, and `auto` stops. The id in the message is
+the one pinned in `.phasekit/logs/phase-<n>.session`, and it looks perfectly valid, because
+it is — just not here.
+
+Claude Code keeps its conversations inside its config directory, which `CLAUDE_CONFIG_DIR`
+selects. Point that variable somewhere else — the usual reason is a second account, work
+and personal on one machine — and you get a different credential store *and* a different
+set of transcripts. The pinned id belongs to the directory that created it. Nothing can
+resume it from the other one.
+
+So the rule is: switch accounts between targets, never during one. A target that is
+running, or stopped waiting for an answer, is holding a conversation that only one config
+directory can reach.
+
+To carry on after it has happened, either put `CLAUDE_CONFIG_DIR` back to the account that
+started the target, or delete that target's `.session` file and let it start a fresh
+conversation. The second costs the session's context, not the work: the branch, the commits
+and the ledger are where progress lives, which is the whole reason they are.
+
 ## The run died and there was no error
 
 First rule out the boring explanation: **a run waiting out a usage limit looks exactly
@@ -134,7 +155,7 @@ take an ordinary afternoon and cost eight times an ordinary target.
 
 Two settings hold it down, and both are on by default:
 
-- **`"autoCompact": 200000`** in `phasekit.json` is passed to every session, resumes
+- **`"autoCompact": 150000`** in `phasekit.json` is passed to every session, resumes
   included. Set it lower on a small allowance; `"auto"` hands the ceiling back to the CLI,
   which is what produced the 542k above.
 - **`{{SECTION}}` in the task prompt block.** If your prompt still says "read PLAN.md",
