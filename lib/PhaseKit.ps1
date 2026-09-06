@@ -1121,24 +1121,46 @@ function Invoke-Gates {
             continue
         }
 
-        Push-Location $cwd
-        try {
-            # Reset first: a gate that is a cmdlet rather than an executable leaves
-            # $LASTEXITCODE untouched, so a stale value from an earlier command would be
-            # read as this gate's result.
-            $global:LASTEXITCODE = 0
-            $out = Invoke-Expression $g.run 2>&1
-            $ok = $?
-            $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } elseif ($ok) { 0 } else { 1 }
-        } catch {
-            $out = $_.Exception.Message
-            $code = 1
-        } finally {
-            Pop-Location
+        # Opt-in, and off unless a gate asks for it: a failing test is not worth retrying
+        # blindly, and a gate that quietly runs twice turns a real regression into a
+        # coin toss. It exists for the one kind of gate whose failures are not all the
+        # code's own - a browser suite drives real servers on real ports, and a run that
+        # collided with the previous one's teardown reports the product as broken. That
+        # answer stops an unattended sequence for as long as nobody is watching, which
+        # for a weekend is three days of nothing. So the gate that knows it can be
+        # disturbed says so, and every retry is printed: a gate that only passes on the
+        # second attempt is a defect report, not a green tick.
+        $attempts = 1
+        if ($g.PSObject.Properties['retries'] -and $g.retries -gt 0) { $attempts += [int] $g.retries }
+
+        for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+            Push-Location $cwd
+            try {
+                # Reset first: a gate that is a cmdlet rather than an executable leaves
+                # $LASTEXITCODE untouched, so a stale value from an earlier command would be
+                # read as this gate's result.
+                $global:LASTEXITCODE = 0
+                $out = Invoke-Expression $g.run 2>&1
+                $ok = $?
+                $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } elseif ($ok) { 0 } else { 1 }
+            } catch {
+                $out = $_.Exception.Message
+                $code = 1
+            } finally {
+                Pop-Location
+            }
+
+            if ($code -eq 0) { break }
+            if ($attempt -lt $attempts) {
+                Write-Host ("  FLAKY {0,-22} exit {1} on attempt {2} of {3} - running it again" -f $g.name, $code, $attempt, $attempts) -ForegroundColor Yellow
+                $lastLines = ($out | Select-Object -Last 8) -join "`n"
+                if ($lastLines.Trim()) { Write-Host $lastLines -ForegroundColor DarkGray }
+            }
         }
 
         if ($code -eq 0) {
-            Write-Host ("  PASS  {0,-22} {1}" -f $g.name, $g.run) -ForegroundColor Green
+            $note = if ($attempt -gt 1) { "  (passed on attempt $attempt of $attempts)" } else { '' }
+            Write-Host ("  PASS  {0,-22} {1}{2}" -f $g.name, $g.run, $note) -ForegroundColor Green
         } else {
             $failed++
             Write-Host ("  FAIL  {0,-22} {1}  (exit {2})" -f $g.name, $g.run, $code) -ForegroundColor Red

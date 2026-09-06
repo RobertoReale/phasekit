@@ -299,10 +299,19 @@ matters off the bottom.
   "gates": [
     { "name": "tests", "cwd": "backend",  "run": "pytest -q" },
     { "name": "types", "cwd": "backend",  "run": "pyright" },
-    { "name": "build", "cwd": "frontend", "run": "npm run build" }
+    { "name": "build", "cwd": "frontend", "run": "npm run build" },
+    { "name": "browser", "cwd": "frontend", "run": "npm run e2e", "retries": 1 }
   ]
 }
 ```
+
+`retries` on a gate is opt-in and absent everywhere it is not written down. A failing test
+is not worth running twice, and a gate that quietly does turns a regression into a coin
+toss. It is there for the one kind of gate whose failures are not all the code's own — a
+browser suite drives real servers on real ports, and a run that collided with the previous
+one's teardown reports the product as broken. Unattended, that answer stops the sequence
+until somebody comes back. Every retry is printed, and a gate that only passed on the
+second attempt says so: it is a defect report, not a green tick.
 
 `workingDir` is where the agent is launched; `codeDir` is the git repository that receives
 the branch and the commits. They differ when the plan lives in a separate notes repo — set

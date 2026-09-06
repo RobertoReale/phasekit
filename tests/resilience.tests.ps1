@@ -208,6 +208,34 @@ try {
     Test-Case 'nothing failing is said plainly' `
         (Format-GateFailures -Failures (Get-LastGateFailures)) `
         'the merge preconditions failed on the branch'
+
+    # A gate that is allowed to be disturbed. `retries` is opt-in and off everywhere it
+    # is not written down: a failing test is not worth running twice, and a gate that
+    # quietly does turns a real regression into a coin toss.
+    $ranOnce = Join-Path $gateDir 'ran-once'
+    $flaky = "if (Test-Path '$ranOnce') { " + '$global:LASTEXITCODE = 0' + " } else { " +
+             "New-Item -ItemType File '$ranOnce' | Out-Null; " + '$global:LASTEXITCODE = 1' + " }"
+
+    $once = [pscustomobject]@{
+        configDir = $gateDir; workingDir = $gateDir
+        gates = @([pscustomobject]@{ name = 'browser suite'; cwd = '.'; run = $flaky })
+    }
+    Test-Case 'a gate without retries fails on the first refusal' (Invoke-Gates -Config $once) 1
+
+    Remove-Item -LiteralPath $ranOnce -Force
+    $twice = [pscustomobject]@{
+        configDir = $gateDir; workingDir = $gateDir
+        gates = @([pscustomobject]@{ name = 'browser suite'; cwd = '.'; run = $flaky; retries = 1 })
+    }
+    Test-Case 'a gate that asked for one retry gets it' (Invoke-Gates -Config $twice) 0
+
+    # The retry is a second chance, not an exemption.
+    $never = [pscustomobject]@{
+        configDir = $gateDir; workingDir = $gateDir
+        gates = @([pscustomobject]@{ name = 'browser suite'; cwd = '.'; run = 'cmd /c exit 3'; retries = 2 })
+    }
+    Test-Case 'a gate that refuses every time fails with retries too' (Invoke-Gates -Config $never) 1
+    Test-Case 'and reports the exit code it really gave' @(Get-LastGateFailures)[0].code 3
 }
 finally {
     Remove-Item -LiteralPath $gateDir -Recurse -Force -ErrorAction SilentlyContinue
