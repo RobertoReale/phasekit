@@ -408,6 +408,167 @@ Test-Case 'the answer names the target it is for' ($answer -match 'G\.10') $true
 Test-Case 'it says to run the gates in the foreground' ($answer -match 'FOREGROUND') $true
 Test-Case 'it says the work is still there' ($answer -match 'Nothing is lost') $true
 
+# ---------------------------------------------------------------------------
+# Reading a failure out of a gate's output
+# ---------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'what a failing gate leaves in the stop note'
+
+# The shape that produced the empty stop note: vitest prints the failure where it happens
+# and the counts at the end, so the tail of a red run is a list of tests that passed.
+$vitest = @(
+    ' RUN  v3.2.4'
+    ''
+    ' FAIL  src/lib/propertyParams.test.ts > round-trips a price range'
+    'AssertionError: expected 250000 to be 25000'
+    '  - Expected: 25000'
+    '  + Received: 250000'
+    ' at src/lib/propertyParams.test.ts:41:22'
+    ''
+) + (1..40 | ForEach-Object { "  ok  src/routes/thing$_.test.tsx (3 tests) 12ms" }) + @(
+    ' Test Files  1 failed | 50 passed (51)'
+    '      Tests  1 failed | 457 passed (458)'
+    '   Duration  68.11s'
+)
+
+$picked = Select-FailureLines -Output $vitest
+
+# The whole point: the name of what broke survives the trip into auto-stopped.txt.
+Test-Case 'the failing test is named' ($picked -match 'round-trips a price range') $true
+Test-Case 'the assertion comes with it' ($picked -match 'expected 250000 to be 25000') $true
+Test-Case 'so does what was expected' ($picked -match 'Expected: 25000') $true
+Test-Case 'and the counts at the end' ($picked -match '1 failed \| 457 passed') $true
+Test-Case 'the forty passing tests in between do not' ($picked -match 'thing20') $false
+Test-Case 'the cut is marked, not silent' ($picked -match '\.\.\.') $true
+
+# The old behaviour, kept for anything this vocabulary does not recognise.
+$unknown = 1..30 | ForEach-Object { "line $_" }
+$tailOnly = Select-FailureLines -Output $unknown -Tail 8
+Test-Case 'output with no marker falls back to the tail' `
+    (($tailOnly -split "`n").Count) 8
+Test-Case 'and it is the end of it' ($tailOnly -match 'line 30') $true
+
+# Colour codes are in front of every anchor, and in the note nobody can read past them.
+$coloured = @("$([char] 27)[31m FAIL  src/x.test.ts > it adds$([char] 27)[39m", 'AssertionError: nope')
+$clean = Select-FailureLines -Output $coloured
+Test-Case 'colour codes are stripped' ($clean -match '\[31m') $false
+Test-Case 'the line survives the stripping' ($clean -match 'FAIL  src/x.test.ts') $true
+
+Test-Case 'pytest failures are recognised' `
+    ((Select-FailureLines -Output @('FAILED tests/test_scan.py::test_dedup - assert 2 == 1')) -match 'test_dedup') $true
+Test-Case 'a type error is recognised' `
+    ((Select-FailureLines -Output @("src/App.tsx(12,5): error TS2304: Cannot find name 'foo'")) -match 'TS2304') $true
+
+Test-Case 'nothing at all is not a crash' (Select-FailureLines -Output @()) ''
+Test-Case 'a null output is not a crash' (Select-FailureLines -Output $null) ''
+
+# ---------------------------------------------------------------------------
+# A pinned session that is not there any more
+# ---------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'resuming a conversation the machine no longer has'
+
+Test-Case 'the sentence claude prints is recognised' `
+    (Test-DeadSession -LogTail 'No conversation found with session ID: cbb679d3-296a-4cb2-8055-e1a0080c68a4') $true
+
+Test-Case 'it is recognised inside a log tail' `
+    (Test-DeadSession -LogTail ("some earlier line" + "`n" + "No conversation found with session ID: abc" + "`n" + '{"type":"result"}')) $true
+
+# It must not swallow the failures that ARE worth retrying, or a dropped connection would
+# cost the pin as well as the attempt.
+Test-Case 'a dropped connection is not this' `
+    (Test-DeadSession -LogTail 'API Error: Connection reset by peer') $false
+
+Test-Case 'a usage limit is not this' `
+    (Test-DeadSession -LogTail 'Claude usage limit reached. Your limit resets at 3am') $false
+
+Test-Case 'an empty log is not this' (Test-DeadSession -LogTail '') $false
+
+# The two classifications have to disagree here, because the retry loop asks this one
+# first and a yes to both would send a dead session round the transient path.
+Test-Case 'a dead session is not classified as transient' `
+    (Test-TransientFailure -LogTail 'No conversation found with session ID: abc') $false
+
+# ---------------------------------------------------------------------------
+# The journal a sequence writes about itself
+# ---------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'the progress journal'
+
+$jd = Join-Path ([IO.Path]::GetTempPath()) ("pk-journal-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $jd | Out-Null
+try {
+    $jcfg = [pscustomobject]@{ logDir = $jd }
+
+    # Silence before a sequence opens one: a hand-run `phasekit gates` must not write into
+    # the record of a run that is not happening.
+    Close-AutoJournal
+    Write-AutoProgress 'this should go nowhere'
+    Test-Case 'nothing is written before a sequence opens one' `
+        (Test-Path (Get-AutoJournalFile -Config $jcfg)) $false
+
+    Open-AutoJournal -Config $jcfg
+    Write-AutoProgress 'G.10 starting'
+    $lines = @(Get-Content -LiteralPath (Get-AutoJournalFile -Config $jcfg))
+    Test-Case 'opening it says the sequence started' ($lines[0] -match 'sequence started') $true
+    Test-Case 'a line lands after it' ($lines[-1] -match 'G\.10 starting') $true
+    Test-Case 'every line is timestamped' ($lines[-1] -match '^\d\d:\d\d:\d\d  ') $true
+
+    # A second sequence starts from an empty journal - what is in it is what is happening
+    # now, not a scroll back through last week.
+    Open-AutoJournal -Config $jcfg
+    Test-Case 'the next sequence truncates it' `
+        (@(Get-Content -LiteralPath (Get-AutoJournalFile -Config $jcfg))).Count 1
+
+    Close-AutoJournal
+    Write-AutoProgress 'after the sequence ended'
+    Test-Case 'closing it stops the writing' `
+        (@(Get-Content -LiteralPath (Get-AutoJournalFile -Config $jcfg))).Count 1
+}
+finally {
+    Close-AutoJournal
+    Remove-Item -LiteralPath $jd -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
+# Dating a log by its own clock
+# ---------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'reading back a log that is hours old'
+
+function Get-Rendered([string[]] $Lines) {
+    Reset-StreamClock
+    return (& { foreach ($l in $Lines) { Write-StreamLine -Line $l } } 6>&1 | Out-String)
+}
+
+$old = '2020-01-02T03:04:05.000Z'
+$stamped = ([datetime] $old).ToLocalTime().ToString('HH:mm:ss')
+
+# The result event carries no timestamp of its own, which is why it used to be dated by
+# the clock of whoever was reading the log rather than by the run that produced it.
+$rendered = Get-Rendered @(
+    '{"type":"assistant","timestamp":"' + $old + '","message":{"content":[{"type":"text","text":"working"}]}}'
+    '{"type":"result","subtype":"success","is_error":false,"num_turns":7}'
+)
+Test-Case 'a finished run is dated by the log, not by now' ($rendered -match ($stamped + '  DONE')) $true
+Test-Case 'and it still says it is done' ($rendered -match 'turns=7') $true
+
+# The log that started all this: a resume of a session that no longer exists. It used to
+# render as a green DONE with turns=0, which reads as a phase that had nothing to do.
+$dead = Get-Rendered @(
+    'No conversation found with session ID: cbb679d3'
+    '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,' +
+        '"errors":["No conversation found with session ID: cbb679d3"]}'
+)
+Test-Case 'a failed run does not say DONE' ($dead -match 'DONE') $false
+Test-Case 'it says FAILED' ($dead -match 'FAILED') $true
+Test-Case 'it names the subtype' ($dead -match 'error_during_execution') $true
+Test-Case 'and it prints the error itself' ($dead -match 'No conversation found') $true
+
 Write-Host ''
 if ($fails) {
     Write-Host "$fails failed." -ForegroundColor Red

@@ -579,6 +579,7 @@ function Invoke-Auto {
     # the last sequence would end the next follow the moment it started.
     Remove-Item -LiteralPath $stopFile -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $doneFile -ErrorAction SilentlyContinue
+    Open-AutoJournal -Config $cfg
 
     # Two runners on one repository is not a race worth having: both merge, both push,
     # and the second one verifies branches the first is still writing. The mark is how
@@ -617,6 +618,8 @@ function Invoke-Auto {
     }
     Write-Host ''
     if ($Push) { Write-Host '  Pushing after each merge.' -ForegroundColor Yellow }
+    Write-AutoProgress ("walking {0} target(s): {1}" -f $sequence.Count,
+                        (($sequence | ForEach-Object { $_.target }) -join ', '))
 
     function Stop-Auto {
         param([string] $Target, [string] $Why, [string] $Next, $Detail)
@@ -639,6 +642,8 @@ $body
 What to do: $Next
 "@
         Set-Content -LiteralPath $stopFile -Value $text
+        Write-AutoProgress "STOPPED at $Target - $Why"
+        Close-AutoJournal
         # A stop is the runner speaking; it is about to exit on purpose. Leaving the mark
         # behind would report a deliberate stop as a killed process, and an alarm that
         # cries wolf on every ordinary stop is one nobody reads.
@@ -699,6 +704,7 @@ What to do: $Next
 
         if (Test-TargetDone -Config $cfg -Target $target) {
             Write-Host "  $target already done — skipping." -ForegroundColor DarkGray
+            Write-AutoProgress "$target already done - skipping"
             continue
         }
 
@@ -714,6 +720,7 @@ What to do: $Next
 
         $Phase = $target
         Set-RunnerMark -Config $cfg -Target $target
+        Write-AutoProgress "$target starting"
 
         # -DryRun prints each target's prompt and stops there. Verifying and merging a
         # run that never happened would report every target as broken.
@@ -756,7 +763,9 @@ What to do: $Next
             Remove-Item -LiteralPath $sessionFile -Force -ErrorAction SilentlyContinue
         }
 
+        Write-AutoProgress ("$target : {0} the agent" -f $(if ($started) { 'resuming' } else { 'running' }))
         $exit = @(Invoke-Run -Mode $(if ($started) { 'continue' } else { 'run' }))[-1]
+        Write-AutoProgress "$target : the agent ended with exit $exit"
 
         # Usage limits are already handled inside the run. What reaches here is a question,
         # a crash, or a dropped connection. Only the last of those is worth retrying: a
@@ -767,6 +776,20 @@ What to do: $Next
             $logNow = Get-ChildItem -Path $cfg.logDir -Filter "phase-$($target -replace '[^\w.-]', '_')-*.log" |
                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
             $tail = if ($logNow) { (Get-Content -LiteralPath $logNow.FullName -Tail 40) -join "`n" } else { '' }
+
+            if (Test-DeadSession -LogTail $tail) {
+                # Resuming a conversation this machine no longer holds is not a failure to
+                # retry: the id is gone, and every attempt spends a second arriving at the
+                # same sentence. Drop the pin so a later reply or continue does not walk
+                # into it as well, and go and judge what the branch actually holds - which,
+                # for work committed before the session was lost, is everything.
+                Write-Host ''
+                Write-Host "  $target's pinned session no longer exists - retrying cannot bring it back." -ForegroundColor Yellow
+                Write-Host '  Dropping the pin and judging the branch on what is committed to it.' -ForegroundColor Yellow
+                Write-AutoProgress "$target : pinned session gone - judging the branch instead"
+                Remove-Item -LiteralPath (Get-SessionFile -Config $cfg -Phase $target) -Force -ErrorAction SilentlyContinue
+                break
+            }
 
             if (-not (Test-TransientFailure -LogTail $tail)) {
                 if ($tries -eq 0) {
@@ -796,14 +819,20 @@ What to do: $Next
         }
 
         $report = Test-PhaseReady -Config $cfg -Phase $target -AllowNoCommits:$item.allowNoCommits
+        Write-AutoProgress ("$target : verify {0}" -f $(if ($report.ok) { 'passed' } else { 'failed - ' + ($report.problems -join '; ') }))
 
         # A task that ended without committing is the one stop with a mechanical answer,
         # so give it here rather than waking somebody to type the same sentence. Once per
         # target: if the same target arrives here a second time the answer was not what it
         # needed, and that stop is the honest one. $Text and $File are read by Invoke-Run
         # out of this scope, the way $Model and $Effort already are.
+        # ...and only where there is a pinned conversation to answer into. Without one,
+        # Get-ResumeArgs falls back to -c, which continues whatever was last spoken to in
+        # that directory - possibly a person's own session, which would then be handed an
+        # instruction to commit somebody else's work.
         if ((-not $report.ok) -and (Test-UnfinishedWorkStop -Report $report) -and
-            (-not $answered.Contains($target))) {
+            (-not $answered.Contains($target)) -and
+            (Get-PinnedSession -Config $cfg -Phase $target)) {
             [void] $answered.Add($target)
             Write-Host ''
             Write-Host "  $target ended without committing - answering it once, in the same conversation." -ForegroundColor Yellow
@@ -838,6 +867,7 @@ What to do: $Next
 
         # Last element, not the whole thing: if any callee ever leaks to the output stream
         # again, this reads the exit code rather than the noise in front of it.
+        Write-AutoProgress "$target : merging - the gates run first"
         $merged = @(Invoke-Merge -Quiet -AllowNoCommits:$item.allowNoCommits)[-1]
         if ($merged -ne 0) {
             $why = Format-GateFailures -Failures (Get-LastGateFailures)
@@ -845,6 +875,8 @@ What to do: $Next
                 -Next "phasekit merge $target   to see what blocked it"
             return 1
         }
+
+        Write-AutoProgress "$target : merged"
 
         if ($Push) {
             $pushed = @(Invoke-GitPushWithRetry -RepoDir $cfg.codeDir)[-1]
@@ -865,6 +897,7 @@ What to do: $Next
                     return 1
                 }
             }
+            Write-AutoProgress "$target : pushed"
         }
     }
 
@@ -875,6 +908,8 @@ $(Get-Date -Format 'yyyy-MM-dd HH:mm')
 Every target ran, verified and merged.
 "@
     Clear-RunnerMark -Config $cfg
+    Write-AutoProgress 'sequence complete - every target ran, verified and merged'
+    Close-AutoJournal
     Write-Host ''
     Write-Host 'Sequence complete. Every target ran, verified and merged.' -ForegroundColor Green
     if ($cfg.notify) {
@@ -985,6 +1020,22 @@ function Watch-Logs {
     $doneFile = Join-Path $Config.logDir 'auto-finished.txt'
     $startedAt = Get-Date
 
+    # What the sequence itself is doing, which no phase log records. Start from the end of
+    # it, after showing the last few lines: somebody attaching mid-run wants to know where
+    # the run is, not to replay it, and everything before this moment is already in the
+    # phase logs the follower is about to show.
+    $journal = Get-AutoJournalFile -Config $Config
+    $journalAt = 0L
+    if (Test-Path $journal) {
+        $recent = @(Get-Content -LiteralPath $journal -Tail 6 -ErrorAction SilentlyContinue)
+        if ($recent.Count -gt 0) {
+            Write-Host ''
+            Write-Host '  Where the sequence is:' -ForegroundColor Cyan
+            foreach ($l in $recent) { Write-Host "  | $l" -ForegroundColor DarkCyan }
+        }
+        $journalAt = (Get-Item $journal).Length
+    }
+
     # A detached launch gets here before the child has opened its first log.
     $current = Get-NewestLog -LogDir $Config.logDir
     while (-not $current) {
@@ -1003,6 +1054,7 @@ function Watch-Logs {
         Write-LogHeader -File $current
         $createdAt = $current.CreationTime
 
+        Reset-StreamClock
         $fs = [System.IO.File]::Open($current.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
                                      [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
         # Stateful, so a UTF-8 character split across two reads still decodes.
@@ -1056,11 +1108,44 @@ function Watch-Logs {
                     }
                 }
 
-                # Silence is normal here — gates, a merge, or a usage-limit wait, none of
-                # which write to the log. Say so, so it does not read as a hang.
+                # The gates, the merge and the push happen without the agent, so none of
+                # them reach a phase log. The sequence writes them to its own journal, and
+                # this is where they get shown: in the gap between one phase log ending and
+                # the next one being created, which is exactly when they happen.
+                if (Test-Path $journal) {
+                    $jlen = (Get-Item $journal).Length
+                    # A new sequence truncates it. Reading on from the old offset would
+                    # start halfway through the first line of the new run.
+                    if ($jlen -lt $journalAt) { $journalAt = 0 }
+                    if ($jlen -gt $journalAt) {
+                        $jfs = [System.IO.File]::Open($journal, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+                                                      [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+                        try {
+                            [void] $jfs.Seek($journalAt, [System.IO.SeekOrigin]::Begin)
+                            $buf = New-Object byte[] ([int][Math]::Min($jlen - $journalAt, 256KB))
+                            $n = $jfs.Read($buf, 0, $buf.Length)
+                            $chunk = [System.Text.Encoding]::UTF8.GetString($buf, 0, $n)
+                            # Only up to the last newline: the writer may be mid-line, and
+                            # half a line shown now is a whole line lost later.
+                            $cut = $chunk.LastIndexOf([char] 10)
+                            if ($cut -ge 0) {
+                                $journalAt += ([System.Text.Encoding]::UTF8.GetByteCount($chunk.Substring(0, $cut + 1)))
+                                foreach ($l in ($chunk.Substring(0, $cut) -split "`n")) {
+                                    if ($l.Trim()) { Write-Host ("  | " + $l.TrimEnd([char] 13)) -ForegroundColor DarkCyan }
+                                }
+                                $lastData = Get-Date
+                                $lastNotice = Get-Date
+                            }
+                        }
+                        finally { $jfs.Dispose() }
+                    }
+                }
+
+                # Silence is still possible - a usage-limit wait writes nothing anywhere.
+                # Say so, so it does not read as a hang.
                 $quiet = ((Get-Date) - $lastData).TotalMinutes
                 if ($quiet -gt 3 -and ((Get-Date) - $lastNotice).TotalMinutes -gt 5) {
-                    Write-Host ("  ... quiet for {0:N0} min - gates, a merge, or waiting out a usage limit" -f $quiet) -ForegroundColor DarkGray
+                    Write-Host ("  ... quiet for {0:N0} min - a usage-limit wait, or a gate that prints nothing until it ends" -f $quiet) -ForegroundColor DarkGray
                     $lastNotice = Get-Date
                 }
 

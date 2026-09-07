@@ -678,6 +678,15 @@ merged yet leaves the runner verifying a branch it is no longer on, which stops 
 sequence and needs a person.
 '@
 
+function Reset-StreamClock {
+    <#
+        Forget the timestamp carried over from the log just finished. The follower rolls
+        from one phase log to the next, and the first events of the new one would
+        otherwise be dated by the end of the old one.
+    #>
+    $script:LastStreamTime = $null
+}
+
 function Write-StreamLine {
     <#
         Renders one stream-json line as a readable line of terminal output. Shared by the
@@ -699,9 +708,17 @@ function Write-StreamLine {
 
     try { $ev = $Line | ConvertFrom-Json } catch { return }
 
-    $t = if ($ev.timestamp) {
-        try { ([datetime] $ev.timestamp).ToLocalTime().ToString('HH:mm:ss') } catch { (Get-Date).ToString('HH:mm:ss') }
-    } else { (Get-Date).ToString('HH:mm:ss') }
+    # Not every event carries a timestamp, and the result event - the one most worth
+    # dating, because it is the line saying the phase ended - carries none at all. Falling
+    # back to the clock there prints a log from three hours ago as though it had just
+    # finished, which is how a run that died at ten reads as one still working at one.
+    # Carry the last stamp the stream did supply; the clock is only for what comes before
+    # the first one.
+    if ($ev.timestamp) {
+        try { $script:LastStreamTime = ([datetime] $ev.timestamp).ToLocalTime() } catch { }
+    }
+    $t = if ($script:LastStreamTime) { $script:LastStreamTime.ToString('HH:mm:ss') }
+         else { (Get-Date).ToString('HH:mm:ss') }
 
     if ($SessionFile -and $ev.session_id -and $ev.session_id -ne $script:SessionId) {
         $script:SessionId = $ev.session_id
@@ -742,7 +759,21 @@ function Write-StreamLine {
         'result' {
             $cost = if ($ev.total_cost_usd) { '  $' + ([math]::Round($ev.total_cost_usd, 2)) } else { '' }
             Write-Host ''
-            Write-Host "$t  DONE  turns=$($ev.num_turns)$cost" -ForegroundColor Green
+            if ($ev.is_error) {
+                # A run that failed printed the same green DONE as one that worked, the only
+                # difference being turns=0 - which reads as a phase that had nothing to do,
+                # not as one that never started. Resuming a session the machine no longer
+                # has ends exactly like that, in under a second, and the log it leaves is
+                # then the newest in the directory: the follower rolls onto it and shows a
+                # green DONE for a run that never happened.
+                Write-Host "$t  FAILED  $($ev.subtype)  turns=$($ev.num_turns)$cost" -ForegroundColor Red
+                foreach ($e in @($ev.errors)) {
+                    $msg = if ($e -is [string]) { $e } else { $e.message }
+                    if ($msg) { Write-Host "          $msg" -ForegroundColor Red }
+                }
+            } else {
+                Write-Host "$t  DONE  turns=$($ev.num_turns)$cost" -ForegroundColor Green
+            }
             if ($ev.result) { Write-Host $ev.result }
         }
     }
@@ -760,6 +791,7 @@ function Invoke-Agent {
         [Parameter(Mandatory)] [string]   $SessionFile
     )
 
+    Reset-StreamClock
     Write-Host ''
     Write-Host ('-' * 72) -ForegroundColor DarkGray
     Write-Host "claude $($ClaudeArgs -join ' ')" -ForegroundColor DarkGray
@@ -1094,6 +1126,81 @@ function Test-PhaseReady {
 # includes a browser run that is fifteen minutes to recover one line.
 $script:LastGateFailures = @()
 
+function Select-FailureLines {
+    <#
+        The lines of a gate's output that say what went wrong, rather than the last few
+        lines of it.
+
+        The tail is the wrong end of a test runner. vitest and pytest print each failure
+        where it happens and the counts at the very end, so the last eight lines of a red
+        run are the names of tests that passed and a "1 failed | 457 passed" - while the
+        one that failed is a hundred lines further up. That is what reached
+        auto-stopped.txt: a stop note whose entire content was a number the reader already
+        had, for a failure nobody could name without running the suite again.
+
+        So find the lines carrying a failure marker, keep a little of what follows each
+        one, and keep the tail as well, because the counts are still worth having.
+    #>
+    param(
+        [string[]] $Output,
+        [int] $Tail = 8,
+        [int] $Before = 1,
+        [int] $After = 6,
+        [int] $Max = 40
+    )
+
+    $lines = @($Output | Where-Object { $null -ne $_ } | ForEach-Object { [string] $_ })
+    if ($lines.Count -eq 0) { return '' }
+
+    # Colour codes sit in front of every anchor below, and a stop note that has to be read
+    # through escape sequences is barely better than no stop note at all.
+    $esc = [char] 27
+    $plain = @($lines | ForEach-Object { $_ -replace "$esc\[[0-9;?]*[A-Za-z]", '' })
+
+    # Deliberately the vocabulary of the runners this is pointed at, rather than a guess at
+    # what failure looks like in general: vitest and pytest (FAIL/FAILED, the numbered
+    # list, the E-prefixed assertion line), tsc (error TSxxxx), pyright (- error:), ruff
+    # (Found n errors), and the two usual shapes of an unhandled exception. Anything
+    # unrecognised falls through to the tail, which is where it was already going.
+    $marker = '(?i)' + (@(
+        '^\s*(FAIL|FAILED)\b'
+        '^\s*[0-9]+\)\s'
+        '^\s*E\s{2,}'
+        '^\s*(x|\u00d7)\s+\S'
+        'AssertionError'
+        '^\s*Error:'
+        '\berror\s+TS[0-9]+'
+        '-\s+error:'
+        '^\s*Found [0-9]+ error'
+        'Traceback \(most recent call last\)'
+        '^\s*(-\s+Expected|\+\s+Received)'
+        '^\s*Unhandled [Ee]rror'
+    ) -join '|')
+
+    $hits = @(0..($plain.Count - 1) | Where-Object { $plain[$_] -match $marker })
+    if ($hits.Count -eq 0) { return (($plain | Select-Object -Last $Tail) -join "`n") }
+
+    $keep = [System.Collections.Generic.SortedSet[int]]::new()
+    foreach ($i in $hits) {
+        foreach ($j in ([Math]::Max(0, $i - $Before))..([Math]::Min($plain.Count - 1, $i + $After))) {
+            [void] $keep.Add($j)
+        }
+    }
+    foreach ($j in ([Math]::Max(0, $plain.Count - $Tail))..($plain.Count - 1)) { [void] $keep.Add($j) }
+
+    $out = [System.Collections.Generic.List[string]]::new()
+    $prev = -1
+    foreach ($i in $keep) {
+        if ($out.Count -ge $Max) { $out.Add('  ... (more above)'); break }
+        # Say where the cut is. Two blocks of output run together read as one, and a stack
+        # trace that is not really under the assertion above it sends the reader nowhere.
+        if ($prev -ge 0 -and $i -gt $prev + 1) { $out.Add('  ...') }
+        $out.Add($plain[$i])
+        $prev = $i
+    }
+    return ($out -join "`n")
+}
+
 function Invoke-Gates {
     <#
         Runs the project's gates without an agent, so a human can check the state of the
@@ -1112,6 +1219,25 @@ function Invoke-Gates {
     }
 
     $failed = 0
+    Write-AutoProgress "gates: $($Config.gates.Count) to run"
+
+    # Every one of these gates is a test runner, and every test runner writes UTF-8. What
+    # PowerShell decodes it with is the console's code page, which on a Windows machine is
+    # cp1252 or cp850 - so a tick becomes three letters and an em dash becomes two. That
+    # noise is survivable on screen, where it is next to the thing it describes, and is not
+    # in a stop note read at seven the next morning, which is all that is left of the run.
+    $priorEncoding = $null
+    try {
+        $priorEncoding = [Console]::OutputEncoding
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    }
+    catch {
+        # A detached run has no console to set. Nothing here is worth failing a gate over.
+        $priorEncoding = $null
+    }
+
+    try {
+
     foreach ($g in $Config.gates) {
         $cwd = if ($g.cwd) { Join-Path $Config.configDir $g.cwd } else { $Config.workingDir }
         if (-not (Test-Path $cwd)) {
@@ -1153,7 +1279,8 @@ function Invoke-Gates {
             if ($code -eq 0) { break }
             if ($attempt -lt $attempts) {
                 Write-Host ("  FLAKY {0,-22} exit {1} on attempt {2} of {3} - running it again" -f $g.name, $code, $attempt, $attempts) -ForegroundColor Yellow
-                $lastLines = ($out | Select-Object -Last 8) -join "`n"
+                Write-AutoProgress "  FLAKY $($g.name) (exit $code on attempt $attempt of $attempts)"
+                $lastLines = Select-FailureLines -Output $out
                 if ($lastLines.Trim()) { Write-Host $lastLines -ForegroundColor DarkGray }
             }
         }
@@ -1161,13 +1288,20 @@ function Invoke-Gates {
         if ($code -eq 0) {
             $note = if ($attempt -gt 1) { "  (passed on attempt $attempt of $attempts)" } else { '' }
             Write-Host ("  PASS  {0,-22} {1}{2}" -f $g.name, $g.run, $note) -ForegroundColor Green
+            Write-AutoProgress "  PASS  $($g.name)$note"
         } else {
             $failed++
+            Write-AutoProgress "  FAIL  $($g.name) (exit $code)"
             Write-Host ("  FAIL  {0,-22} {1}  (exit {2})" -f $g.name, $g.run, $code) -ForegroundColor Red
-            $lastLines = ($out | Select-Object -Last 8) -join "`n"
+            $lastLines = Select-FailureLines -Output $out
             if ($lastLines.Trim()) { Write-Host $lastLines -ForegroundColor DarkGray }
             $script:LastGateFailures += [pscustomobject]@{ name = $g.name; code = $code; tail = $lastLines }
         }
+    }
+
+    }
+    finally {
+        if ($priorEncoding) { try { [Console]::OutputEncoding = $priorEncoding } catch { } }
     }
     return $failed
 }
@@ -1199,6 +1333,57 @@ function Format-GateFailures {
 # ---------------------------------------------------------------------------
 # Unattended sequences
 # ---------------------------------------------------------------------------
+
+function Open-AutoJournal {
+    <#
+        Start the journal a sequence writes its own progress into.
+
+        Everything an unattended run does between two phases - the gates, the merge, the
+        push - happens without the agent, so none of it reaches a phase log. For the
+        twenty minutes a full gate list takes, `phasekit logs -Follow` therefore has
+        nothing to follow but the log of the phase that already ended, which stopped
+        growing before the gates began. There was no way to tell a run doing the slowest
+        part of its work from one that had quietly died.
+
+        Truncated at the start of each sequence: the journal answers what is happening
+        now, and a reader scrolling past last week's merges to find that out is back where
+        they started.
+    #>
+    param([Parameter(Mandatory)] $Config)
+    $script:AutoJournal = Join-Path $Config.logDir 'auto-progress.log'
+    try {
+        Set-Content -LiteralPath $script:AutoJournal `
+            -Value ("{0}  sequence started" -f (Get-Date -Format 'HH:mm:ss'))
+    }
+    catch { $script:AutoJournal = $null }
+}
+
+function Close-AutoJournal {
+    $script:AutoJournal = $null
+}
+
+function Get-AutoJournalFile {
+    param([Parameter(Mandatory)] $Config)
+    return (Join-Path $Config.logDir 'auto-progress.log')
+}
+
+function Write-AutoProgress {
+    <#
+        One line into that journal. Silent unless a sequence has opened one, which is what
+        keeps a hand-run `phasekit gates` from writing into the record of a run that is not
+        happening.
+    #>
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Message)
+    if (-not $script:AutoJournal) { return }
+    try {
+        Add-Content -LiteralPath $script:AutoJournal `
+            -Value ("{0}  {1}" -f (Get-Date -Format 'HH:mm:ss'), $Message)
+    }
+    catch {
+        # The journal is a convenience for whoever is watching. A locked file must not be
+        # able to stop the sequence it is describing.
+    }
+}
 
 function Get-AutoSequence {
     <#
@@ -1366,6 +1551,21 @@ function Test-TargetDone {
     }
 
     return $Snapshot.merged.ContainsKey($branch)
+}
+
+function Test-DeadSession {
+    <#
+        The resume that cannot ever work: the pinned conversation is not on this machine
+        any more. claude says so and exits in under a second.
+
+        It earns its own answer because both of the general remedies make it worse.
+        Retrying resumes the same missing id and fails identically, and the pin stays on
+        disk to take every later reply and continue down the same hole. Whatever the lost
+        session managed to do is on the branch, and the branch is what the run should be
+        judging instead.
+    #>
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $LogTail)
+    return ($LogTail -match '(?i)No conversation found with session ID')
 }
 
 function Test-TransientFailure {

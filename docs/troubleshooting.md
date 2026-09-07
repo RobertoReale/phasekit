@@ -39,24 +39,42 @@ explicitly instead.
 
 ## `No conversation found with session ID`
 
-The log says exactly that, the target exits 1, and `auto` stops. The id in the message is
-the one pinned in `.phasekit/logs/phase-<n>.session`, and it looks perfectly valid, because
-it is — just not here.
+The log says exactly that and nothing else, and the run it describes lasted under a second.
+The id in the message is the one pinned in `.phasekit/logs/phase-<n>.session`, and it looks
+perfectly valid, because it is — just not reachable from here.
 
-Claude Code keeps its conversations inside its config directory, which `CLAUDE_CONFIG_DIR`
-selects. Point that variable somewhere else — the usual reason is a second account, work
-and personal on one machine — and you get a different credential store *and* a different
-set of transcripts. The pinned id belongs to the directory that created it. Nothing can
-resume it from the other one.
+`auto` handles this one itself. It recognises the sentence, drops the pin rather than
+retrying an id that cannot come back, and judges the target on what is committed to its
+branch — which, for a session lost after its work landed, is everything. You will see it in
+the journal:
 
-So the rule is: switch accounts between targets, never during one. A target that is
-running, or stopped waiting for an answer, is holding a conversation that only one config
+```
+  | 23:22:28  G.10 : pinned session gone - judging the branch instead
+```
+
+There are two reasons it happens, and the difference matters only if it keeps happening.
+
+**A different config directory.** Claude Code keeps its conversations inside the directory
+`CLAUDE_CONFIG_DIR` selects. Point that variable somewhere else — the usual reason is a
+second account, work and personal on one machine — and you get a different credential store
+*and* a different set of transcripts. The pinned id belongs to the directory that created
+it. So the rule is: switch accounts between targets, never during one. A target that is
+running, or stopped waiting for an answer, is holding a conversation only one config
 directory can reach.
 
-To carry on after it has happened, either put `CLAUDE_CONFIG_DIR` back to the account that
-started the target, or delete that target's `.session` file and let it start a fresh
-conversation. The second costs the session's context, not the work: the branch, the commits
-and the ledger are where progress lives, which is the whole reason they are.
+**The transcript is there and still will not open.** The `.jsonl` sits in the config
+directory under the right project, and every resume of it fails the same way regardless.
+Nothing recovers that conversation; do not spend the evening trying, as the pinned id is
+the only thing lost.
+
+Either way the remedy is the same and phasekit has already applied it: the session's
+context is gone, the work is not. The branch, the commits and the ledger are where progress
+lives, which is the whole reason they are. What a fresh conversation costs is the reading
+it has to redo, not the work.
+
+If the target had *uncommitted* work on disk when the session was lost, that is the one
+case still needing a person: there is no conversation left to tell to commit it, so `auto`
+stops with the tree dirty and says so. Read the diff, finish it, tick the ledger.
 
 ## The run died and there was no error
 

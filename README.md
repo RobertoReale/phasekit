@@ -191,7 +191,7 @@ saying so costs less than a session an hour spent proving it.
 
 ### How a run ends, and what happens next
 
-Four endings, and each needs a different move. Getting them confused is expensive in both
+Five endings, and each needs a different move. Getting them confused is expensive in both
 directions: waiting out something that will never come back, or restarting something that
 was one turn from finishing.
 
@@ -200,7 +200,8 @@ was one turn from finishing.
 | **The allowance ran out** | Reads the announced reset time, sleeps until it, resumes the *same* conversation | A fixed twenty-minute wait spends every retry before a three-hour reset arrives |
 | **The connection dropped** | Backs off a minute or so and resumes the same conversation | Waiting out a usage-limit interval idles half an hour over a fault that is usually gone in seconds |
 | **The context window filled** | Picks the same target up in a **fresh** conversation, given the continue prompt | A resume replays the transcript that overflowed, so it fails again on the first turn. Nothing is lost: the progress is in the branch, the commits and the ledger, never in the transcript |
-| **Anything else** | Stops, shows the log tail, says how to answer | An agent that stops to ask a question looks exactly like a crash from the outside, and retrying it just re-asks |
+| **The pinned conversation is gone** | Drops the pin and judges the branch on what is committed to it | The id cannot come back, so every retry spends a second arriving at the same sentence — and the pin left on disk takes the next `reply` and `continue` down the same hole |
+| **Anything else** | Stops, shows what failed, says how to answer | An agent that stops to ask a question looks exactly like a crash from the outside, and retrying it just re-asks |
 
 The classifier reads only text the runtime wrote — the CLI's own output and the API's
 error — never a tool result and, for the context verdict, never the agent's prose either.
@@ -211,6 +212,58 @@ A target may be picked up in a fresh conversation twice before phasekit stops an
 a person. A third would be a loop spending the whole allowance re-reading the same plan,
 and resizing the target is a decision, not a retry. Set it with
 `"usageLimit": { "maxContextRestarts": 2 }`.
+
+### Watching a run that is not talking
+
+```powershell
+phasekit logs -Follow
+```
+
+follows the sequence across phases, rolling onto each new log as it is created. Between
+two phases it has nothing to roll onto: the gates, the merge and the push all happen
+without the agent, so none of them reach a phase log. On a full gate list that is twenty
+minutes in which the newest log is the one that stopped growing before the gates began —
+and the last thing on screen is whatever the agent said half an hour ago, which is
+indistinguishable from a run that has died.
+
+So the sequence keeps a journal of its own, `logs/auto-progress.log`, and the follower
+shows it in exactly those gaps:
+
+```
+  | 23:22:23  G.10 : resuming the agent
+  | 23:22:28  G.10 : pinned session gone - judging the branch instead
+  | 23:22:29  G.10 : merging - the gates run first
+  | 23:22:29  gates: 8 to run
+  | 23:24:56    PASS  backend tests
+  | 23:26:29    PASS  frontend tests
+  | 23:42:35    PASS  browser suite
+  | 23:43:11  G.10 : merged
+  | 23:43:15  F.13 starting
+```
+
+It is truncated at the start of each sequence, because the question it answers is where
+the run is now, and scrolling past last week's merges to find that out is where this
+started. Attaching mid-run prints the last few lines first, then follows.
+
+A log is also dated by its own clock rather than by the reader's. Not every event in the
+stream carries a timestamp — the one that says the phase ended carries none at all — and
+filling that in from `Get-Date` printed a run that died at ten as one still working at
+one. And a run that failed no longer renders as the same green `DONE` as one that worked:
+`FAILED`, the subtype, and the error the runtime gave.
+
+### What a stop note has to contain
+
+The terminal that printed the failure belongs to a detached process nobody was watching,
+so the stop note is the whole record. Sending the reader back to reproduce a fifteen-minute
+suite to find out which assertion broke is not a stop note.
+
+That means the tail of the output is the wrong thing to keep. vitest and pytest print each
+failure where it happens and the counts at the very end, so the last lines of a red run are
+the names of tests that *passed*, followed by `1 failed | 457 passed` — a number the reader
+already had, for a failure nobody can name. phasekit looks through the whole output for the
+lines that carry a failure, keeps a little of what follows each one, and keeps the counts as
+well, marking where it cut. Anything whose vocabulary it does not recognise falls back to
+the tail, which is where it was going anyway.
 
 ### Is anyone actually running it
 
