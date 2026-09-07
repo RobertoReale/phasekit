@@ -807,10 +807,19 @@ What to do: $Next
             [void] $answered.Add($target)
             Write-Host ''
             Write-Host "  $target ended without committing - answering it once, in the same conversation." -ForegroundColor Yellow
-            $Text = Get-UnfinishedWorkAnswer -Target $target
-            $File = ''
-            $null = @(Invoke-Run -Mode 'reply')[-1]
-            $Text = ''
+            # A reply needs a session to resume. If that is gone the answer cannot be
+            # delivered, and an exception here would take the whole sequence down with it
+            # - worse than the stop it was trying to avoid. Fall through to that stop.
+            try {
+                $Text = Get-UnfinishedWorkAnswer -Target $target
+                $File = ''
+                $null = @(Invoke-Run -Mode 'reply')[-1]
+            }
+            catch {
+                Write-Host "  the answer could not be delivered ($($_.Exception.Message))." -ForegroundColor Yellow
+            }
+            finally { $Text = '' }
+
             if (Test-TargetDone -Config $cfg -Target $target) {
                 Write-Host "  $target landed after the answer - moving on." -ForegroundColor DarkGray
                 continue
