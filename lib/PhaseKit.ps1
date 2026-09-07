@@ -1490,6 +1490,94 @@ function Get-RunnerState {
     }
 }
 
+<#
+    A runner that was killed cannot restart itself, and the logon task only helps if
+    somebody logs on. Over a weekend nobody does, so the machine sits with a dead
+    process, an untouched sequence and no way to say either.
+
+    The check below is what a periodic task asks. It has exactly one condition, and it
+    is the mark that makes it that simple: a sequence that finished, and a sequence that
+    stopped on purpose because something needs a person, both clear the mark on their way
+    out. A mark still on disk whose process is gone therefore means one thing only - the
+    run was killed. That is the single case worth restarting, and every other reading of
+    the same directory is left alone, which is what keeps a watchdog from relaunching a
+    stop that was deliberate and burning a session every quarter of an hour to do it.
+
+    The restart history is the other half. A run that dies on startup would otherwise be
+    restarted forever, and each attempt costs a real session; three deaths inside three
+    hours is a fault no relaunch is going to fix, so the watchdog says so and goes quiet
+    rather than spending the weekend proving it.
+#>
+
+function Get-WatchdogFile {
+    param([Parameter(Mandatory)] $Config)
+    return (Join-Path $Config.logDir 'auto-watchdog.json')
+}
+
+function Invoke-WatchdogCheck {
+    <#
+        Reads the sequence's state and decides, recording a restart when it calls for one.
+        It never launches anything: the caller does that, so this can be driven through
+        every branch in a test without a sequence existing.
+
+            idle       no mark - finished, stopped on purpose, or never started
+            running    the runner is alive
+            elsewhere  the mark belongs to another machine, which says nothing here
+            restart    the mark is here and its process is gone: relaunch it
+            given-up   it has been relaunched too often, too recently, to keep trying
+    #>
+    param(
+        [Parameter(Mandatory)] $Config,
+
+        # Three tries in three hours. Past that the failure is not the kind a restart
+        # fixes, and each further attempt costs a session nobody is watching.
+        [int] $MaxRestarts = 3,
+        [int] $WindowMinutes = 180,
+
+        # Injected by the tests, which have to place a death in the past.
+        [datetime] $Now = (Get-Date)
+    )
+
+    $file = Get-WatchdogFile -Config $Config
+    $history = @()
+    if (Test-Path $file) {
+        try {
+            $raw = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+            foreach ($r in @($raw.restarts)) {
+                try { $history += [datetime] $r } catch { }
+            }
+        } catch { }
+    }
+    # Anything older than the window is not evidence of anything: a run that died once a
+    # month ago and once today has not been failing, it has failed twice.
+    $recent = @($history | Where-Object { ($Now - $_).TotalMinutes -lt $WindowMinutes })
+
+    $verdict = { param($action, $why) [pscustomobject]@{
+        action = $action; why = $why; restarts = $recent.Count; target = $null } }
+
+    $state = Get-RunnerState -Config $Config
+    if ($null -eq $state) { return (& $verdict 'idle' 'no sequence is running here') }
+    if ($state.alive)     { return (& $verdict 'running' "process $($state.pid) is on $($state.target)") }
+    if (-not $state.here) { return (& $verdict 'elsewhere' "the mark belongs to $($state.machine)") }
+
+    if ($recent.Count -ge $MaxRestarts) {
+        $v = & $verdict 'given-up' ("restarted $($recent.Count) times in the last $WindowMinutes minutes and it keeps dying")
+        $v.target = $state.target
+        return $v
+    }
+
+    $recent += $Now
+    $dir = Split-Path -Parent $file
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Set-Content -LiteralPath $file -Value (
+        [ordered]@{ restarts = @($recent | ForEach-Object { $_.ToString('o') }) } | ConvertTo-Json)
+
+    $v = & $verdict 'restart' "process $($state.pid) was killed while on $($state.target)"
+    $v.restarts = $recent.Count
+    $v.target = $state.target
+    return $v
+}
+
 function Format-Duration {
     <#
         Minutes as something a person reads at a glance. Anything past a day is quoted in

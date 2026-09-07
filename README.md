@@ -38,8 +38,9 @@ a machine with no notification daemon must not take a run down, and a run that c
 prevent sleep is still a run. The terminal bell is the fallback everywhere, which is
 also the one that survives ssh.
 
-`tools/resume-at-logon.ps1` registers a **Windows** Task Scheduler task. Elsewhere it
-refuses and prints the launchd or systemd equivalent to set up by hand.
+`tools/resume-at-logon.ps1` and `tools/watchdog.ps1` register **Windows** Task Scheduler
+tasks. Elsewhere they refuse and print the launchd, systemd or cron equivalent to set up
+by hand.
 
 ## Install
 
@@ -158,6 +159,22 @@ tools/resume-at-logon.ps1 -Install -Push -Config path\to\phasekit.json
 That registers a logon task which resumes the sequence, and does nothing once it has
 finished. Resuming is safe to repeat: merged targets are skipped, and a target with a
 pinned session is continued rather than restarted.
+
+A reboot is not the only way a process dies, though, and a logon task only helps if
+somebody logs on. Nobody does that over a weekend, so a run left alone wants the other
+half as well:
+
+```powershell
+tools/watchdog.ps1 -Install -Push -Config path\to\phasekit.json
+```
+
+That asks every quarter of an hour whether the runner is still there, and restarts it
+only if it was killed. It can tell the difference because a sequence that finished and a
+sequence that stopped to ask a question both clear the runner mark on their way out — so
+a mark whose process is gone means one thing, and a stop that is waiting for a person is
+left waiting rather than relaunched into the same question. A runner that dies three
+times in three hours does not get a fourth: that is a fault a restart will not fix, and
+saying so costs less than a session an hour spent proving it.
 
 ### How a run ends, and what happens next
 

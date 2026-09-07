@@ -294,6 +294,74 @@ finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# ---------------------------------------------------------------------------
+# Restarting a runner that was killed, and knowing when to stop trying
+# ---------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'watching a runner that died'
+
+$wd = Join-Path ([System.IO.Path]::GetTempPath()) ("phasekit-test-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $wd -Force | Out-Null
+$cfg = [pscustomobject]@{ logDir = $wd; configPath = (Join-Path $wd 'phasekit.json') }
+
+# Rewrites the mark on disk to describe a process that is not there. A killed runner
+# leaves exactly this behind, and it is the only state a watchdog may act on.
+function Set-DeadMark {
+    Set-RunnerMark -Config $cfg -Target 'E.2'
+    $m = Get-Content -LiteralPath (Get-RunnerFile -Config $cfg) -Raw | ConvertFrom-Json
+    $m.pid = 999999
+    Set-Content -LiteralPath (Get-RunnerFile -Config $cfg) -Value ($m | ConvertTo-Json)
+}
+
+try {
+    Test-Case 'nothing to watch when no sequence is running' `
+        (Invoke-WatchdogCheck -Config $cfg).action 'idle'
+
+    # A sequence that stopped on purpose clears its mark, so it reads as idle too - which
+    # is the whole reason the watchdog can be this simple and never relaunches a stop that
+    # was asking for a person.
+    Set-Content -LiteralPath (Join-Path $wd 'auto-stopped.txt') -Value 'stopped at E.2'
+    Test-Case 'a deliberate stop is not a death' (Invoke-WatchdogCheck -Config $cfg).action 'idle'
+
+    Set-RunnerMark -Config $cfg -Target 'E.2'
+    Test-Case 'a live runner is left alone' (Invoke-WatchdogCheck -Config $cfg).action 'running'
+
+    $m = Get-Content -LiteralPath (Get-RunnerFile -Config $cfg) -Raw | ConvertFrom-Json
+    $m.machine = 'some-other-box'
+    Set-Content -LiteralPath (Get-RunnerFile -Config $cfg) -Value ($m | ConvertTo-Json)
+    Test-Case 'another machine is not this one to restart' `
+        (Invoke-WatchdogCheck -Config $cfg).action 'elsewhere'
+
+    Set-DeadMark
+    $v = Invoke-WatchdogCheck -Config $cfg
+    Test-Case 'a killed runner is restarted' $v.action 'restart'
+    Test-Case 'and the verdict names the target it died on' $v.target 'E.2'
+
+    Set-DeadMark
+    Test-Case 'a second death still earns a restart' (Invoke-WatchdogCheck -Config $cfg).action 'restart'
+    Set-DeadMark
+    Test-Case 'and a third' (Invoke-WatchdogCheck -Config $cfg).action 'restart'
+
+    # Three restarts inside the window is a fault a fourth will not fix. Each one costs a
+    # session, so the watchdog stops paying for the same answer.
+    Set-DeadMark
+    $v = Invoke-WatchdogCheck -Config $cfg
+    Test-Case 'a run that keeps dying is given up on' $v.action 'given-up'
+    Test-Case 'and it says how many times it tried' $v.restarts 3
+
+    # The same three deaths, spread over a week, are three unrelated accidents.
+    Set-Content -LiteralPath (Get-WatchdogFile -Config $cfg) -Value (
+        [ordered]@{ restarts = @(1, 2, 3 | ForEach-Object {
+            (Get-Date).AddDays(-$_).ToString('o') }) } | ConvertTo-Json)
+    Set-DeadMark
+    Test-Case 'deaths outside the window are not a pattern' `
+        (Invoke-WatchdogCheck -Config $cfg).action 'restart'
+}
+finally {
+    Remove-Item -LiteralPath $wd -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host ''
 if ($fails) {
     Write-Host "$fails failed." -ForegroundColor Red
