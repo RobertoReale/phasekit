@@ -669,6 +669,7 @@ What to do: $Next
     $cliEffort = $Effort
 
     $attempted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $answered = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     while ($true) {
         if (-not $Targets) {
             try {
@@ -795,6 +796,28 @@ What to do: $Next
         }
 
         $report = Test-PhaseReady -Config $cfg -Phase $target -AllowNoCommits:$item.allowNoCommits
+
+        # A task that ended without committing is the one stop with a mechanical answer,
+        # so give it here rather than waking somebody to type the same sentence. Once per
+        # target: if the same target arrives here a second time the answer was not what it
+        # needed, and that stop is the honest one. $Text and $File are read by Invoke-Run
+        # out of this scope, the way $Model and $Effort already are.
+        if ((-not $report.ok) -and (Test-UnfinishedWorkStop -Report $report) -and
+            (-not $answered.Contains($target))) {
+            [void] $answered.Add($target)
+            Write-Host ''
+            Write-Host "  $target ended without committing - answering it once, in the same conversation." -ForegroundColor Yellow
+            $Text = Get-UnfinishedWorkAnswer -Target $target
+            $File = ''
+            $null = @(Invoke-Run -Mode 'reply')[-1]
+            $Text = ''
+            if (Test-TargetDone -Config $cfg -Target $target) {
+                Write-Host "  $target landed after the answer - moving on." -ForegroundColor DarkGray
+                continue
+            }
+            $report = Test-PhaseReady -Config $cfg -Phase $target -AllowNoCommits:$item.allowNoCommits
+        }
+
         if (-not $report.ok) {
             Stop-Auto -Target $target `
                 -Why ($report.problems -join '; ') `

@@ -1578,6 +1578,63 @@ function Invoke-WatchdogCheck {
     return $v
 }
 
+function Test-UnfinishedWorkStop {
+    <#
+    .SYNOPSIS
+        Did this phase stop with its work on disk and no commit behind it?
+
+    .DESCRIPTION
+        The one stop reason that is not a question. A task that ends its turn while a
+        suite is still running in the background takes the suite down with it and leaves
+        the branch dirty and empty, and the answer is always the same sentence typed by
+        hand at whatever hour somebody notices. There is nothing in it for a person to
+        decide, so it is not worth waking one up for.
+
+        Narrow on purpose. It demands work on disk: changes waiting to be saved are what
+        make "finish what you started" the right answer rather than a guess about what
+        went wrong. Every other problem disqualifies it - a branch that does not exist,
+        the wrong branch checked out, a ledger that disagrees with the repository - since
+        each of those says something happened that nobody has understood yet.
+    #>
+    param([Parameter(Mandatory)] $Report)
+
+    if ($Report.ok) { return $false }
+
+    $dirty = $false
+    foreach ($problem in $Report.problems) {
+        if ([string] $problem -eq 'the branch has no commits on it') { continue }
+        if (([string] $problem).Contains('uncommitted change(s)')) { $dirty = $true; continue }
+        return $false
+    }
+    return $dirty
+}
+
+function Get-UnfinishedWorkAnswer {
+    <#
+    .SYNOPSIS
+        What to say to a task that stopped that way, in the words its prompt already uses.
+    #>
+    param([Parameter(Mandatory)] [string] $Target)
+
+    return @"
+You ended your turn with the work of $Target still uncommitted, on a branch that carries
+no commits. If you left anything running in the background, ending the turn ended the
+process and killed it too: nothing will report back, and no notification is coming.
+
+Nothing is lost - the changes are still on disk. Finish it now, in this turn, without
+ending the turn in between:
+
+1. Run the gates in the FOREGROUND and let each call block, however long they take. Do
+   not start anything in the background, do not use a monitor, and do not say you will
+   check back later. There is no later.
+2. Read each result, and fix whatever is red.
+3. Make one commit with all of it, new files included.
+4. Tick the $Target row in the ledger.
+
+Then stop.
+"@
+}
+
 function Format-Duration {
     <#
         Minutes as something a person reads at a glance. Anything past a day is quoted in

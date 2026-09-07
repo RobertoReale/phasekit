@@ -362,6 +362,52 @@ finally {
     Remove-Item -LiteralPath $wd -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# ---------------------------------------------------------------------------
+# The stop that answers itself
+# ---------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'a task that ended without committing'
+
+function New-Report([bool] $ok, [string[]] $problems) {
+    return [pscustomobject]@{ ok = $ok; problems = [System.Collections.Generic.List[string]] $problems }
+}
+
+Test-Case 'a phase that verified is not a stop at all' `
+    (Test-UnfinishedWorkStop -Report (New-Report $true @())) $false
+
+Test-Case 'work on disk and no commit is the case it exists for' `
+    (Test-UnfinishedWorkStop -Report (New-Report $false @(
+        '20 uncommitted change(s) - a task ended without committing',
+        'the branch has no commits on it'))) $true
+
+Test-Case 'work on disk over commits already made still counts' `
+    (Test-UnfinishedWorkStop -Report (New-Report $false @(
+        '3 uncommitted change(s) - a task ended without committing'))) $true
+
+# Nothing to save means nothing to tell it to save, and the reason the phase produced
+# nothing is exactly the thing nobody has established yet.
+Test-Case 'an empty branch with a clean tree is a question, not this' `
+    (Test-UnfinishedWorkStop -Report (New-Report $false @('the branch has no commits on it'))) $false
+
+Test-Case 'a branch that is not there is a question' `
+    (Test-UnfinishedWorkStop -Report (New-Report $false @('branch plan/phase-G.10 does not exist'))) $false
+
+Test-Case 'the wrong branch checked out is a question' `
+    (Test-UnfinishedWorkStop -Report (New-Report $false @(
+        '20 uncommitted change(s) - a task ended without committing',
+        'not on plan/phase-G.10 (currently on master)'))) $false
+
+Test-Case 'a ledger that disagrees is a question' `
+    (Test-UnfinishedWorkStop -Report (New-Report $false @(
+        '2 uncommitted change(s) - a task ended without committing',
+        '1 task(s) in this phase not ticked: G.10 confirm the search'))) $false
+
+$answer = Get-UnfinishedWorkAnswer -Target 'G.10'
+Test-Case 'the answer names the target it is for' ($answer -match 'G\.10') $true
+Test-Case 'it says to run the gates in the foreground' ($answer -match 'FOREGROUND') $true
+Test-Case 'it says the work is still there' ($answer -match 'Nothing is lost') $true
+
 Write-Host ''
 if ($fails) {
     Write-Host "$fails failed." -ForegroundColor Red

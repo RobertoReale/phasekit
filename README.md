@@ -144,6 +144,19 @@ it left off.
 
 Leave irreversible steps out of the sequence and run them by hand.
 
+One stop is not a question, and that one it answers itself. A task that ends its turn
+while a suite is still running in the background takes the suite down with it and leaves
+the branch dirty with no commits on it — every time, the fix is the same sentence, typed
+by hand at whatever hour somebody notices. So the runner types it: one reply into the
+same conversation, telling it to run the gates in the foreground and commit, and then it
+carries on. Once per target. If the same target comes back a second time the answer was
+not what it needed, and that stop is the honest one.
+
+That is the whole of what it will answer for itself. Work on disk is what makes it
+recoverable, so a clean tree with no commits still stops — the reason a target produced
+nothing is exactly what nobody has established yet — and so does a missing branch, the
+wrong branch, or a ledger that disagrees with the repository.
+
 It tells you when it ends, either way — sound and a desktop notice on both the completion
 and the stop. The stop is the one that pays for it: a sequence waiting for an answer costs
 nothing to fix and everything to not notice. Set `"notify": false` to turn it off.
