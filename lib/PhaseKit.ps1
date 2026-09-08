@@ -1470,9 +1470,16 @@ function New-RepoSnapshot {
     $main = Get-MainBranch -Config $Config
 
     $branches = @{}
-    foreach ($b in @(git -C $Config.codeDir for-each-ref --format='%(refname:short)' "refs/heads/$($Config.branchPrefix)*")) {
-        if ($b) { $branches[$b.Trim()] = $true }
+    $tips = @{}
+    foreach ($b in @(git -C $Config.codeDir for-each-ref --format='%(refname:short) %(objectname)' "refs/heads/$($Config.branchPrefix)*")) {
+        if (-not $b) { continue }
+        $name, $tip = ([string] $b).Trim() -split '\s+', 2
+        if ($name) {
+            $branches[$name] = $true
+            if ($tip) { $tips[$name] = $tip.Trim() }
+        }
     }
+    $mainTip = ([string] (git -C $Config.codeDir rev-parse --verify --quiet $main)).Trim()
 
     $merged = @{}
     foreach ($b in @(git -C $Config.codeDir branch --merged $main --format='%(refname:short)')) {
@@ -1495,7 +1502,9 @@ function New-RepoSnapshot {
 
     return [pscustomobject]@{
         main      = $main
+        mainTip   = $mainTip
         branches  = $branches
+        tips      = $tips
         merged    = $merged
         ahead     = $ahead
         hasPlan   = $hasPlan
@@ -1517,7 +1526,11 @@ function Test-TargetDone {
         # A reading of the repository and the plan taken once by the caller. Left out, one
         # is taken for this call alone — so every existing caller keeps working and there
         # is still only one set of rules for what "done" means.
-        $Snapshot
+        $Snapshot,
+        # A target that legitimately produces no commit ends with its branch still
+        # pointing at the main branch, which is the one case where that is not evidence
+        # of anything having gone wrong.
+        [switch] $AllowNoCommits
     )
 
     if (-not $Snapshot) { $Snapshot = New-RepoSnapshot -Config $Config }
@@ -1548,6 +1561,22 @@ function Test-TargetDone {
         # the two cases part here: no plan, no branch, not done. Redoing finished work
         # wastes a session; skipping unfinished work builds everything after it on sand.
         return $hasPlan
+    }
+
+    # A branch that exists and points exactly where the main branch does was created and
+    # never committed to. `git branch --merged` calls it contained, because containing
+    # nothing is trivially true - so a ticked ledger over an empty branch read as "landed
+    # and merged", and the sequence walked past a task whose work was still only on disk.
+    # That is the ledger-versus-repository disagreement this function exists to catch, and
+    # it was the one shape of it that got through.
+    #
+    # The tip is what separates the two cases, and only because merges here are --no-ff:
+    # a branch that really landed has the merge commit sitting on top of it, so it can
+    # never share the main branch's tip. The check is skipped for a target declared to
+    # produce no commits, where an empty branch is the expected ending.
+    if (-not $AllowNoCommits -and $Snapshot.mainTip -and $Snapshot.tips -and
+        $Snapshot.tips.ContainsKey($branch) -and $Snapshot.tips[$branch] -eq $Snapshot.mainTip) {
+        return $false
     }
 
     return $Snapshot.merged.ContainsKey($branch)

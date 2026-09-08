@@ -569,6 +569,86 @@ Test-Case 'it says FAILED' ($dead -match 'FAILED') $true
 Test-Case 'it names the subtype' ($dead -match 'error_during_execution') $true
 Test-Case 'and it prints the error itself' ($dead -match 'No conversation found') $true
 
+# ---------------------------------------------------------------------------
+# Whether a target has actually landed
+# ---------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'deciding that a target is done'
+
+$MAIN = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+$OWN  = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+
+function New-Snapshot {
+    param(
+        [string[]] $Plan,
+        [hashtable] $Tips = @{},
+        [string[]] $Merged = @(),
+        [switch] $NoPlan
+    )
+    $branches = @{}
+    foreach ($k in $Tips.Keys) { $branches[$k] = $true }
+    $mergedMap = @{}
+    foreach ($m in $Merged) { $mergedMap[$m] = $true }
+    return [pscustomobject]@{
+        main = 'master'; mainTip = $MAIN
+        branches = $branches; tips = $Tips; merged = $mergedMap; ahead = @{}
+        hasPlan = (-not $NoPlan); planLines = $Plan
+    }
+}
+
+$cfgD = [pscustomobject]@{ branchPrefix = 'plan/phase-'; plan = 'nowhere.md'; codeDir = '.' }
+$ticked   = @('- [x] G.6 say which portals answered')
+$unticked = @('- [ ] G.6 say which portals answered')
+
+# The shape that cost a morning: the agent ticked the ledger and ended without ever
+# committing, so its branch still pointed exactly where master did. `git branch --merged`
+# calls such a branch contained - containing nothing is trivially true - and the sequence
+# read "ticked and merged", skipped the verify entirely and walked on to the next target,
+# whose first act is to demand a clean tree.
+Test-Case 'a ticked ledger over a branch that never got a commit is not done' `
+    (Test-TargetDone -Config $cfgD -Target 'G.6' -Snapshot (New-Snapshot -Plan $ticked `
+        -Tips @{ 'plan/phase-G.6' = $MAIN } -Merged @('plan/phase-G.6'))) $false
+
+# ...and the case it must not break: a branch that really landed. --no-ff puts the merge
+# commit on top, so master moves and the branch keeps its own tip.
+Test-Case 'a branch that really merged is done' `
+    (Test-TargetDone -Config $cfgD -Target 'G.6' -Snapshot (New-Snapshot -Plan $ticked `
+        -Tips @{ 'plan/phase-G.6' = $OWN } -Merged @('plan/phase-G.6'))) $true
+
+Test-Case 'a merged branch tidied away is still done' `
+    (Test-TargetDone -Config $cfgD -Target 'G.6' -Snapshot (New-Snapshot -Plan $ticked)) $true
+
+Test-Case 'a branch with its own commits that has not merged is not done' `
+    (Test-TargetDone -Config $cfgD -Target 'G.6' -Snapshot (New-Snapshot -Plan $ticked `
+        -Tips @{ 'plan/phase-G.6' = $OWN })) $false
+
+Test-Case 'an unticked ledger is not done whatever the branch says' `
+    (Test-TargetDone -Config $cfgD -Target 'G.6' -Snapshot (New-Snapshot -Plan $unticked `
+        -Tips @{ 'plan/phase-G.6' = $OWN } -Merged @('plan/phase-G.6'))) $false
+
+# A target declared to produce no commit ends with an empty branch on purpose, so the
+# guard has to stand down for it or the sequence would run it again for ever.
+Test-Case 'an empty branch is the expected ending when no commit was promised' `
+    (Test-TargetDone -Config $cfgD -Target 'G.6' -AllowNoCommits -Snapshot (New-Snapshot -Plan $ticked `
+        -Tips @{ 'plan/phase-G.6' = $MAIN } -Merged @('plan/phase-G.6'))) $true
+
+# With no plan the repository alone decides, and an empty branch is still not evidence
+# that anything happened.
+Test-Case 'no plan, an empty branch is still not done' `
+    (Test-TargetDone -Config $cfgD -Target 'G.6' -Snapshot (New-Snapshot -NoPlan `
+        -Tips @{ 'plan/phase-G.6' = $MAIN } -Merged @('plan/phase-G.6'))) $false
+
+Test-Case 'no plan and no branch is not done' `
+    (Test-TargetDone -Config $cfgD -Target 'G.6' -Snapshot (New-Snapshot -NoPlan)) $false
+
+# A snapshot from before tips were recorded must not start reporting everything undone.
+$old = New-Snapshot -Plan $ticked -Tips @{ 'plan/phase-G.6' = $MAIN } -Merged @('plan/phase-G.6')
+$old.PSObject.Properties.Remove('tips')
+$old.PSObject.Properties.Remove('mainTip')
+Test-Case 'a snapshot without tips falls back to the old answer' `
+    (Test-TargetDone -Config $cfgD -Target 'G.6' -Snapshot $old) $true
+
 Write-Host ''
 if ($fails) {
     Write-Host "$fails failed." -ForegroundColor Red

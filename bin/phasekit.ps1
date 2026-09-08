@@ -612,7 +612,7 @@ function Invoke-Auto {
     foreach ($s in $sequence) {
         $m = if ($s.model) { $s.model } else { $cfg.model }
         $e = if ($s.effort) { $s.effort } else { $cfg.effort }
-        $done = Test-TargetDone -Config $cfg -Target $s.target -Snapshot $listing
+        $done = Test-TargetDone -Config $cfg -Target $s.target -Snapshot $listing -AllowNoCommits:$s.allowNoCommits
         $mark = if ($done) { 'done' } else { '    ' }
         Write-Host ("    [{0}] {1,-6} {2}/{3}{4}" -f $mark, $s.target, $m, $e, $(if ($s.note) { "   ($($s.note))" } else { '' }))
     }
@@ -702,7 +702,7 @@ What to do: $Next
         $Model = if ($item.model) { $item.model } else { $cliModel }
         $Effort = if ($item.effort) { $item.effort } else { $cliEffort }
 
-        if (Test-TargetDone -Config $cfg -Target $target) {
+        if (Test-TargetDone -Config $cfg -Target $target -AllowNoCommits:$item.allowNoCommits) {
             Write-Host "  $target already done — skipping." -ForegroundColor DarkGray
             Write-AutoProgress "$target already done - skipping"
             continue
@@ -764,7 +764,20 @@ What to do: $Next
         }
 
         Write-AutoProgress ("$target : {0} the agent" -f $(if ($started) { 'resuming' } else { 'running' }))
-        $exit = @(Invoke-Run -Mode $(if ($started) { 'continue' } else { 'run' }))[-1]
+        # A precondition that throws - a dirty tree left by the target before this one is
+        # the way it happens - used to travel straight out of here and end the process.
+        # That leaves a runner mark with no stop note, which reads as a killed runner, so
+        # the watchdog restarts it into the very same refusal. Stopping on purpose says
+        # what happened once and leaves it said.
+        try {
+            $exit = @(Invoke-Run -Mode $(if ($started) { 'continue' } else { 'run' }))[-1]
+        }
+        catch {
+            Stop-Auto -Target $target -Why "$target could not start: $($_.Exception.Message)" `
+                -Next ("Read what it names above - a tree left dirty by the target before this one is the`n" +
+                       "  usual cause, and the fix is to finish or discard that work, not to rerun this target.")
+            return 1
+        }
         Write-AutoProgress "$target : the agent ended with exit $exit"
 
         # Usage limits are already handled inside the run. What reaches here is a question,
@@ -813,8 +826,9 @@ What to do: $Next
         # killed between the merge and the next target. Verifying then reports "not on the
         # phase branch", which is true, describes a success, and is written to
         # auto-stopped.txt in the words of a failure. Ask the outcome, not the exit code.
-        if (Test-TargetDone -Config $cfg -Target $target) {
+        if (Test-TargetDone -Config $cfg -Target $target -AllowNoCommits:$item.allowNoCommits) {
             Write-Host "  $target landed and merged despite exit $exit - moving on." -ForegroundColor DarkGray
+            Write-AutoProgress "$target : already landed and merged - moving on"
             continue
         }
 
@@ -849,8 +863,9 @@ What to do: $Next
             }
             finally { $Text = '' }
 
-            if (Test-TargetDone -Config $cfg -Target $target) {
+            if (Test-TargetDone -Config $cfg -Target $target -AllowNoCommits:$item.allowNoCommits) {
                 Write-Host "  $target landed after the answer - moving on." -ForegroundColor DarkGray
+                Write-AutoProgress "$target : landed after the answer - moving on"
                 continue
             }
             $report = Test-PhaseReady -Config $cfg -Phase $target -AllowNoCommits:$item.allowNoCommits
