@@ -200,7 +200,7 @@ was one turn from finishing.
 | **The allowance ran out** | Reads the announced reset time, sleeps until it, resumes the *same* conversation | A fixed twenty-minute wait spends every retry before a three-hour reset arrives |
 | **The connection dropped** | Backs off a minute or so and resumes the same conversation | Waiting out a usage-limit interval idles half an hour over a fault that is usually gone in seconds |
 | **The context window filled** | Picks the same target up in a **fresh** conversation, given the continue prompt | A resume replays the transcript that overflowed, so it fails again on the first turn. Nothing is lost: the progress is in the branch, the commits and the ledger, never in the transcript |
-| **The pinned conversation is gone** | Drops the pin and judges the branch on what is committed to it | The id cannot come back, so every retry spends a second arriving at the same sentence — and the pin left on disk takes the next `reply` and `continue` down the same hole |
+| **The pinned conversation is gone** | Drops the pin and judges the branch on what is committed to it. If work was left uncommitted, a **fresh** session is handed it | The id cannot come back, so every retry spends a second arriving at the same sentence. And the work is on the branch either way — losing the transcript is not losing the diff |
 | **Anything else** | Stops, shows what failed, says how to answer | An agent that stops to ask a question looks exactly like a crash from the outside, and retrying it just re-asks |
 
 The classifier reads only text the runtime wrote — the CLI's own output and the API's
@@ -250,6 +250,34 @@ stream carries a timestamp — the one that says the phase ended carries none at
 filling that in from `Get-Date` printed a run that died at ten as one still working at
 one. And a run that failed no longer renders as the same green `DONE` as one that worked:
 `FAILED`, the subtype, and the error the runtime gave.
+
+### Finishing work whose conversation is gone
+
+A target that ends without committing is the one stop with a mechanical answer, so
+`auto` gives it rather than waking somebody to type the same sentence. There are two
+ways to give it, and which is available decides:
+
+| | |
+|---|---|
+| The conversation is still there | A reply into it. Far the cheaper: it already knows what it was doing |
+| The conversation is gone | A fresh session, handed the work on the branch and the task it was for |
+
+Never `-c`. Continuing "whatever was last spoken to in this directory" can land on a
+person's own session and hand it an instruction to commit somebody else's work.
+
+The fresh session is told to read the diff **as a reviewer, not as its author**, and that
+it may discard what is wrong-headed rather than incomplete. That half matters: the one
+thing known about the earlier attempt is that it did not finish, and an agent told simply
+to "commit what is there" will commit a half-written refactor as readily as a done one.
+
+By hand, the same thing:
+
+```powershell
+phasekit finish G.6
+```
+
+Once per target either way. A target arriving here a second time was not asking what the
+answer assumed, and that stop is the honest one.
 
 ### What a stop note has to contain
 

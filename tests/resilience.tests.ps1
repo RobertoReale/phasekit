@@ -649,6 +649,71 @@ $old.PSObject.Properties.Remove('mainTip')
 Test-Case 'a snapshot without tips falls back to the old answer' `
     (Test-TargetDone -Config $cfgD -Target 'G.6' -Snapshot $old) $true
 
+# ---------------------------------------------------------------------------
+# Finishing work whose conversation is gone
+# ---------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'the prompt for work nobody remembers writing'
+
+$pw = Join-Path ([IO.Path]::GetTempPath()) ("pk-orphan-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $pw | Out-Null
+try {
+    $planFile = Join-Path $pw 'PLAN.md'
+    $promptsFile = Join-Path $pw 'PROMPTS.md'
+    Set-Content -LiteralPath $planFile -Value @(
+        '### G.6 - Say which portals answered'
+        ''
+        'A scan that reaches four portals and hears back from three has to say so.'
+        ''
+        '## Ledger'
+        '- [ ] G.6 say which portals answered'
+    )
+    # The body has to be fenced: Read-PhasePrompt takes the first fenced block after the
+    # heading, so that a phase with no block cannot silently borrow the next phase's prose.
+    Set-Content -LiteralPath $promptsFile -Value @(
+        '## task'
+        ''
+        '```'
+        'You are executing task {{TASK}} of PLAN.md, unattended.'
+        '```'
+    )
+    $cfgO = [pscustomobject]@{
+        plan = $planFile; prompts = $promptsFile
+        codeDir = $pw; workingDir = $pw; logDir = $pw
+    }
+
+    $orphan = Get-OrphanedWorkPrompt -Config $cfgO -Target 'G.6'
+
+    Test-Case 'it says the earlier attempt did not commit' `
+        ($orphan -match 'ended without committing') $true
+    Test-Case 'it says the conversation is gone' ($orphan -match 'conversation is gone') $true
+    Test-Case 'it says the changes are still on disk' ($orphan -match 'still on disk') $true
+    Test-Case 'it names the target' ($orphan -match 'G\.6') $true
+
+    # The half that matters: a fresh agent told only to "commit what is there" would
+    # commit a half-written refactor as readily as a finished one.
+    Test-Case 'it says to read the diff' ($orphan -match 'git diff') $true
+    Test-Case 'it says to review rather than trust' ($orphan -match 'as a reviewer, not as') $true
+    Test-Case 'it permits discarding what is wrong-headed' ($orphan -match 'discard that part') $true
+    Test-Case 'it still insists on the gates in the foreground' ($orphan -match 'FOREGROUND') $true
+    Test-Case 'it asks for the ledger tick' ($orphan -match 'tick the G\.6 row') $true
+
+    # And it has to carry the task itself, because nothing else in the fresh conversation
+    # knows what the work was for.
+    Test-Case 'the task prompt is appended' ($orphan -match 'You are executing task G\.6') $true
+    Test-Case 'the plan is reachable from it' ($orphan -match [regex]::Escape($planFile)) $true
+
+    # The two prompts are for different readers and must not be confused: the answer is
+    # for the session that did the work, the orphan prompt for one that never saw it.
+    $answerText = Get-UnfinishedWorkAnswer -Target 'G.6'
+    Test-Case 'the same-session answer does not claim the conversation is gone' `
+        ($answerText -match 'conversation is gone') $false
+}
+finally {
+    Remove-Item -LiteralPath $pw -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host ''
 if ($fails) {
     Write-Host "$fails failed." -ForegroundColor Red

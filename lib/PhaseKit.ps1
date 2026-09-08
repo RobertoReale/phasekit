@@ -1838,6 +1838,53 @@ function Test-UnfinishedWorkStop {
     return $dirty
 }
 
+function Get-OrphanedWorkPrompt {
+    <#
+        The prompt for finishing work whose conversation is gone.
+
+        Get-UnfinishedWorkAnswer speaks to the session that did the work and needs only to
+        say "commit it". This one speaks to a conversation that has never seen any of it,
+        so it has to hand over the whole situation: the task as the plan states it, the
+        fact that a previous attempt left changes on disk, and the instruction to judge
+        that work rather than trust it.
+
+        Judge rather than trust is the important half. The earlier attempt ended without
+        committing, so the one thing known about it is that it did not finish - and a
+        fresh agent told to "commit what is there" would commit a half-written refactor
+        as readily as a finished one.
+    #>
+    param(
+        [Parameter(Mandatory)] $Config,
+        [Parameter(Mandatory)] [string] $Target
+    )
+
+    $preamble = @"
+An earlier attempt at $Target ended without committing, and its conversation is gone, so
+you are picking up work you have not seen. The changes are still on disk, on the branch
+that is already checked out.
+
+Start there, before anything else:
+
+1. Read the diff - ``git status`` then ``git diff`` - and read it as a reviewer, not as
+   its author. It is unfinished by definition: the attempt that wrote it did not get to
+   the end.
+2. Compare it against the task below. Finish whatever is missing, and correct whatever is
+   wrong. If some of it is wrong-headed rather than incomplete, discard that part and do
+   it properly - you are not obliged to keep it.
+3. Run the gates in the FOREGROUND and let each call block until it returns. Read each
+   result and fix what is red.
+4. Make one commit with all of it, new files included, then tick the $Target row in the
+   ledger.
+
+The task that work was meant to carry out follows.
+
+---------------------------------------------------------------------------
+
+"@
+
+    return $preamble + (Build-PhasePrompt -Config $Config -Phase $Target)
+}
+
 function Get-UnfinishedWorkAnswer {
     <#
     .SYNOPSIS

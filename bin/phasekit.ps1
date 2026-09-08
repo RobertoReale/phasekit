@@ -115,6 +115,7 @@ phasekit — plan-driven, unattended agent runs
   phasekit reply <phase> -Text .   answer a question, in the same conversation
   phasekit reply <phase> -File .   the same, reading the answer from a file
   phasekit continue <phase>        pick up a phase that was interrupted
+  phasekit finish <phase>          commit work left on a branch by a lost conversation
   phasekit check <phase>           are the merge preconditions met? changes nothing
   phasekit merge <phase>           verify, show the commits, then merge into main
   phasekit status [<phase>]        branch, commits, dirty files, pinned session
@@ -409,7 +410,7 @@ function Restore-PhaseBranch {
 }
 
 function Invoke-Run {
-    param([string] $Mode)   # 'run' | 'reply' | 'continue'
+    param([string] $Mode)   # 'run' | 'reply' | 'continue' | 'finish'
 
     if (-not $Phase) { throw "Which phase? e.g.  phasekit $Mode 0" }
 
@@ -440,6 +441,12 @@ function Invoke-Run {
             $prompt = $script:ContinuePrompt
             $first = (Get-ResumeArgs -SessionId $script:SessionId) + @('-p', $prompt) + $common
         }
+        'finish' {
+            # A fresh conversation over work already on the branch. No --resume: the point
+            # of this mode is that there is nothing left to resume.
+            $prompt = Get-OrphanedWorkPrompt -Config $cfg -Target $Phase
+            $first = @('-p', $prompt) + $common
+        }
     }
 
     if ($DryRun) {
@@ -451,9 +458,9 @@ function Invoke-Run {
         return 0
     }
 
-    # A fresh run demands a clean tree and creates the branch. Reply and continue join work
-    # already in flight, where a dirty tree is the work — but they still have to be on the
-    # right branch, which after a reboot they are not.
+    # A fresh run demands a clean tree and creates the branch. Reply, continue and finish
+    # join work already in flight, where a dirty tree is the work — but they still have to
+    # be on the right branch, which after a reboot they are not.
     $branch = if ($Mode -eq 'run') { Assert-CleanTreeAndBranch -Config $cfg -Phase $Phase }
               else { Restore-PhaseBranch -Config $cfg -Phase $Phase }
 
@@ -840,26 +847,35 @@ What to do: $Next
         # target: if the same target arrives here a second time the answer was not what it
         # needed, and that stop is the honest one. $Text and $File are read by Invoke-Run
         # out of this scope, the way $Model and $Effort already are.
-        # ...and only where there is a pinned conversation to answer into. Without one,
-        # Get-ResumeArgs falls back to -c, which continues whatever was last spoken to in
-        # that directory - possibly a person's own session, which would then be handed an
-        # instruction to commit somebody else's work.
+        # Two ways to finish it, and which one is available decides. With the conversation
+        # still there, a reply is far the cheaper: it already knows what it was doing. With
+        # the conversation gone - a machine that lost it, or a runtime that never wrote it
+        # down - a fresh session is given the work on the branch and the task it was for.
+        # Never -c, which continues whatever was last spoken to in that directory: possibly
+        # a person's own session, handed an instruction to commit somebody else's work.
         if ((-not $report.ok) -and (Test-UnfinishedWorkStop -Report $report) -and
-            (-not $answered.Contains($target)) -and
-            (Get-PinnedSession -Config $cfg -Phase $target)) {
+            (-not $answered.Contains($target))) {
             [void] $answered.Add($target)
+            $hasSession = [bool] (Get-PinnedSession -Config $cfg -Phase $target)
+            $how = if ($hasSession) { 'reply' } else { 'finish' }
             Write-Host ''
-            Write-Host "  $target ended without committing - answering it once, in the same conversation." -ForegroundColor Yellow
-            # A reply needs a session to resume. If that is gone the answer cannot be
-            # delivered, and an exception here would take the whole sequence down with it
-            # - worse than the stop it was trying to avoid. Fall through to that stop.
+            Write-Host $(if ($hasSession) {
+                "  $target ended without committing - answering it once, in the same conversation."
+            } else {
+                "  $target ended without committing and its conversation is gone - a fresh session finishes it."
+            }) -ForegroundColor Yellow
+            Write-AutoProgress "$target : ended without committing - $how"
+            # An exception here would take the whole sequence down with it, which is worse
+            # than the stop it was trying to avoid. Fall through to that stop instead.
             try {
-                $Text = Get-UnfinishedWorkAnswer -Target $target
-                $File = ''
-                $null = @(Invoke-Run -Mode 'reply')[-1]
+                if ($hasSession) {
+                    $Text = Get-UnfinishedWorkAnswer -Target $target
+                    $File = ''
+                }
+                $null = @(Invoke-Run -Mode $how)[-1]
             }
             catch {
-                Write-Host "  the answer could not be delivered ($($_.Exception.Message))." -ForegroundColor Yellow
+                Write-Host "  that did not get through ($($_.Exception.Message))." -ForegroundColor Yellow
             }
             finally { $Text = '' }
 
@@ -1714,6 +1730,7 @@ switch ($Command.ToLowerInvariant()) {
     'run' { Set-MachineAwake; try { exit (Invoke-Run -Mode 'run') } finally { Set-MachineAwake -Off } }
     'reply' { Set-MachineAwake; try { exit (Invoke-Run -Mode 'reply') } finally { Set-MachineAwake -Off } }
     'continue' { Set-MachineAwake; try { exit (Invoke-Run -Mode 'continue') } finally { Set-MachineAwake -Off } }
+    'finish' { Set-MachineAwake; try { exit (Invoke-Run -Mode 'finish') } finally { Set-MachineAwake -Off } }
     'status' { Invoke-Status; exit 0 }
     'dashboard' { exit (Invoke-Dashboard) }
     'dash' { exit (Invoke-Dashboard) }
