@@ -1876,7 +1876,10 @@ Start there, before anything else:
 4. Make one commit with all of it, new files included, then tick the $Target row in the
    ledger.
 
-The task that work was meant to carry out follows.
+The task that work was meant to carry out follows. It is the ordinary prompt for it,
+unchanged, which means its CHECK FIRST step asks for a clean working tree. That one
+condition does not apply here and is not a reason to stop: the tree is dirty because the
+work you are picking up is sitting in it. Check the rest of that step as written.
 
 ---------------------------------------------------------------------------
 

@@ -291,7 +291,12 @@ function Assert-CleanTreeAndBranch {
         Write-Host $dirty
         Write-Host ''
         Write-Host "If this is leftover work from an interrupted run, use:  phasekit continue $Phase" -ForegroundColor Cyan
-        exit 1
+        Write-Host "If it is $Phase's own work, left by a conversation that is gone:  phasekit finish $Phase" -ForegroundColor Cyan
+        # throw, not exit: this runs inside an unattended sequence as often as it runs by
+        # hand, and `exit` there is uncatchable - it ends the whole run with no stop note,
+        # leaving a runner mark that reads as a killed process and invites the watchdog to
+        # restart it into this very same refusal.
+        throw "the working tree is not clean, so $Phase cannot be started fresh"
     }
 
     $branch = "$($Config.branchPrefix)$Phase"
@@ -757,27 +762,48 @@ What to do: $Next
         # tree and the uncommitted work is exactly what makes it dirty.
         $treeDirty = [bool] @(git -C $cfg.codeDir status --porcelain)
 
-        $started = (Test-Path $sessionFile) -and $branchExists -and ($ownCommits -gt 0 -or $treeDirty)
-        if ($started) {
+        # Two independent questions, and conflating them was a bug: is there work, and is
+        # there a conversation? Work on the branch is what decides against starting over -
+        # a fresh run would throw that work away and, worse, could not even begin, because
+        # it demands the clean tree the work itself is making dirty. Whether a conversation
+        # survives only decides HOW to carry on: resuming it if it is there, and a fresh
+        # session over the same branch if it is not.
+        $hasWork = $branchExists -and ($ownCommits -gt 0 -or $treeDirty)
+        $hasSession = Test-Path $sessionFile
+
+        $mode = if ($hasWork -and $hasSession) { 'continue' }
+                elseif ($hasWork) { 'finish' }
+                else { 'run' }
+
+        if ($hasWork) {
             $evidence = if ($ownCommits -gt 0) { "$ownCommits commit(s) on the branch" }
                         else { 'uncommitted work on disk' }
-            Write-Host "  $target was already started ($evidence) - resuming that session, not restarting the phase." -ForegroundColor Yellow
+            Write-Host $(if ($hasSession) {
+                "  $target was already started ($evidence) - resuming that session, not restarting the phase."
+            } else {
+                "  $target was already started ($evidence) and its conversation is gone - a fresh session finishes it."
+            }) -ForegroundColor Yellow
+            # One shot at finishing it. If the branch still is not ready afterwards, the
+            # stop that follows is the honest one rather than a second identical attempt.
+            if (-not $hasSession) { [void] $answered.Add($target) }
         }
-        elseif (Test-Path $sessionFile) {
+        elseif ($hasSession) {
             # Drop the pin: leaving it would make the next run take this same wrong turn,
             # and there is no session worth keeping behind a branch with nothing on it.
             Write-Host "  $target left a session behind but committed nothing - starting it fresh." -ForegroundColor Yellow
             Remove-Item -LiteralPath $sessionFile -Force -ErrorAction SilentlyContinue
         }
 
-        Write-AutoProgress ("$target : {0} the agent" -f $(if ($started) { 'resuming' } else { 'running' }))
+        Write-AutoProgress ("$target : {0} the agent" -f @{
+            continue = 'resuming'; finish = 'finishing what was left on the branch with'; run = 'running'
+        }[$mode])
         # A precondition that throws - a dirty tree left by the target before this one is
         # the way it happens - used to travel straight out of here and end the process.
         # That leaves a runner mark with no stop note, which reads as a killed runner, so
         # the watchdog restarts it into the very same refusal. Stopping on purpose says
         # what happened once and leaves it said.
         try {
-            $exit = @(Invoke-Run -Mode $(if ($started) { 'continue' } else { 'run' }))[-1]
+            $exit = @(Invoke-Run -Mode $mode)[-1]
         }
         catch {
             Stop-Auto -Target $target -Why "$target could not start: $($_.Exception.Message)" `
@@ -826,6 +852,10 @@ What to do: $Next
             }
 
             $tries++
+            if (-not (Get-PinnedSession -Config $cfg -Phase $target)) {
+                Write-Host "  ...and there is no conversation left to resume, so this is where it stops." -ForegroundColor Yellow
+                break
+            }
             $exit = @(Invoke-Run -Mode 'continue')[-1]
         }
 

@@ -704,6 +704,12 @@ try {
     Test-Case 'the task prompt is appended' ($orphan -match 'You are executing task G\.6') $true
     Test-Case 'the plan is reachable from it' ($orphan -match [regex]::Escape($planFile)) $true
 
+    # The inherited task prompt opens by demanding a clean working tree and stopping if it
+    # is not. In this mode that is false by construction, so the preamble has to say so or
+    # the fresh session stops on its first check, before it has read anything.
+    Test-Case 'the clean-tree precondition is disarmed' `
+        ($orphan -match 'does not apply here and is not a reason to stop') $true
+
     # The two prompts are for different readers and must not be confused: the answer is
     # for the session that did the work, the orphan prompt for one that never saw it.
     $answerText = Get-UnfinishedWorkAnswer -Target 'G.6'
