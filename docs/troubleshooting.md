@@ -321,6 +321,28 @@ runner's own window, or `phasekit status`, before concluding anything died.
 If the limit pattern ever fails to match a new wording, the run stops with the log tail
 visible, which is the safe direction to fail in.
 
+### Switching account instead of waiting
+
+A session limit comes back in hours; a weekly one can be days away. If the machine has a
+second Claude account — each lives in its own config directory, `~/.claude` and
+`~/.claude-b`, selected by `CLAUDE_CONFIG_DIR` — switch the run to it:
+
+```powershell
+phasekit account          # the accounts found, and which one runs use
+phasekit account b        # switch to ~/.claude-b
+phasekit account next     # or to whichever comes next
+```
+
+The runner reads the choice before every `claude` it starts, so it applies to the next
+target, the next resume, and a run waiting out a limit right now — that wait ends within a
+minute of the switch and the conversation resumes under the new account. Nothing is lost:
+a conversation's transcript is a local file, and it is copied into the new account before
+`--resume` runs. A conversation already working keeps its account until it stops.
+
+The choice is stored in `~/.phasekit/account` and concerns phasekit only: interactive
+sessions keep whatever `CLAUDE_CONFIG_DIR` says. An account must have been logged in once
+— start `claude` with `CLAUDE_CONFIG_DIR` pointing at it and run `/login`.
+
 ## `auto` stopped on a target it had just merged
 
 `auto-stopped.txt` says the merge preconditions failed, but `git log` on the main

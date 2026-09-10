@@ -284,6 +284,143 @@ function Get-ResumeArgs {
 }
 
 # ---------------------------------------------------------------------------
+# Accounts
+# ---------------------------------------------------------------------------
+#
+# One machine can hold several Claude accounts, each in its own config directory -
+# `~/.claude`, `~/.claude-b` - selected by CLAUDE_CONFIG_DIR. The allowance belongs to the
+# account, so when one runs out for the week the choice is to wait days or to carry on
+# under another. `phasekit account <name>` makes that one command, and the runner reads
+# the choice before every claude it starts: the next target, the next resume, and a run
+# that is waiting out a limit right now.
+#
+# The choice is a file under ~/.phasekit rather than a change to CLAUDE_CONFIG_DIR itself,
+# because it is a decision about unattended runs. An interactive session open elsewhere
+# keeps the account it was started with.
+
+function Get-AccountStateFile {
+    $dir = if ($env:PHASEKIT_HOME) { $env:PHASEKIT_HOME } else { Join-Path $HOME '.phasekit' }
+    return (Join-Path $dir 'account')
+}
+
+function Get-ClaudeAccounts {
+    <#
+        Every `.claude` or `.claude-<name>` directory in the home directory that looks
+        like an account: it holds a login or has run a conversation. `.claude` is called
+        `main`, `.claude-b` is called `b`.
+    #>
+    param([string] $HomeDir = $HOME)
+
+    $found = foreach ($d in @(Get-ChildItem -LiteralPath $HomeDir -Directory -Force -Filter '.claude*' -ErrorAction SilentlyContinue)) {
+        if (-not ($d.Name -match '^\.claude(?:-(?<name>[\w.-]+))?$')) { continue }
+        $isAccount = (Test-Path (Join-Path $d.FullName '.credentials.json')) -or
+                     (Test-Path (Join-Path $d.FullName 'projects'))
+        if (-not $isAccount) { continue }
+        [pscustomobject]@{
+            name = $(if ($Matches['name']) { $Matches['name'] } else { 'main' })
+            dir  = $d.FullName
+        }
+    }
+    return @($found | Sort-Object { $_.name -ne 'main' }, name)
+}
+
+function Get-ChosenAccountName {
+    $f = Get-AccountStateFile
+    if (Test-Path $f) { return ([string] (Get-Content -LiteralPath $f -TotalCount 1)).Trim() }
+    return ''
+}
+
+function Get-ActiveAccount {
+    <#
+        The account the next claude will run under. The one chosen with `phasekit
+        account` when there is one; otherwise whatever CLAUDE_CONFIG_DIR says, which is
+        what claude would have used anyway. `chosen` tells the two apart: only a chosen
+        account is imposed on the child process, so a machine that never ran the command
+        behaves exactly as before it existed.
+    #>
+    param([string] $HomeDir = $HOME)
+
+    $accounts = @(Get-ClaudeAccounts -HomeDir $HomeDir)
+    $name = Get-ChosenAccountName
+    if ($name) {
+        $a = $accounts | Where-Object name -eq $name | Select-Object -First 1
+        if ($a) { return [pscustomobject]@{ name = $a.name; dir = $a.dir; chosen = $true } }
+    }
+
+    $dir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HomeDir '.claude' }
+    $same = $accounts | Where-Object { $_.dir.TrimEnd('\', '/') -ieq $dir.TrimEnd('\', '/') } | Select-Object -First 1
+    $label = if ($same) { $same.name } else { '(environment)' }
+    return [pscustomobject]@{ name = $label; dir = $dir; chosen = $false }
+}
+
+function Set-ActiveAccount {
+    <#
+        Chooses the account by name, or `next` for the one after the current. Returns it.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [string] $HomeDir = $HOME
+    )
+
+    $accounts = @(Get-ClaudeAccounts -HomeDir $HomeDir)
+    if ($accounts.Count -eq 0) { throw "No Claude account found in $HomeDir (looked for .claude and .claude-<name>)." }
+
+    if ($Name -eq 'next') {
+        $current = (Get-ActiveAccount -HomeDir $HomeDir).name
+        $i = [array]::IndexOf(@($accounts.name), $current)
+        $pick = $accounts[($i + 1) % $accounts.Count]
+    } else {
+        $pick = $accounts | Where-Object name -eq $Name | Select-Object -First 1
+        if (-not $pick) { throw "No account called '$Name'. Known: $(($accounts.name) -join ', ')" }
+    }
+
+    $f = Get-AccountStateFile
+    New-Item -ItemType Directory -Path (Split-Path -Parent $f) -Force | Out-Null
+    Set-Content -LiteralPath $f -Value $pick.name
+    return $pick
+}
+
+function Copy-SessionToAccount {
+    <#
+        A conversation lives in the account that started it: `--resume <id>` under
+        another account answers "No conversation found". The transcript is a local file,
+        so the move is to copy it across - into a project folder of the same name, which
+        is the one claude looks in for this working directory. Measured: a conversation
+        started under one account and resumed this way under another carried on with its
+        memory intact.
+
+        Returns whether the target account now has the conversation.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $SessionId,
+        [Parameter(Mandatory)] [string] $ToDir,
+        [object[]] $Accounts = @(Get-ClaudeAccounts)
+    )
+
+    $file = "$SessionId.jsonl"
+    $toProjects = Join-Path $ToDir 'projects'
+    foreach ($p in @(Get-ChildItem -LiteralPath $toProjects -Directory -ErrorAction SilentlyContinue)) {
+        if (Test-Path (Join-Path $p.FullName $file)) { return $true }
+    }
+
+    foreach ($a in $Accounts) {
+        if ($a.dir.TrimEnd('\', '/') -ieq $ToDir.TrimEnd('\', '/')) { continue }
+        foreach ($p in @(Get-ChildItem -LiteralPath (Join-Path $a.dir 'projects') -Directory -ErrorAction SilentlyContinue)) {
+            $src = Join-Path $p.FullName $file
+            if (-not (Test-Path $src)) { continue }
+            $dest = Join-Path $toProjects $p.Name
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            Copy-Item -LiteralPath $src -Destination $dest -Force
+            # Subagent transcripts and large tool results sit beside it, under the id.
+            $side = Join-Path $p.FullName $SessionId
+            if (Test-Path $side) { Copy-Item -LiteralPath $side -Destination $dest -Recurse -Force }
+            return $true
+        }
+    }
+    return $false
+}
+
+# ---------------------------------------------------------------------------
 # Running the agent
 # ---------------------------------------------------------------------------
 
@@ -477,16 +614,31 @@ function Wait-UntilDeadline {
         The countdown is written to the run log as well as the console, because a wait is
         otherwise indistinguishable from a dead run: no claude process, and a log that
         stopped growing. That misreading is the most expensive one in this workflow.
+
+        -Account is the account whose allowance ran out. Choosing another one with
+        `phasekit account` ends the wait at the next tick: the limit being waited for no
+        longer applies to the claude that runs next.
     #>
     param(
         [Parameter(Mandatory)] [datetime] $Deadline,
-        [string] $LogPath
+        [string] $LogPath,
+        [string] $Account
     )
 
     $lastNote = Get-Date
     while ($true) {
         $left = ($Deadline - (Get-Date)).TotalSeconds
         if ($left -le 0) { break }
+
+        if ($Account) {
+            $switchedTo = Get-ChosenAccountName
+            if ($switchedTo -and $switchedTo -ne $Account) {
+                $note = "$script:NoteMarker Account switched to $switchedTo - resuming now instead of waiting out the limit on $Account."
+                Write-Host $note -ForegroundColor Yellow
+                if ($LogPath) { Add-Content -LiteralPath $LogPath -Value $note }
+                break
+            }
+        }
 
         if (((Get-Date) - $lastNote).TotalMinutes -ge 15) {
             $note = "$script:NoteMarker ... still waiting out the usage limit, {0:N0} min to go (resuming ~{1})" -f ($left / 60), $Deadline.ToString('HH:mm')
@@ -795,14 +947,34 @@ function Invoke-Agent {
     Write-Host ''
     Write-Host ('-' * 72) -ForegroundColor DarkGray
     Write-Host "claude $($ClaudeArgs -join ' ')" -ForegroundColor DarkGray
+
+    # Read at every start, not once per run, so `phasekit account` reaches the very next
+    # claude - including the resume that follows a usage-limit wait.
+    $account = Get-ActiveAccount
+    $previousConfigDir = $env:CLAUDE_CONFIG_DIR
+    if ($account.chosen) {
+        Write-Host "account $($account.name)  ($($account.dir))" -ForegroundColor DarkGray
+        $at = [array]::IndexOf($ClaudeArgs, '--resume')
+        if ($at -ge 0 -and $at + 1 -lt $ClaudeArgs.Count) {
+            if (-not (Copy-SessionToAccount -SessionId $ClaudeArgs[$at + 1] -ToDir $account.dir)) {
+                Write-Host "conversation $($ClaudeArgs[$at + 1]) not found in any account - the resume will fail" -ForegroundColor Yellow
+            }
+        }
+        $env:CLAUDE_CONFIG_DIR = $account.dir
+    }
     Write-Host ('-' * 72) -ForegroundColor DarkGray
 
-    & claude @ClaudeArgs 2>&1 | ForEach-Object {
-        $line = [string] $_
-        Add-Content -LiteralPath $LogPath -Value $line
-        Write-StreamLine -Line $line -SessionFile $SessionFile
+    try {
+        & claude @ClaudeArgs 2>&1 | ForEach-Object {
+            $line = [string] $_
+            Add-Content -LiteralPath $LogPath -Value $line
+            Write-StreamLine -Line $line -SessionFile $SessionFile
+        }
+        return $LASTEXITCODE
     }
-    return $LASTEXITCODE
+    finally {
+        $env:CLAUDE_CONFIG_DIR = $previousConfigDir
+    }
 }
 
 function Invoke-AgentWithLimitRetry {
@@ -905,6 +1077,12 @@ function Invoke-AgentWithLimitRetry {
             $source = if ($announced) { 'until the announced reset' } else { 'fixed interval' }
             $resumeAt = (Get-Date).AddMinutes($wait).ToString('HH:mm')
             $note = "$script:NoteMarker Usage limit reached. Waiting $wait min ($source), resuming at ~$resumeAt (attempt $attempt of $($Config.maxRetries))."
+            # Only a spent allowance is worth leaving for another account; a dropped link
+            # is the same on all of them.
+            $waitAccount = (Get-ActiveAccount).name
+            if (@(Get-ClaudeAccounts).Count -gt 1) {
+                $note += " Or carry on now under another account:  phasekit account next"
+            }
         }
         Write-Host ''
         Write-Host $note -ForegroundColor Yellow
@@ -914,7 +1092,10 @@ function Invoke-AgentWithLimitRetry {
         Add-Content -LiteralPath $LogPath -Value $note
 
         Set-MachineAwake
-        try { Wait-UntilDeadline -Deadline (Get-Date).AddMinutes($wait) -LogPath $LogPath }
+        try {
+            $account = if ($reason -eq 'transient') { '' } else { $waitAccount }
+            Wait-UntilDeadline -Deadline (Get-Date).AddMinutes($wait) -LogPath $LogPath -Account $account
+        }
         finally { Set-MachineAwake -Off }
 
         $resume = (Get-ResumeArgs -SessionId $script:SessionId) + @('-p', $script:ContinuePrompt) + $Common

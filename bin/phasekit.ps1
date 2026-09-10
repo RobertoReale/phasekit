@@ -125,6 +125,7 @@ phasekit — plan-driven, unattended agent runs
   phasekit gates                   run the project's gates locally, no agent
   phasekit auto [-Push]            walk autoSequence unattended: run, verify, merge, next
   phasekit logs [-Follow]          follow the run, rolling over as each phase starts
+  phasekit account [<name>|next]   list the Claude accounts here, or switch the one runs use
 
 Options
   -Detach          run in a process that survives this terminal closing, then follow it
@@ -990,6 +991,10 @@ function Invoke-Status {
     $branch = (git -C $cfg.codeDir branch --show-current).Trim()
     Write-Host "  Branch    : $branch"
 
+    $account = Get-ActiveAccount
+    $how = if ($account.chosen) { 'chosen with phasekit account' } else { 'from CLAUDE_CONFIG_DIR' }
+    Write-Host "  Account   : $($account.name)  ($how)"
+
     $dirty = @(git -C $cfg.codeDir status --porcelain)
     if ($dirty) {
         Write-Host '  Tree      : dirty' -ForegroundColor Yellow
@@ -1742,8 +1747,46 @@ function Invoke-Dashboard {
     return 0
 }
 
+function Invoke-Account {
+    <#
+        `phasekit account` lists the accounts; `phasekit account <name>` or `next`
+        switches the one runs use. Needs no phasekit.json: accounts belong to the
+        machine, not to a project.
+    #>
+    if ($Phase) {
+        $picked = Set-ActiveAccount -Name $Phase
+        Write-Host ''
+        Write-Host "  Runs now use account $($picked.name)  ($($picked.dir))" -ForegroundColor Green
+        if ($IsWindows -and -not (Test-Path (Join-Path $picked.dir '.credentials.json'))) {
+            Write-Host "  No login found there. Log in once:  `$env:CLAUDE_CONFIG_DIR='$($picked.dir)'; claude   then /login" -ForegroundColor Yellow
+        }
+        Write-Host '  A run waiting out a usage limit resumes within a minute; a conversation already' -ForegroundColor DarkGray
+        Write-Host '  working keeps its account until it stops. Interactive sessions are not affected.' -ForegroundColor DarkGray
+        Write-Host ''
+        return 0
+    }
+
+    $active = Get-ActiveAccount
+    $accounts = @(Get-ClaudeAccounts)
+    Write-Host ''
+    if ($accounts.Count -eq 0) { Write-Host "  No Claude account found in $HOME (.claude, .claude-<name>)." -ForegroundColor Yellow }
+    foreach ($a in $accounts) {
+        $isActive = $a.dir.TrimEnd('\', '/') -ieq $active.dir.TrimEnd('\', '/')
+        $mark = if ($isActive) { '*' } else { ' ' }
+        $how = if (-not $isActive) { '' }
+               elseif ($active.chosen) { '   <- runs use this (chosen with phasekit account)' }
+               else { '   <- runs use this (CLAUDE_CONFIG_DIR)' }
+        Write-Host ("  {0} {1,-8} {2}{3}" -f $mark, $a.name, $a.dir, $how) -ForegroundColor $(if ($isActive) { 'Green' } else { 'White' })
+    }
+    Write-Host ''
+    Write-Host '  Switch:  phasekit account <name>    or    phasekit account next' -ForegroundColor DarkGray
+    Write-Host ''
+    return 0
+}
+
 switch ($Command.ToLowerInvariant()) {
     'init' { Invoke-Init; exit 0 }
+    'account' { exit (Invoke-Account) }
     'merge' { exit (Invoke-Merge) }
     'check' {
         # The merge preconditions, reported and nothing else. Safe to run at any time,
