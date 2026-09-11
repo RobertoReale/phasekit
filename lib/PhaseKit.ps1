@@ -2022,6 +2022,79 @@ function Remove-StaleGitLock {
     return $true
 }
 
+# What an agent's background command can hang from. An orphan whose root is anything
+# else - an editor, a browser - is somebody's application, however it names the project.
+$script:OrphanRootNames = @('bash.exe', 'sh.exe', 'cmd.exe', 'pwsh.exe', 'powershell.exe',
+                            'node.exe', 'npm.exe', 'npx.exe', 'python.exe', 'py.exe', 'git.exe')
+
+function Get-OrphanedWork {
+    <#
+        Process trees a runner started and no longer holds. A command sent to the
+        background - a browser suite the agent left running while it read on - is
+        started by a shell that then exits, and from that moment its tree hangs from a
+        parent that is gone, where stopping the runner's own tree never reaches it. One
+        survived a pause with the suite's two test servers still bound to their ports,
+        and the next gate failed in seconds on "port already used".
+
+        A root counts when its parent is gone (or its pid was reused by a younger
+        process), it started at or after -Since, it is a shell or a command-line tool,
+        and something in its tree names one of -Dirs on its command line. The last two
+        conditions keep this to the project's own work: an editor opened on the project
+        folder names it too, and is left alone.
+
+        Windows only, where the process table keeps a parent id that can be gone.
+        -Processes takes that table directly, for tests.
+    #>
+    param(
+        [Parameter(Mandatory)] [datetime] $Since,
+        [Parameter(Mandatory)] [string[]] $Dirs,
+        [object[]] $Processes
+    )
+
+    if (-not $Processes) {
+        if (-not $IsWindows) { return @() }
+        $Processes = @(Get-CimInstance Win32_Process |
+            Select-Object ProcessId, ParentProcessId, Name, CreationDate, CommandLine)
+    }
+
+    $byId = @{}
+    $children = @{}
+    foreach ($p in $Processes) {
+        $byId[[int] $p.ProcessId] = $p
+        $parentId = [int] $p.ParentProcessId
+        if (-not $children.ContainsKey($parentId)) {
+            $children[$parentId] = [System.Collections.Generic.List[object]]::new()
+        }
+        $children[$parentId].Add($p)
+    }
+
+    $found = foreach ($p in $Processes) {
+        if (-not $p.CreationDate -or $p.CreationDate -lt $Since) { continue }
+        if ($script:OrphanRootNames -notcontains ([string] $p.Name).ToLowerInvariant()) { continue }
+        $parent = $byId[[int] $p.ParentProcessId]
+        # A parent younger than its child is a reused pid - someone else entirely.
+        if ($parent -and $parent.CreationDate -le $p.CreationDate) { continue }
+
+        $namesProject = $false
+        $pending = [System.Collections.Generic.Stack[object]]::new()
+        $pending.Push($p)
+        while ($pending.Count -gt 0 -and -not $namesProject) {
+            $n = $pending.Pop()
+            foreach ($d in $Dirs) {
+                if ($d -and $n.CommandLine -and
+                    $n.CommandLine.IndexOf($d, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $namesProject = $true }
+            }
+            if ($children.ContainsKey([int] $n.ProcessId)) {
+                foreach ($c in $children[[int] $n.ProcessId]) {
+                    if ($c.CreationDate -ge $n.CreationDate) { $pending.Push($c) }
+                }
+            }
+        }
+        if ($namesProject) { $p }
+    }
+    return @($found)
+}
+
 <#
     A runner that was killed cannot restart itself, and the logon task only helps if
     somebody logs on. Over a weekend nobody does, so the machine sits with a dead

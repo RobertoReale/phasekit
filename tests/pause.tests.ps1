@@ -73,6 +73,55 @@ try {
     Start-Sleep -Seconds 2
     Test-Case 'the runner is stopped' ([bool] (Get-Process -Id $child.Id -ErrorAction SilentlyContinue)) $false
     Test-Case 'and so is what it started' ([bool] (Get-Process -Id $grandchild -ErrorAction SilentlyContinue)) $false
+
+    Write-Host 'what the runner left in the background'
+    $t0 = [datetime] '2026-09-11 17:00'
+    $proj = 'C:\work\repo'
+    $row = { param($id, $parent, $name, $minutes, $cmd)
+             [pscustomobject]@{ ProcessId = $id; ParentProcessId = $parent; Name = $name
+                                CreationDate = $t0.AddMinutes($minutes); CommandLine = $cmd } }
+    $table = @(
+        & $row 10 1 'explorer.exe' -600 'explorer.exe'
+        # still held by a live parent: the runner's own tree, not an orphan
+        & $row 20 10 'pwsh.exe' 5 'pwsh -File phasekit.ps1 auto'
+        & $row 21 20 'node.exe' 6 "node $proj\frontend\node_modules\.bin\playwright test"
+        # a background suite whose shell is gone, like the one that held 8137 and 8138
+        & $row 30 999 'bash.exe' 27 '"C:\Program Files\Git\usr\bin\bash.exe" npm run e2e'
+        & $row 31 30 'node.exe' 27 'node npm-cli.js run e2e'
+        & $row 32 31 'python.exe' 28 "$proj\backend\.venv\Scripts\python.exe run.py"
+        # an orphan that names nothing of this project
+        & $row 40 998 'node.exe' 30 'node C:\elsewhere\server.js'
+        # an orphan from before the target began
+        & $row 50 997 'bash.exe' -30 "bash $proj\old.sh"
+        # an editor opened on the project folder, whose launcher has exited
+        & $row 60 996 'Code.exe' 31 "Code.exe $proj"
+        # a pid reused by a younger process: the child's real parent is gone
+        & $row 70 71 'cmd.exe' 32 "cmd /c $proj\build.cmd"
+        & $row 71 10 'notepad.exe' 40 'notepad.exe'
+    )
+    $orphans = @(Get-OrphanedWork -Since $t0 -Dirs @($proj) -Processes $table)
+    Test-Case 'the background tree whose shell is gone' (($orphans.ProcessId | Sort-Object) -join ',') '30,70'
+    Test-Case 'is found by its root, not by every member' ($orphans.Count) 2
+
+    if ($IsWindows) {
+        # For real: a shell that starts something and exits at once, the way a background
+        # command is started. The survivor names this test's directory, like a gate names
+        # the project.
+        $since = (Get-Date).AddSeconds(-1)
+        $orphanPidFile = Join-Path $root 'orphan.pid'
+        $launch = "`$o = Start-Process -FilePath '$pwsh' -ArgumentList '-NoProfile','-Command','Start-Sleep 120; ''$root'' | Out-Null' -PassThru -WindowStyle Hidden; Set-Content -LiteralPath '$orphanPidFile' -Value `$o.Id"
+        $launcher = Start-Process -FilePath $pwsh -PassThru -WindowStyle Hidden `
+            -ArgumentList @('-NoProfile', '-EncodedCommand', [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launch)))
+        $launcher.WaitForExit(30000) | Out-Null
+        $orphanPid = [int] (Get-Content -LiteralPath $orphanPidFile -TotalCount 1)
+        Test-Case 'the launcher has exited, the orphan runs on' ([bool] (Get-Process -Id $orphanPid -ErrorAction SilentlyContinue)) $true
+
+        $live = @(Get-OrphanedWork -Since $since -Dirs @($root))
+        Test-Case 'it is found in the live process table' ($live.ProcessId -contains $orphanPid) $true
+        foreach ($o in $live) { Stop-ProcessTree -Id ([int] $o.ProcessId) }
+        Start-Sleep -Seconds 2
+        Test-Case 'and stopped' ([bool] (Get-Process -Id $orphanPid -ErrorAction SilentlyContinue)) $false
+    }
 }
 finally {
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue

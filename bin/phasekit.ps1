@@ -1783,6 +1783,16 @@ function Invoke-Pause {
     if ($runner -and $runner.alive) {
         Set-PauseState -Config $cfg -Target $runner.target -Command (Get-ProcessCommandLine -Id $runner.pid)
         Stop-ProcessTree -Id $runner.pid
+        # A command the agent sent to the background hangs from a shell that has already
+        # exited, so the tree above never reached it - and it keeps the ports the next
+        # gate needs.
+        $orphans = if ($runner.started) {
+            @(Get-OrphanedWork -Since $runner.started -Dirs @($cfg.codeDir, $cfg.codeDir.Replace('\', '/')))
+        } else { @() }
+        foreach ($o in $orphans) { Stop-ProcessTree -Id ([int] $o.ProcessId) }
+        if ($orphans.Count) {
+            Write-Host "  Also stopped $($orphans.Count) process tree(s) it had left running in the background." -ForegroundColor DarkGray
+        }
         # Deliberate, so it must not read as a killed run - that is the one thing the
         # watchdog restarts.
         Remove-Item -LiteralPath (Get-RunnerFile -Config $cfg) -ErrorAction SilentlyContinue

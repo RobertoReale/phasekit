@@ -332,7 +332,13 @@ phasekit resume    # later: carries on the same target, in the same conversation
 
 `pause` stops the runner and everything under it — the `claude` it started, the gates
 that one was running, a test server those gates had up — and writes
-`logs/auto-paused.json`. Every automatic start honours that file: the logon task, the
+`logs/auto-paused.json`. It also stops what the agent had sent to the *background*: such a
+command is started by a shell that exits at once, so its tree no longer hangs from the
+runner, and on Windows it would otherwise outlive the pause with its test servers still on
+their ports — the next gate then fails in seconds on "port already used". Those trees are
+recognised by a parent that is gone, a start after the target began, a shell or
+command-line tool at the root, and the project's directory on some command line inside;
+an editor open on the project is none of that. Every automatic start honours that file: the logon task, the
 watchdog, a plain `phasekit auto` (which says the sequence is paused and does nothing;
 `-Force` overrides it). Nothing is lost. The branch, the files on disk and the transcript
 all stay, and a resume picks the target up exactly as it does after a power cut: its
