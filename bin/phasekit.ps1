@@ -126,6 +126,8 @@ phasekit — plan-driven, unattended agent runs
   phasekit auto [-Push]            walk autoSequence unattended: run, verify, merge, next
   phasekit logs [-Follow]          follow the run, rolling over as each phase starts
   phasekit account [<name>|next]   list the Claude accounts here, or switch the one runs use
+  phasekit pause                   stop the sequence now; nothing restarts it until resume
+  phasekit resume                  carry on where the pause stopped, same conversation
 
 Options
   -Detach          run in a process that survives this terminal closing, then follow it
@@ -585,6 +587,18 @@ function Invoke-Auto {
     # then fail to find the config it had just been using.
     $Config = $cfg.configPath
 
+    # A pause holds against every automatic start - the logon task, the watchdog, a relaunch
+    # script - and is lifted by `phasekit resume`, which removes it before starting this.
+    # Exit 0: a start that correctly declined is not a failure for a scheduler to report.
+    $paused = Get-PauseState -Config $cfg
+    if ($paused -and -not $Force) {
+        $where = if ($paused.target) { " at $($paused.target)" } else { '' }
+        Write-Host ''
+        Write-Host "  This sequence is paused$where. Nothing starts it until:  phasekit resume" -ForegroundColor Yellow
+        return 0
+    }
+    if ($paused) { Remove-Item -LiteralPath (Get-PauseFile -Config $cfg) -ErrorAction SilentlyContinue }
+
     $sequence = Get-AutoSequence -Config $cfg -Targets $Targets
     $stopFile = Join-Path $cfg.logDir 'auto-stopped.txt'
     $doneFile = Join-Path $cfg.logDir 'auto-finished.txt'
@@ -994,6 +1008,13 @@ function Invoke-Status {
     $account = Get-ActiveAccount
     $how = if ($account.chosen) { 'chosen with phasekit account' } else { 'from CLAUDE_CONFIG_DIR' }
     Write-Host "  Account   : $($account.name)  ($how)"
+
+    $paused = Get-PauseState -Config $cfg
+    if ($paused) {
+        $where = if ($paused.target) { " at $($paused.target)" } else { '' }
+        $when = if ($paused.since) { ", since $($paused.since.ToString('dd/MM HH:mm'))" } else { '' }
+        Write-Host "  Sequence  : PAUSED$where$when - phasekit resume carries on" -ForegroundColor Yellow
+    }
 
     $dirty = @(git -C $cfg.codeDir status --porcelain)
     if ($dirty) {
@@ -1747,6 +1768,114 @@ function Invoke-Dashboard {
     return 0
 }
 
+function Invoke-Pause {
+    <#
+        Stops the sequence now and keeps it stopped - across a reboot, the logon task and
+        the watchdog - until `phasekit resume`. For the laptop going into a bag: the
+        branch, the files on disk and the conversation all stay, and a resume carries on
+        the same target in the same conversation, the way it does after a power cut.
+    #>
+    $cfg = Get-PhaseKitConfig -Path $Config
+    $runner = Get-RunnerState -Config $cfg
+    $already = Get-PauseState -Config $cfg
+    Write-Host ''
+
+    if ($runner -and $runner.alive) {
+        Set-PauseState -Config $cfg -Target $runner.target -Command (Get-ProcessCommandLine -Id $runner.pid)
+        Stop-ProcessTree -Id $runner.pid
+        # Deliberate, so it must not read as a killed run - that is the one thing the
+        # watchdog restarts.
+        Remove-Item -LiteralPath (Get-RunnerFile -Config $cfg) -ErrorAction SilentlyContinue
+        $line = '{0}  PAUSED at {1} - phasekit resume carries on' -f (Get-Date -Format 'HH:mm:ss'), $runner.target
+        Add-Content -LiteralPath (Get-AutoJournalFile -Config $cfg) -Value $line -ErrorAction SilentlyContinue
+        Write-Host "  Paused at $($runner.target). The runner (process $($runner.pid)) and everything it started are stopped." -ForegroundColor Green
+    }
+    elseif ($already) {
+        $where = if ($already.target) { " at $($already.target)" } else { '' }
+        Write-Host "  Already paused$where. Nothing restarts it until:  phasekit resume" -ForegroundColor Yellow
+        Write-Host ''
+        return 0
+    }
+    else {
+        # Nothing running now, but the logon task or the watchdog could start it later -
+        # a dead runner's mark is exactly what the watchdog restarts. The marker holds them.
+        Set-PauseState -Config $cfg -Target $(if ($runner) { $runner.target } else { '' }) -Command ''
+        Remove-Item -LiteralPath (Get-RunnerFile -Config $cfg) -ErrorAction SilentlyContinue
+        Write-Host '  No sequence is running. It is paused anyway, so nothing starts it on its own.' -ForegroundColor Green
+    }
+
+    Write-Host '  Nothing is lost: the branch, the files on disk and the conversation stay as they are.' -ForegroundColor DarkGray
+    Write-Host '  Safe to close the lid or shut down. To carry on:  phasekit resume' -ForegroundColor Cyan
+    Write-Host ''
+    return 0
+}
+
+function Invoke-Resume {
+    <#
+        Ends a pause and starts the sequence again, detached. The target it stopped on is
+        picked up the way `auto` picks up any unfinished one: its conversation, resumed
+        over the work on its branch.
+    #>
+    $cfg = Get-PhaseKitConfig -Path $Config
+    Write-Host ''
+
+    $runner = Get-RunnerState -Config $cfg
+    if ($runner -and $runner.alive) {
+        Write-Host "  The sequence is already running - process $($runner.pid), on $($runner.target)." -ForegroundColor Yellow
+        Write-Host ''
+        return 0
+    }
+
+    $pause = Get-PauseState -Config $cfg
+    if (Remove-StaleGitLock -RepoDir $cfg.codeDir) {
+        Write-Host '  Removed a .git/index.lock left by the stopped run.' -ForegroundColor DarkGray
+    }
+    Remove-Item -LiteralPath (Get-PauseFile -Config $cfg) -ErrorAction SilentlyContinue
+
+    # Through the logon task when there is one for this sequence: it parents the runner to
+    # the scheduler, so the run survives the terminal - and the session - that typed this.
+    $task = if ($IsWindows) { Get-ScheduledTask -TaskName 'phasekit-resume' -ErrorAction SilentlyContinue } else { $null }
+    if ($task -and ([string] $task.Actions[0].Arguments).Contains($cfg.configPath)) {
+        Start-ScheduledTask -TaskName 'phasekit-resume'
+        $how = 'the phasekit-resume task'
+    }
+    elseif ($pause -and (Split-CommandLineArgs -CommandLine $pause.command)) {
+        $argLine = Split-CommandLineArgs -CommandLine $pause.command
+        $env:PHASEKIT_DETACHED = '1'
+        try {
+            if ($IsWindows) { Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $argLine -WindowStyle Hidden | Out-Null }
+            else { Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $argLine | Out-Null }
+        }
+        finally { $env:PHASEKIT_DETACHED = $null }
+        $how = 'the command the paused runner was started with'
+    }
+    else {
+        Write-Host '  The pause is lifted, but nothing records how this sequence was started. Start it as usual:' -ForegroundColor Yellow
+        Write-Host '    phasekit auto -Push -Detach' -ForegroundColor Cyan
+        Write-Host ''
+        return 1
+    }
+
+    # The task detaches once more before the runner announces itself, so give it a moment
+    # rather than reporting a start that simply has not happened yet.
+    $deadline = (Get-Date).AddSeconds(40)
+    do {
+        Start-Sleep -Seconds 2
+        $runner = Get-RunnerState -Config $cfg
+    } while (-not ($runner -and $runner.alive) -and (Get-Date) -lt $deadline)
+
+    if ($runner -and $runner.alive) {
+        Write-Host "  Resumed through $how - process $($runner.pid), on $($runner.target)." -ForegroundColor Green
+        Write-Host '  Watch it:  phasekit dashboard -Watch' -ForegroundColor DarkGray
+        Write-Host ''
+        return 0
+    }
+    Write-Host "  Started through $how, but no runner has announced itself yet." -ForegroundColor Yellow
+    Write-Host '  Check  phasekit status  in a minute; the journal is logs/auto-progress.log.' -ForegroundColor DarkGray
+    Write-Host ''
+    return 1
+}
+
 function Invoke-Account {
     <#
         `phasekit account` lists the accounts; `phasekit account <name>` or `next`
@@ -1787,6 +1916,8 @@ function Invoke-Account {
 switch ($Command.ToLowerInvariant()) {
     'init' { Invoke-Init; exit 0 }
     'account' { exit (Invoke-Account) }
+    'pause' { exit (Invoke-Pause) }
+    'resume' { exit (Invoke-Resume) }
     'merge' { exit (Invoke-Merge) }
     'check' {
         # The merge preconditions, reported and nothing else. Safe to run at any time,

@@ -1900,6 +1900,128 @@ function Get-RunnerState {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Pausing
+# ---------------------------------------------------------------------------
+#
+# A laptop that goes into a bag mid-target had two bad options: leave the run going and
+# hope the standby is survived, or kill it by hand and then remember that the logon task
+# will start it again at the next logon. A pause is the third. The whole process tree stops
+# now, a marker that every automatic start honours is left behind, and a resume carries on
+# the same target in the same conversation. Nothing a pause throws away was progress: the
+# branch, the files on disk and the transcript all stay, which is exactly what a resume
+# after a power cut already relies on.
+
+function Get-PauseFile {
+    param([Parameter(Mandatory)] $Config)
+    return (Join-Path $Config.logDir 'auto-paused.json')
+}
+
+function Get-PauseState {
+    <#
+        $null when the sequence is not paused. Otherwise when it was paused, on which
+        target, and the command line of the runner it stopped, so a resume can start that
+        same runner again.
+
+        A marker that cannot be read still means paused: a half-written file must not be
+        what lets the logon task start a run somebody asked to hold.
+    #>
+    param([Parameter(Mandatory)] $Config)
+
+    $file = Get-PauseFile -Config $Config
+    if (-not (Test-Path $file)) { return $null }
+
+    try { $p = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json } catch { $p = $null }
+    $since = $null
+    if ($p) { try { $since = [datetime] $p.since } catch { } }
+    return [pscustomobject]@{
+        since   = $since
+        target  = $(if ($p) { [string] $p.target } else { '' })
+        command = $(if ($p) { [string] $p.command } else { '' })
+    }
+}
+
+function Set-PauseState {
+    param(
+        [Parameter(Mandatory)] $Config,
+        [string] $Target,
+        [string] $Command
+    )
+
+    $file = Get-PauseFile -Config $Config
+    $dir = Split-Path -Parent $file
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $state = [ordered]@{ since = (Get-Date).ToString('o'); target = $Target; command = $Command }
+    Set-Content -LiteralPath $file -Value ($state | ConvertTo-Json)
+}
+
+function Get-ProcessCommandLine {
+    param([Parameter(Mandatory)] [int] $Id)
+
+    if ($IsWindows) {
+        return [string] (Get-CimInstance Win32_Process -Filter "ProcessId=$Id" -ErrorAction SilentlyContinue).CommandLine
+    }
+    $f = "/proc/$Id/cmdline"
+    if (Test-Path $f) { return ((Get-Content -LiteralPath $f -Raw) -replace "`0", ' ').Trim() }
+    return ''
+}
+
+function Split-CommandLineArgs {
+    <#
+        A command line without its executable: what a relaunch hands the same
+        executable. The executable is either quoted - "C:\Program Files\...\pwsh.exe" -
+        or ends at the first space.
+    #>
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $CommandLine)
+
+    $s = $CommandLine.TrimStart()
+    if ($s.StartsWith('"')) {
+        $end = $s.IndexOf('"', 1)
+        if ($end -lt 0) { return '' }
+        return $s.Substring($end + 1).Trim()
+    }
+    $space = $s.IndexOf(' ')
+    if ($space -lt 0) { return '' }
+    return $s.Substring($space + 1).Trim()
+}
+
+function Stop-ProcessTree {
+    <#
+        Stops a process and everything under it: the runner, the claude it started, the
+        gates that claude started, and the test server those gates started. Stopping only
+        the top leaves the rest running headless - still writing to the branch, still
+        holding the port the next run needs.
+    #>
+    param([Parameter(Mandatory)] [int] $Id)
+
+    if ($IsWindows) {
+        & taskkill.exe /PID $Id /T /F 2>&1 | Out-Null
+        return
+    }
+    foreach ($child in @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Parent -and $_.Parent.Id -eq $Id })) {
+        Stop-ProcessTree -Id $child.Id
+    }
+    Stop-Process -Id $Id -Force -ErrorAction SilentlyContinue
+}
+
+function Remove-StaleGitLock {
+    <#
+        A process stopped inside a git command leaves .git/index.lock behind, and every
+        git command after it then refuses to run - the resumed target's first `git
+        status` included. Removed only while no git process is running, because a live
+        one owns its lock. Returns whether a lock was removed.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $RepoDir,
+        [bool] $GitRunning = [bool] (Get-Process git -ErrorAction SilentlyContinue)
+    )
+
+    $lock = Join-Path $RepoDir '.git' 'index.lock'
+    if ($GitRunning -or -not (Test-Path $lock)) { return $false }
+    Remove-Item -LiteralPath $lock -Force
+    return $true
+}
+
 <#
     A runner that was killed cannot restart itself, and the logon task only helps if
     somebody logs on. Over a weekend nobody does, so the machine sits with a dead

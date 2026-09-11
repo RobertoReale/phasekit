@@ -95,6 +95,8 @@ phasekit run 0
 | `phasekit gates` | Run the gates yourself, no agent, no cost |
 | `phasekit auto [-Push]` | Walk `autoSequence` unattended: run, verify, merge, next |
 | `phasekit logs [-Follow]` | Follow the run, rolling over to each new phase's log |
+| `phasekit pause` | Stop the sequence now, process tree and all, and keep it stopped across reboots and the logon task ([details](docs/troubleshooting.md#pausing-a-sequence)) |
+| `phasekit resume` | End a pause: the target it stopped on carries on in the same conversation |
 | `phasekit account [<name>\|next]` | List the Claude accounts on this machine, or switch the one runs use — a run waiting out a limit resumes at once ([details](docs/troubleshooting.md#switching-account-instead-of-waiting)) |
 
 Useful flags: `-Detach` (survives closing the terminal), `-DryRun` (print the prompt and

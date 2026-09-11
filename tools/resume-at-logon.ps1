@@ -15,7 +15,9 @@
     half-finished task carries on from where it stopped instead of being redone.
 
     The task does nothing once the sequence has finished: auto-finished.txt is the guard,
-    so this does not spawn a run at every logon for the rest of the machine's life.
+    so this does not spawn a run at every logon for the rest of the machine's life. Nor
+    while it is paused: `auto` itself refuses to start over auto-paused.json, so a
+    `phasekit pause` holds across the reboot it was probably made for.
 
     Registers under the current user, no elevation, no stored password. It runs only when
     that user is logged on — which is what you want, since the run needs their session,

@@ -321,6 +321,34 @@ runner's own window, or `phasekit status`, before concluding anything died.
 If the limit pattern ever fails to match a new wording, the run stops with the log tail
 visible, which is the safe direction to fail in.
 
+## Pausing a sequence
+
+For the laptop that has to go into a bag mid-target:
+
+```powershell
+phasekit pause     # stops now; safe to close the lid or shut down
+phasekit resume    # later: carries on the same target, in the same conversation
+```
+
+`pause` stops the runner and everything under it — the `claude` it started, the gates
+that one was running, a test server those gates had up — and writes
+`logs/auto-paused.json`. Every automatic start honours that file: the logon task, the
+watchdog, a plain `phasekit auto` (which says the sequence is paused and does nothing;
+`-Force` overrides it). Nothing is lost. The branch, the files on disk and the transcript
+all stay, and a resume picks the target up exactly as it does after a power cut: its
+conversation, resumed over the work on its branch, re-reads `git status` before
+trusting its own memory of what it had finished.
+
+`resume` removes a `.git/index.lock` a stopped git command may have left, deletes the
+marker and starts the sequence detached — through the `phasekit-resume` logon task when
+one is registered for this config, so the runner survives the terminal that typed the
+command; otherwise with the command line the paused runner had.
+
+Closing the lid *without* pausing usually survives too — a dropped connection is resumed,
+and a usage-limit wait is measured against the wall clock — but a gate that was halfway
+through a browser suite fails on its own timeouts, and the agent then spends a turn
+finding out why. A pause costs nothing and leaves nothing to find out.
+
 ### Switching account instead of waiting
 
 A session limit comes back in hours; a weekly one can be days away. If the machine has a
