@@ -662,8 +662,10 @@ $script:NoteMarker = '[phasekit]'
 # A dropped link is not a spent allowance and not a question to the owner: it is the one
 # failure worth retrying at once. Kept narrow on purpose — anything not listed here still
 # stops the run and is shown, because a sequence that retries an unknown failure eight
-# times hides it eight times.
-$script:TransientPattern = 'Connection closed mid-response|connection error|ECONNRESET|ETIMEDOUT|EPIPE|socket hang up|Overloaded|\b(502|503|504|529)\b|Internal server error'
+# times hides it eight times. A machine with no network at all belongs here too: the Wi-Fi
+# dropping for half an hour answered "Unable to connect to API (ENOTFOUND)" on every
+# resume, and read as a stop the sequence gave up on seven retries in.
+$script:TransientPattern = 'Connection closed mid-response|connection error|Unable to connect to API|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ENETUNREACH|ETIMEDOUT|EPIPE|socket hang up|Overloaded|\b(502|503|504|529)\b|Internal server error'
 
 # A conversation that outgrows its window is a third kind of ending, and it is the one
 # that used to stop an unattended sequence dead. It is neither a spent allowance nor a

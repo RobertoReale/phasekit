@@ -44,6 +44,9 @@ Test-Case 'the connection dropping mid-response' `
 Test-Case 'a 529 from an overloaded upstream' `
     '{"type":"result","result":"API Error: 529 Overloaded"}' 'transient'
 
+Test-Case 'no network at all - the Wi-Fi dropped' `
+    '{"type":"result","subtype":"success","is_error":true,"result":"API Error: Unable to connect to API (ENOTFOUND)"}' 'transient'
+
 # Without the marker this is self-confirming: the note a retry writes is read by the next
 # retry as proof of a limit, and the run sleeps its whole budget away on its own voice.
 Test-Case 'phasekit''s own note from the previous attempt' (
