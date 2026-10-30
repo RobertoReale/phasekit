@@ -966,6 +966,18 @@ function Invoke-Agent {
     }
     Write-Host ('-' * 72) -ForegroundColor DarkGray
 
+    # claude writes UTF-8, and PowerShell decodes a native command's output with the
+    # console's code page - cp850 or cp1252 on a Windows machine. Every accented letter
+    # and dash the agent wrote reached the log as two or three wrong characters, and from
+    # there the screen, the stop note and anything else that reads the log. Same fix as
+    # the gates, for the same reason.
+    $priorEncoding = $null
+    try {
+        $priorEncoding = [Console]::OutputEncoding
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    }
+    catch { $priorEncoding = $null }
+
     try {
         & claude @ClaudeArgs 2>&1 | ForEach-Object {
             $line = [string] $_
