@@ -8,6 +8,10 @@
   and a way to tell whether it worked. Write it once, carefully, and the runs are boring.
   Write it vaguely and every run ends in a question.
 
+  Write it in English, like everything else the agents read and write. Only strings a
+  user of the product will see stay in their own language, quoted verbatim
+  (docs/writing-a-plan.md, "Write it in English").
+
   Delete these comments as you fill the file in.
 -->
 

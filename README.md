@@ -64,7 +64,7 @@ phasekit init          # writes phasekit.json, PLAN.md, PROMPTS.md, AGENT-RULES.
 
 1. Edit `phasekit.json`: point `codeDir` at the git repo, and list the **gates** — the
    exact commands that must be green before every commit.
-2. Write `PLAN.md`. This is the work. See [docs/method.md](docs/method.md) and
+2. Write `PLAN.md`, in English. This is the work. See [docs/method.md](docs/method.md) and
    [docs/writing-a-plan.md](docs/writing-a-plan.md).
 3. Write the phase blocks in `PROMPTS.md`. Each one opens by verifying the previous phase.
 4. Check the gates actually run:

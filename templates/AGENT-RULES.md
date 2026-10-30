@@ -18,6 +18,14 @@ cd frontend && npm run build      # exit 0
 Run them before every commit, not once at the end. A phase that ends with one commit
 containing six tasks is a phase that cannot be reviewed or reverted.
 
+## Language
+
+Code, identifiers, comments, commit messages, documentation and your reports are in
+**English**. Strings a user of the product will see are the exception: the plan quotes them
+in their own language, and you copy them as they are.
+<!-- If some file is written for a person who reads another language (manual-check
+     instructions, say), name it and its language here. -->
+
 ## Committing
 
 - One task, one commit, Conventional Commit message.

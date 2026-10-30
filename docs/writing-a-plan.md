@@ -39,6 +39,23 @@ Four sections, one commit. The **Done when** is what makes it unattended: it is 
 condition the agent checks before ticking the box, and the condition you check when you
 review.
 
+## Write it in English
+
+The plan, the agent rules, the prompts, and everything the agents write back (decisions, reports,
+commit messages, documentation) are in English, whatever language you think in. A task section is
+quoted verbatim into a prompt whose own instructions, and phasekit's stop notes, are English, and
+the code, identifiers and commit messages the task produces are English too: a plan in another
+language makes every session translate between what it was told and what it writes, and names
+things in the plan differently from how they end up named in the code.
+
+Two kinds of text stay in their own language, and the rules should say which:
+
+- **Strings a user of the product will see.** Quote them verbatim, in their language: they are
+  data the agent copies into the product, not instructions it reads.
+- **Text written for a particular person who reads another language**, such as step-by-step
+  instructions for whoever does the manual checks. Name the file and the language in
+  AGENT-RULES.md, so an agent never has to guess.
+
 ## What makes a task fail
 
 **A premise instead of evidence.** "The error handling is inconsistent" produces a session
