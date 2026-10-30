@@ -122,7 +122,7 @@ fix what it names, then:
 Delete this file to let the watchdog try again.
 "@
                 if (Get-Command Send-PhaseKitNotice -ErrorAction SilentlyContinue) {
-                    Send-PhaseKitNotice -Kind 'stop' -Title 'phasekit: the watchdog gave up' `
+                    Send-PhaseKitNotice -Kind 'attention' -Title 'phasekit: the watchdog gave up' `
                         -Message "The runner keeps being killed on $($verdict.target). See watchdog-gave-up.txt."
                 }
             }
