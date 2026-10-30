@@ -296,6 +296,13 @@ lines that carry a failure, keeps a little of what follows each one, and keeps t
 well, marking where it cut. Anything whose vocabulary it does not recognise falls back to
 the tail, which is where it was going anyway.
 
+The same goes for a target that ended without landing. The verification can only report what
+the repository shows, such as `the branch has no commits on it`. The reason is nearly always a
+question the agent stopped to ask, and it used to sit in a JSONL log. So the note also quotes
+**what the agent said last**: its final message, or its last prose if it was cut off
+mid-turn. Tool output is never quoted, because a file the agent happened to read is not
+something it said. Long messages keep their end, which is where the question is.
+
 ### Is anyone actually running it
 
 A sequence that *stops* says so. A sequence that is *killed* says nothing at all, because

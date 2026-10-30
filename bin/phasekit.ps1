@@ -657,7 +657,9 @@ function Invoke-Auto {
         $body = ''
         foreach ($d in @($Detail)) {
             if (-not $d) { continue }
-            $body += "`n--- $($d.name) (exit $($d.code)) ---`n$($d.tail)`n"
+            # A gate has an exit code; what the agent said does not.
+            $code = if ($null -ne $d.code) { " (exit $($d.code))" } else { '' }
+            $body += "`n--- $($d.name)$code ---`n$($d.tail)`n"
         }
 
         $text = @"
@@ -933,7 +935,13 @@ What to do: $Next
         }
 
         if (-not $report.ok) {
-            Stop-Auto -Target $target `
+            # The problems say what the repository shows; the agent's last message says
+            # why, and is usually the question the person is being woken up to answer.
+            $lastLog = Get-ChildItem -Path $cfg.logDir -Filter "phase-$($target -replace '[^\w.-]', '_')-*.log" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            $words = if ($lastLog) { Get-AgentLastWords -LogTail ((Get-Content -LiteralPath $lastLog.FullName -Tail 400) -join "`n") } else { '' }
+            $said = if ($words) { [pscustomobject]@{ name = 'what the agent said last'; code = $null; tail = $words } } else { $null }
+            Stop-Auto -Target $target -Detail $said `
                 -Why ($report.problems -join '; ') `
                 -Next ("Read the log, then answer in the same conversation:`n" +
                        "    phasekit reply $target -Text `"your answer`"`n" +

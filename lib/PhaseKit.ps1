@@ -766,6 +766,43 @@ function Get-StopReason {
     return 'stop'
 }
 
+function Get-AgentLastWords {
+    <#
+        What the agent said when it ended its turn, read from its log: the `result` of
+        the last result record, or failing that the prose of its last assistant message.
+
+        This is what a stop note was missing. The verification can only say what the
+        repository shows - "the branch has no commits on it" - and the reason, nearly
+        always a question the agent is waiting on, sat in a JSONL log that nobody reads
+        at seven in the morning. Only the agent's own prose counts here: a tool result
+        is whatever it happened to read, not something it said.
+
+        Long messages keep their end, which is where the question is.
+    #>
+    param(
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $LogTail,
+        [int] $MaxChars = 4000
+    )
+
+    $result = ''
+    $prose = ''
+    foreach ($line in ($LogTail -split "`n")) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed.StartsWith('{')) { continue }
+        try { $d = $trimmed | ConvertFrom-Json } catch { continue }
+        if ($d.type -eq 'result' -and $d.result) { $result = [string] $d.result }
+        elseif ($d.type -eq 'assistant') {
+            $texts = @($d.message.content | Where-Object { $_.type -eq 'text' -and $_.text } | ForEach-Object { [string] $_.text })
+            if ($texts.Count) { $prose = $texts -join "`n" }
+        }
+    }
+
+    $words = if ($result) { $result } else { $prose }
+    $words = $words.Trim()
+    if ($words.Length -gt $MaxChars) { $words = '[...] ' + $words.Substring($words.Length - $MaxChars) }
+    return $words
+}
+
 function Get-ResetWaitMinutes {
     <#
         The limit message usually says when the allowance comes back:
@@ -988,6 +1025,7 @@ function Invoke-Agent {
     }
     finally {
         $env:CLAUDE_CONFIG_DIR = $previousConfigDir
+        if ($priorEncoding) { try { [Console]::OutputEncoding = $priorEncoding } catch { } }
     }
 }
 
