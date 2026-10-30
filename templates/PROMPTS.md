@@ -85,15 +85,21 @@ ask the agent to read the plan: a real plan reaches a hundred kilobytes, and wha
 session reads it does not read once — it carries it in the context of every request it
 makes afterwards.
 
+The check names a target's predecessor by `autoSequence`, not by ledger order. A target can
+be added to the sequence while it runs (a fix for something a person found by hand, say), and
+it belongs where it runs, not where its ledger row was appended. Checked by ledger order, the
+first target after the insertion would find an unticked row above it and stop.
+
 ```
 Read AGENT-RULES.md.
 
 The task itself is quoted at the end of this prompt. Do not read all of PLAN.md:
 grep it for the one line you need (the ledger row, a neighbouring task) instead.
 
-CHECK FIRST: the gates are green, the working tree is clean, and the task
-immediately before {{TASK}} in the ledger is both ticked and backed by a commit in
-git log. Report each; if any fails, STOP and tell me.
+CHECK FIRST: the gates are green, the working tree is clean, and the target
+immediately before {{TASK}} in the autoSequence of phasekit.json (or, if it is not
+there, in the ledger) is both ticked and backed by a commit in git log. Report each;
+if any fails, STOP and tell me.
 
 THEN: execute task {{TASK}} and nothing else. Respect every constraint listed under
 it — those are the invariants the task is most likely to break.
