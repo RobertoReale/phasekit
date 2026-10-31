@@ -434,6 +434,12 @@ one's teardown reports the product as broken. Unattended, that answer stops the 
 until somebody comes back. Every retry is printed, and a gate that only passed on the
 second attempt says so: it is a defect report, not a green tick.
 
+`"strictMcp": true` starts every session with `--strict-mcp-config` and nothing beside it,
+so the agent gets no MCP server: neither the project's nor the claude.ai connectors of the
+account it runs under. Off by default. Turn it on when the agents only write code: a mail
+account or a document store has no business in a run nobody is watching, and every tool
+the session is handed is carried by every request it makes.
+
 `workingDir` is where the agent is launched; `codeDir` is the git repository that receives
 the branch and the commits. They differ when the plan lives in a separate notes repo — set
 `workingDir` to their common parent so the agent can see both.

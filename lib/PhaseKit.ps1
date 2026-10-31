@@ -69,6 +69,11 @@ function Get-PhaseKitConfig {
         # costs what its context costs. Compacting at a ceiling turns that curve into a
         # sawtooth. Set 'auto' to hand the decision back to the CLI.
         autoCompact      = 150000
+        # Off by default, so a project whose agents use an MCP server keeps it. On, the
+        # session gets no MCP server at all - not the user's claude.ai connectors either,
+        # which an unattended agent writing code has no use for and which put a mail
+        # account and a document store within reach of a run nobody is watching.
+        strictMcp        = $false
         # Sound and a desktop notice when the sequence ends or stops to ask. On by
         # default: an unattended run nobody is watching is exactly the one whose stop
         # costs hours before anyone notices.
@@ -86,6 +91,9 @@ function Get-PhaseKitConfig {
     }
     if ($raw.PSObject.Properties.Name -contains 'notify') {
         $cfg.notify = [bool] $raw.notify
+    }
+    if ($raw.PSObject.Properties.Name -contains 'strictMcp') {
+        $cfg.strictMcp = [bool] $raw.strictMcp
     }
     if ($raw.usageLimit) {
         if ($raw.usageLimit.maxRetries) { $cfg.maxRetries = [int] $raw.usageLimit.maxRetries }

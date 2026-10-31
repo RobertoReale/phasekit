@@ -232,6 +232,10 @@ function Get-CommonArgs {
         $a += @('--autocompact', "$($Config.autoCompact)")
     }
 
+    # With no --mcp-config beside it, this leaves the session with no MCP server at all,
+    # the claude.ai connectors included.
+    if ($Config.strictMcp) { $a += '--strict-mcp-config' }
+
     return $a
 }
 
