@@ -26,6 +26,16 @@ in their own language, and you copy them as they are.
 <!-- If some file is written for a person who reads another language (manual-check
      instructions, say), name it and its language here. -->
 
+## Looking things up
+
+The session has `WebSearch` and `WebFetch`. Use them when the repository cannot answer and
+guessing would cost more than a search: an API that does not behave as the plan says, an
+error you cannot explain from the code, a version or compatibility question, a behaviour
+that changed after your training. Prefer the official documentation and the project's own
+source over forums, and cite the page in the decision it supports. Do not search for what
+the plan, the code or the tests already say: every result is carried by every later
+request of the session.
+
 ## Committing
 
 - One task, one commit, Conventional Commit message.
