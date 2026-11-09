@@ -616,6 +616,19 @@ Test-Case 'a branch that really merged is done' `
     (Test-TargetDone -Config $cfgD -Target 'G.6' -Snapshot (New-Snapshot -Plan $ticked `
         -Tips @{ 'plan/phase-G.6' = $OWN } -Merged @('plan/phase-G.6'))) $true
 
+# The same empty branch after main moved on: a commit landed on main while the target was
+# paused, so the branch no longer shares main's tip but sits on main's own line.
+$BEHIND = 'cccccccccccccccccccccccccccccccccccccccc'
+$moved = New-Snapshot -Plan $ticked -Tips @{ 'plan/phase-G.6' = $BEHIND } -Merged @('plan/phase-G.6')
+$moved | Add-Member -NotePropertyName mainLine -NotePropertyValue @{ $MAIN = $true; $BEHIND = $true }
+Test-Case 'an empty branch left behind a moved main is not done' `
+    (Test-TargetDone -Config $cfgD -Target 'G.6' -Snapshot $moved) $false
+
+$landed = New-Snapshot -Plan $ticked -Tips @{ 'plan/phase-G.6' = $OWN } -Merged @('plan/phase-G.6')
+$landed | Add-Member -NotePropertyName mainLine -NotePropertyValue @{ $MAIN = $true; $BEHIND = $true }
+Test-Case 'a merged branch is off main''s own line, and done' `
+    (Test-TargetDone -Config $cfgD -Target 'G.6' -Snapshot $landed) $true
+
 Test-Case 'a merged branch tidied away is still done' `
     (Test-TargetDone -Config $cfgD -Target 'G.6' -Snapshot (New-Snapshot -Plan $ticked)) $true
 

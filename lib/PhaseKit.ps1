@@ -1741,9 +1741,21 @@ function New-RepoSnapshot {
     $hasPlan = Test-Path $Config.plan
     $planLines = if ($hasPlan) { @(Get-Content -LiteralPath $Config.plan) } else { @() }
 
+    # The commits on the main branch's own line, first parents only. A branch whose tip is
+    # one of them never got a commit of its own: it was cut from main and main moved on.
+    # A branch that landed is never on that line, because --no-ff puts its tip behind a
+    # merge commit, as a second parent.
+    $mainLine = @{}
+    if ($mainTip) {
+        foreach ($c in @(git -C $Config.codeDir rev-list --first-parent $main 2>$null)) {
+            if ($c) { $mainLine[([string] $c).Trim()] = $true }
+        }
+    }
+
     return [pscustomobject]@{
         main      = $main
         mainTip   = $mainTip
+        mainLine  = $mainLine
         branches  = $branches
         tips      = $tips
         merged    = $merged
@@ -1817,6 +1829,16 @@ function Test-TargetDone {
     # produce no commits, where an empty branch is the expected ending.
     if (-not $AllowNoCommits -and $Snapshot.mainTip -and $Snapshot.tips -and
         $Snapshot.tips.ContainsKey($branch) -and $Snapshot.tips[$branch] -eq $Snapshot.mainTip) {
+        return $false
+    }
+
+    # The same empty branch after main has moved on. A commit made on main between the
+    # cut and the check, for example an edit while the run was paused, leaves the empty
+    # branch behind main's tip instead of on it. The tip check above then lets it through,
+    # and a target whose ledger was ticked on disk but never committed is walked past.
+    # Its tip is still on main's own line, and nothing that landed through a merge is.
+    if (-not $AllowNoCommits -and $Snapshot.mainLine -and $Snapshot.tips -and
+        $Snapshot.tips.ContainsKey($branch) -and $Snapshot.mainLine.ContainsKey($Snapshot.tips[$branch])) {
         return $false
     }
 
