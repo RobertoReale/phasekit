@@ -65,6 +65,9 @@ param(
     # dashboard: redraw every few seconds instead of printing once and returning.
     [switch] $Watch,
 
+    # forecast: print the estimate as JSON instead of text.
+    [switch] $Json,
+
     # -Detach normally hands the terminal straight back to following the run. This leaves
     # you at the prompt instead.
     [switch] $NoFollow,
@@ -122,6 +125,7 @@ phasekit — plan-driven, unattended agent runs
   phasekit dashboard [-Watch]      how far along, what is running, how much is left
   phasekit steps [G|G.2]           what every phase and target is, in the plan's words
   phasekit spend                   what each target cost: requests, peak context, weight
+  phasekit forecast [-Json]        when the sequence ends, usage limits and resets included
   phasekit gates                   run the project's gates locally, no agent
   phasekit auto [-Push]            walk autoSequence unattended: run, verify, merge, next
   phasekit logs [-Follow]          follow the run, rolling over as each phase starts
@@ -132,6 +136,7 @@ phasekit — plan-driven, unattended agent runs
 Options
   -Detach          run in a process that survives this terminal closing, then follow it
   -Watch           dashboard: redraw every 20s instead of printing once
+  -Json            forecast: print the estimate as JSON, for another tool to read
   -NoFollow        with -Detach, return to the prompt instead of following
   -DryRun          print the prompt and the claude command, run nothing
   -NoBranch        stay on the current branch
@@ -1542,6 +1547,10 @@ function Show-Dashboard {
         }
     }
 
+    foreach ($line in @(Format-ForecastLines -Forecast $Frame.forecast)) {
+        Write-Host $line.text -ForegroundColor $line.colour
+    }
+
     if ($Frame.started) {
         Write-Host ('  since     {0}   ({1} elapsed)' -f $Frame.started.ToString('dd/MM HH:mm'), (Format-Duration $Frame.elapsed)) -ForegroundColor DarkGray
     }
@@ -1724,6 +1733,47 @@ function Invoke-Steps {
     $cfg = Get-PhaseKitConfig -Path $Config
     $frame = Get-DashboardFrame -Config $cfg -Targets $Targets
     Show-Steps -Frame $frame -Only $Phase
+    return 0
+}
+
+function Invoke-Forecast {
+    <#
+        When the sequence ends, with the usage limits in the picture: the work left, walked
+        through the five-hour and the weekly windows as the logs have measured them. It
+        assumes the machine stays on and nothing waits for a person. -Json prints the same
+        estimate for another tool to read.
+    #>
+    $cfg = Get-PhaseKitConfig -Path $Config
+    $frame = Get-DashboardFrame -Config $cfg -Targets $Targets
+    if ($Json) {
+        $summary = ConvertTo-ForecastSummary -Forecast $frame.forecast
+        $summary['remaining'] = $frame.remaining
+        $summary['total'] = $frame.total
+        # Straight to stdout: anything left on the pipeline would become this function's
+        # return value, and `exit` would swallow it.
+        [Console]::Out.WriteLine(($summary | ConvertTo-Json -Depth 4))
+        return 0
+    }
+
+    Write-Host ''
+    if ($frame.remaining -eq 0) {
+        Write-Host '  Nothing left: every target in the sequence has landed.' -ForegroundColor Green
+        Write-Host ''
+        return 0
+    }
+    $lines = @(Format-ForecastLines -Forecast $frame.forecast)
+    if ($lines.Count -eq 0) {
+        Write-Host '  No estimate yet: no finished target has a priced log to measure.' -ForegroundColor Yellow
+        Write-Host ''
+        return 0
+    }
+    Write-Host ('  left      {0} of {1} targets' -f $frame.remaining, $frame.total)
+    foreach ($line in $lines) { Write-Host $line.text -ForegroundColor $line.colour }
+    $f = $frame.forecast
+    Write-Host ('            from the last {0} targets; {1} of work at the typical pace, {2} waits for a reset' -f `
+                $f.samples, (Format-Duration $f.typical.workMinutes), $f.typical.waits) -ForegroundColor DarkGray
+    Write-Host '            assumes the machine stays on and no stop waits for a person' -ForegroundColor DarkGray
+    Write-Host ''
     return 0
 }
 
@@ -1962,6 +2012,7 @@ switch ($Command.ToLowerInvariant()) {
     'dash' { exit (Invoke-Dashboard) }
     'steps' { exit (Invoke-Steps) }
     'spend' { exit (Invoke-Spend) }
+    'forecast' { exit (Invoke-Forecast) }
     'plan' { exit (Invoke-Steps) }
     'gates' {
         $cfg = Get-PhaseKitConfig -Path $Config

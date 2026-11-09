@@ -2563,6 +2563,590 @@ function Get-RunPace {
     }
 }
 
+# ---------------------------------------------------------------------------------------
+# The forecast: when the sequence will finish, allowance included.
+#
+# The pace above answers "how much work is left". A subscription answers a different
+# question, "how much of it may run, and when": a five-hour window and a weekly one, each
+# with its own reset. A sequence that needs 25 hours of work and has a quarter of its week
+# left does not finish in 25 hours, and the only honest estimate walks the remaining work
+# through both windows.
+#
+# Everything is read back from the logs:
+# - what each target cost. Each session ends with a `result` record carrying its
+#   total_cost_usd. That is the API-price equivalent, the closest public proxy for what an
+#   allowance counts, and it already prices each model correctly.
+# - when that cost was spent. A session's cost is spread over its requests in proportion
+#   to their input-side tokens, so it can be placed inside the allowance windows.
+# - how much a window holds. Every `rate_limit_event` names its window, the window's reset,
+#   and either a utilization (as a warning) or a rejection (100%). The cost spent inside that
+#   window up to that moment, divided by the utilization, measures the window's size. The
+#   owner's own use outside the sequence is not in these logs, so the size comes out on the
+#   small side. That errs towards a later date, never an earlier one.
+# ---------------------------------------------------------------------------------------
+
+$script:AllowanceWindowHours = [ordered]@{ five_hour = 5; seven_day = 168 }
+
+# Price ratio against Opus, for a target that will run on another model. Used only to
+# project targets not yet run: measured costs are already priced per model.
+$script:ModelCostRatio = [ordered]@{ opus = 1.0; sonnet = 0.6; haiku = 0.2 }
+
+function Get-ModelCostRatio {
+    param([string] $Model)
+    $m = "$Model".ToLowerInvariant()
+    foreach ($k in $script:ModelCostRatio.Keys) { if ($m.Contains($k)) { return [double] $script:ModelCostRatio[$k] } }
+    return 1.0
+}
+
+function ConvertFrom-UnixSeconds {
+    param([double] $Seconds)
+    return [DateTimeOffset]::FromUnixTimeMilliseconds([int64] ($Seconds * 1000)).UtcDateTime
+}
+
+function ConvertTo-UnixSeconds {
+    param([datetime] $When)
+    return [DateTimeOffset]::new($When.ToUniversalTime()).ToUnixTimeMilliseconds() / 1000.0
+}
+
+function Read-LogUsage {
+    <#
+        One log, reduced to what the forecast needs:
+        - the requests, as (time, cost) pairs in unix seconds and USD;
+        - the allowance events;
+        - the minutes of real activity, which sum the gaps between events shorter than a
+          quarter of an hour, so a night spent waiting for a reset is not billed as work;
+        - the measured cost.
+
+        A session that has not ended yet has no `result` record. Its cost is then
+        `$null` and its requests carry only their input-side weight, for the caller to
+        price with the ratio the finished sessions show.
+    #>
+    param([Parameter(Mandatory)] [string] $LogPath)
+
+    $segments = [System.Collections.Generic.List[object]]::new()
+    $current = $null
+    $limits = [System.Collections.Generic.List[object]]::new()
+    $prev = $null
+    $last = $null
+    $active = 0.0
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $utc = [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal
+
+    $newSegment = { [pscustomobject]@{ requests = [ordered]@{}; usd = $null } }
+
+    foreach ($line in [System.IO.File]::ReadLines($LogPath)) {
+        $ts = [regex]::Match($line, '^\{.*?"timestamp":"(\d{4}-\d\d-\d\dT[\d:.]+Z)"')
+        if ($ts.Success) {
+            $t = [datetime]::Parse($ts.Groups[1].Value, $inv, $utc)
+            if ($null -ne $prev) {
+                $gap = ($t - $prev).TotalMinutes
+                if ($gap -gt 0 -and $gap -lt 15) { $active += $gap }
+            }
+            if ($null -eq $prev -or $t -gt $prev) { $prev = $t }
+            $last = $t
+        }
+
+        if ($line.StartsWith('{"type":"system","subtype":"init"')) {
+            $current = & $newSegment
+            $segments.Add($current)
+            continue
+        }
+
+        if ($line.StartsWith('{"type":"assistant"') -and $line.Contains('"request_id"')) {
+            if ($null -eq $current) { $current = & $newSegment; $segments.Add($current) }
+            $rid = [regex]::Match($line, '"request_id":"([^"]+)"')
+            if (-not $rid.Success -or $null -eq $last) { continue }
+            $read = [regex]::Match($line, '"cache_read_input_tokens":(\d+)')
+            $write = [regex]::Match($line, '"cache_creation_input_tokens":(\d+)')
+            $fresh = [regex]::Match($line, '"input_tokens":(\d+)')
+            $weight = 0.0
+            if ($read.Success) { $weight += [double] $read.Groups[1].Value * 0.1 }
+            if ($write.Success) { $weight += [double] $write.Groups[1].Value * 1.25 }
+            if ($fresh.Success) { $weight += [double] $fresh.Groups[1].Value }
+            # Streamed messages repeat a request; the first sighting dates it.
+            if (-not $current.requests.Contains($rid.Groups[1].Value)) {
+                $current.requests[$rid.Groups[1].Value] = [pscustomobject]@{ t = (ConvertTo-UnixSeconds $last); w = $weight }
+            }
+            continue
+        }
+
+        if ($line.StartsWith('{"type":"rate_limit_event"')) {
+            $type = [regex]::Match($line, '"rateLimitType":"([a-z_]+)"')
+            $status = [regex]::Match($line, '"status":"([a-z_]+)"')
+            $resets = [regex]::Match($line, '"resetsAt":(\d+)')
+            if (-not ($type.Success -and $status.Success -and $resets.Success)) { continue }
+            $util = [regex]::Match($line, '"utilization":([\d.]+)')
+            $when = if ($null -ne $last) { ConvertTo-UnixSeconds $last } else { ConvertTo-UnixSeconds (Get-Item -LiteralPath $LogPath).LastWriteTimeUtc }
+            $limits.Add([pscustomobject]@{
+                t        = $when
+                type     = $type.Groups[1].Value
+                status   = $status.Groups[1].Value
+                resetsAt = [double] $resets.Groups[1].Value
+                util     = $(if ($util.Success) { [double]::Parse($util.Groups[1].Value, $inv) } else { $null })
+            })
+            continue
+        }
+
+        if ($line.StartsWith('{"type":"result"') -or ($line.Contains('"type":"result"') -and $line.Contains('"total_cost_usd"'))) {
+            $cost = [regex]::Match($line, '"total_cost_usd":([\d.eE+-]+)')
+            if ($cost.Success -and $null -ne $current) {
+                $current.usd = [double]::Parse($cost.Groups[1].Value, $inv)
+                $current = $null
+            }
+        }
+    }
+
+    # Price the finished sessions; leave the open one for the caller.
+    $requests = [System.Collections.Generic.List[object]]::new()
+    $usd = 0.0
+    $priced = $true
+    $openWeight = 0.0
+    foreach ($seg in $segments) {
+        $reqs = @($seg.requests.Values)
+        $total = ($reqs | Measure-Object -Property w -Sum).Sum
+        if ($null -eq $seg.usd) {
+            $priced = $false
+            foreach ($r in $reqs) { $requests.Add([pscustomobject]@{ t = $r.t; usd = $null; w = $r.w }); $openWeight += $r.w }
+            continue
+        }
+        $usd += $seg.usd
+        foreach ($r in $reqs) {
+            $share = if ($total -gt 0) { $seg.usd * $r.w / $total } else { $seg.usd / [Math]::Max(1, $reqs.Count) }
+            $requests.Add([pscustomobject]@{ t = $r.t; usd = $share; w = $r.w })
+        }
+    }
+
+    return [pscustomobject]@{
+        requests   = @($requests)
+        limits     = @($limits)
+        active     = $active
+        usd        = $usd
+        priced     = $priced
+        openWeight = $openWeight
+        pricedWeight = [double] (($requests | Where-Object { $null -ne $_.usd } | Measure-Object -Property w -Sum).Sum)
+    }
+}
+
+function Get-UsageHistory {
+    <#
+        Every log of the directory, read once and cached. Parsing tens of megabytes of
+        stream-json takes a while, and a finished log never changes, so the cache is keyed
+        by name, size and write time. Only the log being written is read again.
+    #>
+    param([Parameter(Mandatory)] [string] $LogDir)
+
+    $cachePath = Join-Path $LogDir 'usage-cache.json'
+    $cache = @{}
+    if (Test-Path $cachePath) {
+        try {
+            $raw = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
+            foreach ($p in $raw.PSObject.Properties) { $cache[$p.Name] = $p.Value }
+        } catch { $cache = @{} }
+    }
+
+    $files = [ordered]@{}
+    $dirty = $false
+    foreach ($file in Get-ChildItem -Path $LogDir -Filter 'phase-*.log' -File -ErrorAction SilentlyContinue | Sort-Object Name) {
+        if ($file.Name -notmatch '^phase-(?<target>.+)-(?<stamp>\d{8}-\d{6})\.log$') { continue }
+        $key = '{0}|{1}|{2}' -f $file.Name, $file.Length, $file.LastWriteTimeUtc.Ticks
+        $entry = $cache[$file.Name]
+        if ($entry -and $entry.key -eq $key) {
+            $usage = $entry.usage
+        } else {
+            $usage = Read-LogUsage -LogPath $file.FullName
+            $cache[$file.Name] = [pscustomobject]@{ key = $key; usage = $usage }
+            $dirty = $true
+        }
+        $files[$file.Name] = [pscustomobject]@{ target = $Matches['target']; usage = $usage }
+    }
+
+    if ($dirty) {
+        try {
+            $keep = @{}
+            foreach ($name in $files.Keys) { $keep[$name] = $cache[$name] }
+            $keep | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath $cachePath -Encoding utf8
+        } catch { }
+    }
+
+    # One USD per weight unit, from the finished sessions, prices the open one.
+    $pricedUsd = 0.0; $pricedW = 0.0
+    foreach ($f in $files.Values) { $pricedUsd += [double] $f.usage.usd; $pricedW += [double] $f.usage.pricedWeight }
+    $usdPerWeight = if ($pricedW -gt 0) { $pricedUsd / $pricedW } else { 0.0 }
+
+    $requests = [System.Collections.Generic.List[object]]::new()
+    $limits = [System.Collections.Generic.List[object]]::new()
+    $targets = [ordered]@{}
+    foreach ($f in $files.Values) {
+        $u = $f.usage
+        $cost = [double] $u.usd + [double] $u.openWeight * $usdPerWeight
+        foreach ($r in @($u.requests)) {
+            $price = if ($null -ne $r.usd) { [double] $r.usd } else { [double] $r.w * $usdPerWeight }
+            $requests.Add([pscustomobject]@{ t = [double] $r.t; usd = $price })
+        }
+        foreach ($l in @($u.limits)) { $limits.Add($l) }
+        if (-not $targets.Contains($f.target)) {
+            $targets[$f.target] = [pscustomobject]@{ target = $f.target; usd = 0.0; active = 0.0; lastT = 0.0 }
+        }
+        $targets[$f.target].usd += $cost
+        $targets[$f.target].active += [double] $u.active
+        $lastReq = @($u.requests | ForEach-Object { [double] $_.t } | Sort-Object -Descending)
+        if ($lastReq.Count -gt 0 -and $lastReq[0] -gt $targets[$f.target].lastT) { $targets[$f.target].lastT = $lastReq[0] }
+    }
+
+    return New-SpendIndex -Requests @($requests) -Limits @($limits) -Targets $targets -UsdPerWeight $usdPerWeight
+}
+
+function New-SpendIndex {
+    <#
+        The requests sorted by time, with a running total beside them, so the spend
+        between two moments is two binary searches rather than a pass over every request.
+        A forecast asks that question once per allowance reading, and a long sequence has
+        tens of thousands of requests.
+    #>
+    param([object[]] $Requests, [object[]] $Limits, $Targets = [ordered]@{}, [double] $UsdPerWeight = 0)
+
+    $sorted = @($Requests | Sort-Object t)
+    $times = [double[]]::new($sorted.Count)
+    $cum = [double[]]::new($sorted.Count)
+    $run = 0.0
+    for ($i = 0; $i -lt $sorted.Count; $i++) {
+        $run += [double] $sorted[$i].usd
+        $times[$i] = [double] $sorted[$i].t
+        $cum[$i] = $run
+    }
+    return [pscustomobject]@{
+        times        = $times
+        cum          = $cum
+        limits       = @($Limits | Sort-Object t)
+        targets      = $Targets
+        usdPerWeight = $UsdPerWeight
+    }
+}
+
+function Get-SpendBefore {
+    # Total spent at or before $At.
+    param($History, [double] $At)
+    $times = $History.times
+    if ($times.Count -eq 0) { return 0.0 }
+    $i = [Array]::BinarySearch($times, $At)
+    if ($i -lt 0) { $i = (-bnot $i) - 1 }
+    else { while ($i + 1 -lt $times.Count -and $times[$i + 1] -eq $At) { $i++ } }
+    if ($i -lt 0) { return 0.0 }
+    return [double] $History.cum[$i]
+}
+
+function Get-FirstRequestAfter {
+    # The time of the first request strictly after $After, or $null.
+    param($History, [double] $After)
+    $times = $History.times
+    if ($times.Count -eq 0) { return $null }
+    $i = [Array]::BinarySearch($times, $After)
+    if ($i -lt 0) { $i = -bnot $i } else { while ($i -lt $times.Count -and $times[$i] -le $After) { $i++ } }
+    if ($i -ge $times.Count) { return $null }
+    return [double] $times[$i]
+}
+
+function Get-SpendBetween {
+    param($History, [double] $From, [double] $To)
+    if ($To -lt $From) { return 0.0 }
+    return (Get-SpendBefore -History $History -At $To) - (Get-SpendBefore -History $History -At ($From - 0.0005))
+}
+
+function Get-AllowanceModel {
+    <#
+        How large each allowance window is, and how full each one is now.
+
+        A window's size is measured once per window, from its last reading: a warning that
+        names a utilization, or a rejection, which means 100%. The last reading has the
+        most spend behind it. Readings under half are too noisy to scale up, and they are
+        skipped. Allowances change between weeks, so the weekly size is the most recent
+        week's. The five-hour size is the median of the last ten windows, which vary with
+        whatever else the account did in them.
+
+        Now: the weekly window keeps a fixed weekly cadence, so a reset that has passed
+        is carried forward by whole weeks. A five-hour window opens with the first request
+        after the previous one closed, so once its reset has passed it counts as empty.
+        How full the current window is starts from its latest reading, when there is one,
+        plus what was spent after it.
+    #>
+    param(
+        [Parameter(Mandatory)] $History,
+        [Parameter(Mandatory)] [double] $Now
+    )
+
+    $model = [ordered]@{}
+    foreach ($type in $script:AllowanceWindowHours.Keys) {
+        $len = $script:AllowanceWindowHours[$type] * 3600.0
+        $events = @($History.limits | Where-Object { $_.type -eq $type } | Sort-Object t)
+        $readingOf = {
+            param($e)
+            if ($e.status -eq 'rejected') { return 1.0 }
+            if ($null -ne $e.util) { return [double] $e.util }
+            return $null
+        }
+
+        $sizes = @()
+        foreach ($g in @($events | Group-Object resetsAt | Sort-Object { [double] $_.Name })) {
+            $last = @($g.Group | Where-Object { $u = & $readingOf $_; $null -ne $u -and $u -ge 0.5 } | Sort-Object t | Select-Object -Last 1)
+            if ($last.Count -eq 0) { continue }
+            $u = & $readingOf $last[0]
+            $spent = Get-SpendBetween -History $History -From ([double] $g.Name - $len) -To $last[0].t
+            if ($spent -gt 0) { $sizes += $spent / $u }
+        }
+        $size = if ($sizes.Count -eq 0) { $null }
+                elseif ($type -eq 'seven_day') { [double] $sizes[-1] }
+                else { Get-Percentile -Values @($sizes | Select-Object -Last 10) -P 0.5 }
+
+        $end = $null
+        if ($events.Count -gt 0) {
+            $end = [double] $events[-1].resetsAt
+            if ($type -eq 'seven_day') { while ($end -le $Now) { $end += $len } }
+            elseif ($end -le $Now) {
+                # The window the logs last named has closed. If work went on after it, the
+                # first request after the close opened the current one.
+                $opened = Get-FirstRequestAfter -History $History -After $end
+                $end = if ($null -ne $opened -and $opened + $len -gt $Now) { $opened + $len } else { $null }
+            }
+        }
+
+        $used = 0.0
+        if ($null -ne $end -and $null -ne $size -and $size -gt 0) {
+            $from = $end - $len
+            $base = 0.0
+            $reading = @($events | Where-Object { $_.resetsAt -eq $end -and $null -ne (& $readingOf $_) } | Select-Object -Last 1)
+            if ($reading.Count -gt 0) { $base = & $readingOf $reading[0]; $from = $reading[0].t }
+            $used = $base + (Get-SpendBetween -History $History -From $from -To $Now) / $size
+        }
+
+        $model[$type] = [pscustomobject]@{
+            type     = $type
+            hours    = $script:AllowanceWindowHours[$type]
+            size     = $size
+            readings = $sizes.Count
+            used     = [Math]::Min(1.0, $used)
+            resetsAt = $end
+        }
+    }
+    return [pscustomobject] $model
+}
+
+function Invoke-ForecastWalk {
+    <#
+        Walks the remaining work through the allowance windows, minute by minute of work
+        rather than of clock, and returns when it ends.
+
+        Each piece of work is (minutes, usd). While a window has room, work runs at the
+        piece's own spending rate. A window that is full stops the clock until its reset.
+        A window whose size is unknown never stops it. Between targets the gates and the
+        merge run, which spend no allowance: -OverheadMinutes.
+
+        Pure: everything it knows comes in through its parameters, so a test can give it
+        a week that does not exist.
+    #>
+    param(
+        [Parameter(Mandatory)] [object[]] $Work,
+        [Parameter(Mandatory)] $Allowance,
+        [Parameter(Mandatory)] [double] $Now,
+        [double] $OverheadMinutes = 8
+    )
+
+    $t = $Now
+    $win = @{}
+    foreach ($type in $script:AllowanceWindowHours.Keys) {
+        $a = $Allowance.$type
+        $win[$type] = [pscustomobject]@{
+            len  = $script:AllowanceWindowHours[$type] * 3600.0
+            size = $(if ($a -and $a.size) { [double] $a.size } else { $null })
+            used = $(if ($a -and $a.size) { [double] $a.used * [double] $a.size } else { 0.0 })
+            end  = $(if ($a) { $a.resetsAt } else { $null })
+            fixed = ($type -eq 'seven_day')
+        }
+    }
+    $waits = 0
+
+    foreach ($piece in $Work) {
+        $left = [double] $piece.minutes * 60.0
+        if ($left -le 0) { continue }
+        $rate = [double] $piece.usd / $left
+        $guard = 0
+        while ($left -gt 0.5 -and $guard -lt 100000) {
+            $guard++
+            # Windows that ended give their room back.
+            foreach ($w in $win.Values) {
+                if ($null -ne $w.end -and $t -ge $w.end) {
+                    $w.used = 0.0
+                    if ($w.fixed) { while ($t -ge $w.end) { $w.end += $w.len } } else { $w.end = $null }
+                }
+                if ($null -eq $w.end -and -not $w.fixed) { $w.end = $t + $w.len }
+            }
+
+            $step = $left
+            $blocked = $null
+            foreach ($w in $win.Values) {
+                if ($null -ne $w.end) { $step = [Math]::Min($step, $w.end - $t) }
+                if ($null -eq $w.size -or $rate -le 0) { continue }
+                $room = $w.size - $w.used
+                if ($room -le 1e-9) { if ($null -eq $blocked -or $w.end -gt $blocked.end) { $blocked = $w } ; continue }
+                $step = [Math]::Min($step, $room / $rate)
+            }
+
+            if ($null -ne $blocked) {
+                $t = $blocked.end
+                $waits++
+                continue
+            }
+
+            $step = [Math]::Max($step, 1.0)
+            $t += $step
+            $left -= $step
+            foreach ($w in $win.Values) { $w.used += $step * $rate }
+        }
+        $t += $OverheadMinutes * 60.0
+    }
+
+    return [pscustomobject]@{ finish = $t; waits = $waits }
+}
+
+function Get-CompletionForecast {
+    <#
+        When the sequence ends, as three walks: the quickest quarter of recent targets,
+        the typical one and the slowest quarter. Recent means the last -Recent finished
+        targets, because the model, the effort and the size of the work drift over a
+        sequence, and the forecast should follow the run as it is now.
+
+        A target that will run on another model is priced by the model ratio. A target
+        already running owes what is left of a typical one, never less than a tenth.
+
+        It assumes the machine stays on and nothing stops for a person. The observed pace
+        on the dashboard is the other half of the story.
+    #>
+    param(
+        [Parameter(Mandatory)] $Frame,
+        [Parameter(Mandatory)] $History,
+        [int] $Recent = 12,
+        [Nullable[datetime]] $At = $null
+    )
+
+    $nowUtc = if ($At) { $At.Value.ToUniversalTime() } else { (Get-Date).ToUniversalTime() }
+    $now = ConvertTo-UnixSeconds $nowUtc
+
+    $done = @($Frame.rows | Where-Object { $_.state -eq 'done' })
+    $samples = @()
+    foreach ($row in $done) {
+        $name = $row.target -replace '[^\w.-]', '_'
+        if (-not $History.targets.Contains($name)) { continue }
+        $h = $History.targets[$name]
+        if ($h.active -le 0 -or $h.usd -le 0) { continue }
+        $ratio = Get-ModelCostRatio $row.model
+        $samples += [pscustomobject]@{ minutes = $h.active; usdOpus = $h.usd / $ratio; lastT = $h.lastT }
+    }
+    $samples = @($samples | Sort-Object lastT | Select-Object -Last $Recent)
+
+    $allowance = Get-AllowanceModel -History $History -Now $now
+    $result = [ordered]@{
+        now       = $nowUtc
+        samples   = $samples.Count
+        allowance = $allowance
+        quick     = $null
+        typical   = $null
+        slow      = $null
+        workMinutes = $null
+    }
+    if ($samples.Count -eq 0) { return [pscustomobject] $result }
+
+    $pending = @($Frame.rows | Where-Object { $_.state -ne 'done' })
+    foreach ($q in @(@('quick', 0.25), @('typical', 0.5), @('slow', 0.75))) {
+        $minutes = Get-Percentile -Values @($samples | ForEach-Object { $_.minutes }) -P $q[1]
+        $usd = Get-Percentile -Values @($samples | ForEach-Object { $_.usdOpus }) -P $q[1]
+        $work = @()
+        $total = 0.0
+        foreach ($row in $pending) {
+            $m = $minutes; $c = $usd * (Get-ModelCostRatio $row.model)
+            if ($row.state -in @('running', 'stalled', 'merging')) {
+                $name = $row.target -replace '[^\w.-]', '_'
+                if ($History.targets.Contains($name)) {
+                    $h = $History.targets[$name]
+                    $m = [Math]::Max($minutes - $h.active, $minutes * 0.1)
+                    $c = [Math]::Max($c - $h.usd, $c * 0.1)
+                }
+            }
+            $work += [pscustomobject]@{ minutes = $m; usd = $c }
+            $total += $m
+        }
+        $walk = Invoke-ForecastWalk -Work $work -Allowance $allowance -Now $now
+        $result[$q[0]] = [pscustomobject]@{
+            finish = (ConvertFrom-UnixSeconds $walk.finish)
+            waits  = $walk.waits
+            workMinutes = $total
+        }
+    }
+    return [pscustomobject] $result
+}
+
+function ConvertTo-ForecastSummary {
+    <#
+        The forecast as plain data, local times in ISO 8601, for another tool to read
+        (`phasekit forecast -Json`). Every field is null when the logs cannot answer it yet.
+    #>
+    param($Forecast)
+
+    $iso = { param($utc) if ($null -eq $utc) { $null } else { $utc.ToLocalTime().ToString('yyyy-MM-ddTHH:mm:ss') } }
+    $window = {
+        param($a)
+        if ($null -eq $a) { return $null }
+        [ordered]@{
+            used     = $(if ($null -ne $a.size) { [Math]::Round([double] $a.used, 3) } else { $null })
+            resetsAt = $(if ($null -ne $a.resetsAt) { & $iso (ConvertFrom-UnixSeconds $a.resetsAt) } else { $null })
+            sizeUsd  = $(if ($null -ne $a.size) { [Math]::Round([double] $a.size, 1) } else { $null })
+            readings = $a.readings
+        }
+    }
+    if ($null -eq $Forecast) { return [ordered]@{ available = $false } }
+    return [ordered]@{
+        available   = ($null -ne $Forecast.typical)
+        samples     = $Forecast.samples
+        quick       = $(if ($Forecast.quick) { & $iso $Forecast.quick.finish } else { $null })
+        typical     = $(if ($Forecast.typical) { & $iso $Forecast.typical.finish } else { $null })
+        slow        = $(if ($Forecast.slow) { & $iso $Forecast.slow.finish } else { $null })
+        workMinutes = $(if ($Forecast.typical) { [Math]::Round($Forecast.typical.workMinutes) } else { $null })
+        fiveHour    = (& $window $Forecast.allowance.five_hour)
+        sevenDay    = (& $window $Forecast.allowance.seven_day)
+    }
+}
+
+function Format-ForecastLines {
+    <#
+        The dashboard's lines for the forecast: when it ends, and how full each allowance
+        window is. Returns (text, colour) pairs so the caller decides how to print them.
+    #>
+    param($Forecast)
+
+    if ($null -eq $Forecast -or $null -eq $Forecast.typical) { return @() }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $when = { param($utc) $utc.ToLocalTime().ToString('ddd dd/MM HH:mm', $inv) }
+    $day = { param($utc) $utc.ToLocalTime().ToString('ddd dd/MM', $inv) }
+
+    $lines = @()
+    $lines += [pscustomobject]@{
+        text   = ('  forecast  ends ~{0} if it keeps running   (between {1} and {2})' -f `
+                  (& $when $Forecast.typical.finish), (& $day $Forecast.quick.finish), (& $day $Forecast.slow.finish))
+        colour = 'Green'
+    }
+    $parts = @()
+    foreach ($pair in @(@('five_hour', '5h'), @('seven_day', 'week'))) {
+        $a = $Forecast.allowance.($pair[0])
+        if ($null -eq $a -or $null -eq $a.size) { $parts += ('{0} not measured yet' -f $pair[1]); continue }
+        $reset = if ($null -ne $a.resetsAt) {
+            $r = ConvertFrom-UnixSeconds $a.resetsAt
+            $fmt = if ($pair[0] -eq 'five_hour') { 'HH:mm' } else { 'ddd dd/MM HH:mm' }
+            ', resets ' + $r.ToLocalTime().ToString($fmt, $inv)
+        } else { '' }
+        $parts += ('{0} {1:p0} used{2}' -f $pair[1], [double] $a.used, $reset)
+    }
+    $lines += [pscustomobject]@{ text = ('  allowance ' + ($parts -join '   ')); colour = 'DarkGray' }
+    return $lines
+}
+
 function Get-LedgerLabels {
     <#
         The plan's own words for each target, so the dashboard names a target the way its
@@ -2826,9 +3410,20 @@ function Get-DashboardFrame {
         }
     }
 
+    # The allowance-aware estimate. It reads every log (cached), so a failure here must
+    # never cost the rest of the dashboard.
+    $forecast = $null
+    if ($remaining -gt 0) {
+        try {
+            $history = Get-UsageHistory -LogDir $Config.logDir
+            $forecast = Get-CompletionForecast -Frame ([pscustomobject]@{ rows = $rows }) -History $history
+        } catch { $forecast = $null }
+    }
+
     return [pscustomobject]@{
         name      = Split-Path -Leaf $Config.codeDir
         now       = $now
+        forecast  = $forecast
         rows      = $rows
         total     = $rows.Count
         doneCount = $doneRows.Count

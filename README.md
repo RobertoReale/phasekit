@@ -92,6 +92,7 @@ phasekit run 0
 | `phasekit dashboard [-Watch]` | How far along, what is running, roughly how much is left |
 | `phasekit steps [<phase>\|<target>]` | What every phase and target is, in the plan's own words |
 | `phasekit spend` | What each target cost: requests, peak context, one weighted number |
+| `phasekit forecast [-Json]` | When the sequence ends, with the five-hour and weekly limits and their resets |
 | `phasekit gates` | Run the gates yourself, no agent, no cost |
 | `phasekit auto [-Push]` | Walk `autoSequence` unattended: run, verify, merge, next |
 | `phasekit logs [-Follow]` | Follow the run, rolling over to each new phase's log |
@@ -346,6 +347,8 @@ phasekit dashboard -Watch   # the same, redrawn every 20 seconds
             5h 52m per target as it has actually gone, waits included
 
   left      38 targets   ~16h 4m of work   ~9d 6h at the observed pace
+  forecast  ends ~Fri 05/09 10:05 if it keeps running   (between Thu 04/09 and Tue 09/09)
+  allowance 5h 73% used, resets 01:40   week 78% used, resets Wed 03/09 12:00
   since     29/08 21:59   (3d 15h elapsed)
 
   0 ████ 4/4   A ██████ 6/6   G █████░░░░░ 5/10   H ░░░░ 0/4   B ░░░░░ 0/5
@@ -366,8 +369,42 @@ The typical target is a median rather than a mean on purpose: one target that sa
 weekend waiting for a limit to reset moves a mean by a factor of nine, and an estimate
 built on that quotes months.
 
-The dashboard writes nothing and remembers nothing — every number is read fresh from the
-repository, the plan and the log directory. That is what makes it honest about a run it
+### When it ends, usage limits included
+
+**Forecast** answers the question the two estimates leave open: on which day does it end?
+It walks the work that is left through the subscription's two windows, the five-hour one
+and the weekly one, the way the run will meet them:
+
+- **What a target costs.** Every session's log ends with a `result` record carrying its
+  `total_cost_usd`, the API-price equivalent. Each model is priced at its own rate there.
+  The cost is spread over the session's requests in proportion to their input tokens, so
+  it can be placed in time. The forecast uses the last twelve finished targets, because
+  the model, the effort and the size of the work drift over a sequence. A target
+  configured for another model is scaled by the price ratio: Sonnet 0.6, Haiku 0.2.
+- **How much a window holds.** Every `rate_limit_event` names its window, the reset, and a
+  utilization (a warning) or a rejection (100%). The spend inside the window up to that
+  moment, divided by the utilization, is the window's size. The weekly size is taken from
+  the most recent week, because allowances change. The five-hour size is the median of the
+  last ten windows. Your own use of the account outside the sequence is not in the logs, so
+  the size comes out small, and the date errs late rather than early.
+- **The walk.** Work runs while both windows have room. A full window stops the clock until
+  its reset. The weekly reset keeps its fixed weekly time. The walk is done three times: with
+  the quickest quarter of recent targets, the typical one and the slowest quarter. That gives
+  the date and the range around it.
+
+It assumes the machine stays on and no stop waits for a person: the observed pace above is
+the reading that includes those.
+
+```powershell
+phasekit forecast           # the date, the range and how full each window is
+phasekit forecast -Json     # the same as JSON, local ISO times, for another tool to read
+```
+
+The logs are parsed once and cached in `usage-cache.json` in the log directory, keyed by
+each file's name, size and write time, so only the log being written is read again.
+
+The dashboard remembers nothing else: every number is read fresh from the repository, the
+plan and the log directory. That is what makes it honest about a run it
 never saw start, one that died without saying so, and a target somebody finished by hand
 between sequences, none of which a progress file kept by the runner would have known
 about. It is also why a stop marker left behind by a run that was since answered by hand
