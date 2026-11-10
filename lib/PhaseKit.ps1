@@ -74,6 +74,15 @@ function Get-PhaseKitConfig {
         # which an unattended agent writing code has no use for and which put a mail
         # account and a document store within reach of a run nobody is watching.
         strictMcp        = $false
+        # When phasekit's own pre-merge gates passed on exactly the tree a new target starts
+        # from, the prompt says so, and the agent does not run the whole gate list again
+        # before it starts. That run used to cost minutes and tokens to learn what was
+        # already measured. Off restores the old behaviour.
+        skipVerifiedGates = $true
+        # A new target's prompt carries the previous target's final report, so the agent
+        # knows what just landed without exploring the code to find out. It is bounded and
+        # adds far less context than resuming the previous conversation would.
+        handoff          = $true
         # Sound and a desktop notice when the sequence ends or stops to ask. On by
         # default: an unattended run nobody is watching is exactly the one whose stop
         # costs hours before anyone notices.
@@ -94,6 +103,9 @@ function Get-PhaseKitConfig {
     }
     if ($raw.PSObject.Properties.Name -contains 'strictMcp') {
         $cfg.strictMcp = [bool] $raw.strictMcp
+    }
+    foreach ($k in @('skipVerifiedGates', 'handoff')) {
+        if ($raw.PSObject.Properties.Name -contains $k) { $cfg[$k] = [bool] $raw.$k }
     }
     if ($raw.usageLimit) {
         if ($raw.usageLimit.maxRetries) { $cfg.maxRetries = [int] $raw.usageLimit.maxRetries }
@@ -195,6 +207,107 @@ function Get-PlanSectionText {
     return (@($head) + @($t.body)) -join "`n"
 }
 
+function Get-GatesFingerprint {
+    # Which gates "green" was measured against. A changed gate list makes an old
+    # measurement say nothing about the new one.
+    param([Parameter(Mandatory)] $Config)
+    $json = (@($Config.gates) | ConvertTo-Json -Depth 6 -Compress)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$json")) } finally { $sha.Dispose() }
+    return (-join ($bytes[0..7] | ForEach-Object { $_.ToString('x2') }))
+}
+
+function Get-GreenGatesFile {
+    param([Parameter(Mandatory)] $Config)
+    return Join-Path $Config.logDir 'gates-green.json'
+}
+
+function Save-GreenGates {
+    <#
+        Records that every gate passed on the tree checked out now. Written by the merge
+        right after its gates pass, so the next target, which starts from that very tree,
+        can be told so instead of measuring it again.
+    #>
+    param([Parameter(Mandatory)] $Config)
+    $tree = ([string] (git -C $Config.codeDir rev-parse 'HEAD^{tree}' 2>$null)).Trim()
+    if (-not $tree) { return }
+    $dirty = @(git -C $Config.codeDir status --porcelain 2>$null | Where-Object { $_ })
+    if ($dirty.Count -gt 0) { return }
+    New-Item -ItemType Directory -Path $Config.logDir -Force | Out-Null
+    [ordered]@{
+        tree  = $tree
+        gates = (Get-GatesFingerprint -Config $Config)
+        at    = (Get-Date).ToString('o')
+    } | ConvertTo-Json | Set-Content -LiteralPath (Get-GreenGatesFile -Config $Config) -Encoding utf8
+}
+
+function Get-GreenGatesNote {
+    <#
+        The prompt paragraph that spares an agent the gate run before it starts: only when
+        the gates passed on exactly this tree, with exactly this gate list, and nothing in
+        the working tree has changed since. Anything else returns '' and the agent measures
+        for itself, as before.
+    #>
+    param([Parameter(Mandatory)] $Config)
+    if (-not $Config.skipVerifiedGates) { return '' }
+    $file = Get-GreenGatesFile -Config $Config
+    if (-not (Test-Path -LiteralPath $file)) { return '' }
+    try { $green = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json } catch { return '' }
+    $tree = ([string] (git -C $Config.codeDir rev-parse 'HEAD^{tree}' 2>$null)).Trim()
+    if (-not $tree -or $green.tree -ne $tree) { return '' }
+    if ($green.gates -ne (Get-GatesFingerprint -Config $Config)) { return '' }
+    $dirty = @(git -C $Config.codeDir status --porcelain 2>$null | Where-Object { $_ })
+    if ($dirty.Count -gt 0) { return '' }
+    $when = try { ([datetime] $green.at).ToString('yyyy-MM-dd HH:mm') } catch { "$($green.at)" }
+    $short = $tree.Substring(0, [Math]::Min(10, $tree.Length))
+    return ("ALREADY VERIFIED: phasekit ran every gate in phasekit.json at $when on exactly the tree " +
+            "you start from (tree $short), as the last step before merging the previous target, and " +
+            "all of them passed. Nothing has changed since. Wherever the instructions below tell you " +
+            "to run the gates BEFORE you start work (a CHECK FIRST item, for example), report that " +
+            "item as passed by this note and do not run them. Every instruction to run the gates " +
+            "before you COMMIT still applies in full.`n`n")
+}
+
+function Get-HandoffNote {
+    <#
+        The previous target's final report, so a fresh session knows what just landed:
+        the commit, the gate results, what was decided, what was noticed and left alone.
+        Without it every target spends its first requests rediscovering that by reading
+        code. It is bounded, and it is orientation only: the repository is the truth.
+    #>
+    param(
+        [Parameter(Mandatory)] $Config,
+        [Parameter(Mandatory)] [string] $Phase,
+        [int] $MaxChars = 3000
+    )
+    if (-not $Config.handoff) { return '' }
+    $sequence = @(Get-AutoSequence -Config $Config)
+    $index = -1
+    for ($i = 0; $i -lt $sequence.Count; $i++) { if ($sequence[$i].target -eq $Phase) { $index = $i; break } }
+    if ($index -le 0) { return '' }
+    $previous = $sequence[$index - 1].target
+    $safe = $previous -replace '[^\w.-]', '_'
+    # The newest attempt is not always the report. A target that was resumed after it had
+    # already committed ends with a two-line "already finished", and the report that says
+    # what landed sits in the attempt before it. So the newest substantial report wins,
+    # and the newest of any length only when there is no substantial one.
+    $logs = @(Get-ChildItem -Path $Config.logDir -Filter "phase-$safe-*.log" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)
+    if ($logs.Count -eq 0) { return '' }
+    $words = ''
+    foreach ($log in $logs) {
+        $said = Get-AgentLastWords -LogTail ((Get-Content -LiteralPath $log.FullName -Tail 400) -join "`n") -MaxChars $MaxChars
+        if (-not $said -or -not $said.Trim()) { continue }
+        if (-not $words) { $words = $said }
+        if ($said.Trim().Length -ge 800) { $words = $said; break }
+    }
+    if (-not $words -or -not $words.Trim()) { return '' }
+    return ("HANDOFF: the previous target, $previous, ended with this report. Use it to orient " +
+            "yourself instead of re-exploring what it did. If it disagrees with the repository, " +
+            "the repository wins.`n--- report of $previous ---`n" + $words.Trim() +
+            "`n--- end of report ---`n`n")
+}
+
 function Build-PhasePrompt {
     param(
         [Parameter(Mandatory)] $Config,
@@ -259,7 +372,13 @@ function Build-PhasePrompt {
               "The instructions below are the prompt for it, copied verbatim from $promptsName.`n" +
               "Follow them exactly. Do not go beyond what they ask for.`n`n"
 
-    return $header + $where + $block
+    # Measured facts the agent would otherwise spend requests establishing. Each is empty
+    # when it does not hold, and a failure to compute one never costs the prompt.
+    $known = ''
+    try { $known += Get-GreenGatesNote -Config $Config } catch { }
+    try { $known += Get-HandoffNote -Config $Config -Phase $Phase } catch { }
+
+    return $header + $where + $known + $block
 }
 
 # ---------------------------------------------------------------------------

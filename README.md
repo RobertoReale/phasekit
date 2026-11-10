@@ -477,6 +477,25 @@ account it runs under. Off by default. Turn it on when the agents only write cod
 account or a document store has no business in a run nobody is watching, and every tool
 the session is handed is carried by every request it makes.
 
+Two things a new target is told before it starts, both on by default:
+
+- `"skipVerifiedGates"`: when the gates last passed on exactly the tree the target starts
+  from, with the same gate list and a clean working tree, the prompt says so. The agent then
+  skips the gate run its CHECK FIRST step would make. That run used to cost minutes and
+  tokens to re-measure what the merge had just measured. Any change, committed or not,
+  brings the run back, and the gates before the commit and before the merge are unchanged.
+  The measurement is recorded in `gates-green.json` in the log directory.
+- `"handoff"`: the prompt carries the previous target's final report: its commit, its gate
+  results, what it decided and what it noticed. It is capped at 3000 characters. The session
+  starts by knowing what just landed instead of exploring the code to find out.
+
+  Why not continue the previous conversation instead? Because a request costs what its
+  context costs. A fresh session starts at a few tens of thousands of tokens. A continued
+  one starts where the previous target ended, often above a hundred thousand, and every
+  request of the new target would carry that.
+
+Set either to `false` to turn it off.
+
 `workingDir` is where the agent is launched; `codeDir` is the git repository that receives
 the branch and the commits. They differ when the plan lives in a separate notes repo — set
 `workingDir` to their common parent so the agent can see both.

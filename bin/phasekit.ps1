@@ -545,6 +545,10 @@ function Invoke-Merge {
     $failed = Invoke-Gates -Config $cfg
     Write-Host ''
 
+    # Green on this exact tree: the next target starts from it, and its agent is told so
+    # rather than spending a run of every gate to find out (see Get-GreenGatesNote).
+    if ($report.ok -and $failed -eq 0) { try { Save-GreenGates -Config $cfg } catch { } }
+
     if (-not $report.ok -or $failed -gt 0) {
         Write-Host 'Not merging.' -ForegroundColor Red
         if ($failed -gt 0) { Write-Host "  $failed gate(s) failing on this branch." -ForegroundColor Red }
