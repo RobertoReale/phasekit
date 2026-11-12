@@ -1097,6 +1097,35 @@ function Write-StreamLine {
     }
 }
 
+function Add-LogLine {
+    <#
+        Appends one line of the agent's output to its log, and never lets the log stop the
+        run. Anything that reads the log - a forecast, a report, an editor, a virus scanner -
+        can hold it without write sharing for a moment, and a plain Add-Content then throws
+        "being used by another process". That throw travelled out of the pipeline and the
+        runner read it as a failed start, stopping the sequence while the agent kept working
+        with nobody listening. Wait it out instead; only after several seconds give up on
+        this one line and say so in the next one that does land.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $LogPath,
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $Line
+    )
+    if ($script:LogLinesLost -gt 0) {
+        $Line = '{"type":"phasekit","subtype":"log_lines_lost","count":' + $script:LogLinesLost + '}' + "`n" + $Line
+    }
+    for ($try = 0; $try -lt 50; $try++) {
+        try {
+            Add-Content -LiteralPath $LogPath -Value $Line -ErrorAction Stop
+            $script:LogLinesLost = 0
+            return
+        }
+        catch [System.IO.IOException] { Start-Sleep -Milliseconds 200 }
+    }
+    $script:LogLinesLost = 1 + [int] $script:LogLinesLost
+    Write-Host "  log busy for 10 s - one line of output not written to $LogPath" -ForegroundColor Yellow
+}
+
 function Invoke-Agent {
     <#
         Runs claude and renders its stream-json output as one readable line per event.
@@ -1145,7 +1174,7 @@ function Invoke-Agent {
     try {
         & claude @ClaudeArgs 2>&1 | ForEach-Object {
             $line = [string] $_
-            Add-Content -LiteralPath $LogPath -Value $line
+            Add-LogLine -LogPath $LogPath -Line $line
             Write-StreamLine -Line $line -SessionFile $SessionFile
         }
         return $LASTEXITCODE
@@ -2775,7 +2804,15 @@ function Read-LogUsage {
 
     $newSegment = { [pscustomobject]@{ requests = [ordered]@{}; usd = $null } }
 
-    foreach ($line in [System.IO.File]::ReadLines($LogPath)) {
+    # Shared for writing: this log may be the one the running agent is appending to, and
+    # [IO.File]::ReadLines opens with FileShare.Read, which makes that append fail for as
+    # long as the read lasts - seconds on a long log. The runner took it as a start failure
+    # and stopped the sequence.
+    $stream = [System.IO.FileStream]::new($LogPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+                                          [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+    $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8)
+    try {
+    while ($null -ne ($line = $reader.ReadLine())) {
         $ts = [regex]::Match($line, '^\{.*?"timestamp":"(\d{4}-\d\d-\d\dT[\d:.]+Z)"')
         if ($ts.Success) {
             $t = [datetime]::Parse($ts.Groups[1].Value, $inv, $utc)
@@ -2836,6 +2873,8 @@ function Read-LogUsage {
             }
         }
     }
+    }
+    finally { $reader.Dispose(); $stream.Dispose() }
 
     # Price the finished sessions; leave the open one for the caller.
     $requests = [System.Collections.Generic.List[object]]::new()
