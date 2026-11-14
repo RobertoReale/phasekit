@@ -12,6 +12,7 @@
   "branchPrefix": "plan/phase-",
   "requireCleanTree": true,
   "autoCompact": 150000,
+  "verify": "full",
 
   "usageLimit": {
     "maxRetries": 6,

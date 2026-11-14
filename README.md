@@ -471,6 +471,45 @@ one's teardown reports the product as broken. Unattended, that answer stops the 
 until somebody comes back. Every retry is printed, and a gate that only passed on the
 second attempt says so: it is a defect report, not a green tick.
 
+### How much to verify: `"verify"`
+
+`"verify": "full"` is the default: every gate runs before every merge. `"verify": "fast"`
+lets the slowest gates wait for the end of a milestone. You mark them on the gate:
+
+```json
+"verify": "fast",
+"gates": [
+  { "name": "tests",   "cwd": "backend",  "run": "pytest -q" },
+  { "name": "browser", "cwd": "frontend", "run": "npm run e2e", "retries": 1, "slow": true }
+]
+```
+
+In fast mode a target merges on the gates not marked `slow`, and its prompt tells the agent
+to leave the slow ones out as well, so neither the agent nor the merge spends their minutes.
+Every gate, slow ones included, runs at a **checkpoint**:
+
+- the last target of a milestone, where the milestone is the target's id without its last
+  part (`M4.3` is in `M4`; `2.1.4` is in `2.1`), so a checkpoint falls wherever the next
+  target's milestone differs;
+- the last target of the sequence;
+- any `autoSequence` entry with `"checkpoint": true`;
+- any target the sequence does not list, and any target with no dot in its id.
+
+The agent of a checkpoint is told that the slow gates have not run since the last one, and
+that a failure there is still its to fix. The merge prints the gates it deferred and to which
+target, and so does the journal.
+
+What it costs. A regression only a slow gate catches is found at the checkpoint, not at the
+target that caused it. By then later targets may sit on top of it, and the agent fixing it
+did not write it. A slow gate failing at a checkpoint stops the sequence like any other red
+gate. Choose fast when the slow gates take many minutes, the targets in a milestone are
+small, and an occasional repair at the milestone's end is cheaper than paying those minutes
+on every target. Keep full when the slow gates are the ones that catch what matters most,
+or when a milestone is long.
+
+Fast mode changes nothing outside the gates: the commit, the merge preconditions and
+`phasekit gates`, which still runs the whole list, are as they were.
+
 `"strictMcp": true` starts every session with `--strict-mcp-config` and nothing beside it,
 so the agent gets no MCP server: neither the project's nor the claude.ai connectors of the
 account it runs under. Off by default. Turn it on when the agents only write code: a mail
