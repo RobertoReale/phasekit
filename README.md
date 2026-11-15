@@ -105,6 +105,9 @@ phasekit run 0
 | `phasekit pause` | Stop the sequence now, process tree and all, and keep it stopped across reboots and the logon task ([details](docs/troubleshooting.md#pausing-a-sequence)) |
 | `phasekit resume` | End a pause: the target it stopped on carries on in the same conversation |
 | `phasekit account [<name>\|next]` | List the Claude accounts on this machine, or switch the one runs use — a run waiting out a limit resumes at once ([details](docs/troubleshooting.md#switching-account-instead-of-waiting)) |
+| `phasekit lessons` | What the agents learned so far, best first ([details](#lessons-what-one-agent-learns-the-next-one-knows)) |
+| `phasekit lessons add -Text "…"` | Record one by hand: `when <condition> \| <lesson> \| evidence: <what shows it>` |
+| `phasekit lessons drop <id>` | Retire one by hand; `-Text` says why |
 
 Useful flags: `-Detach` (survives closing the terminal), `-DryRun` (print the prompt and
 the exact `claude` command, run nothing), `-Watch` (redraw the dashboard), `-NoBranch`,
@@ -541,6 +544,60 @@ Two things a new target is told before it starts, both on by default:
 
 Set either to `false` to turn it off.
 
+### Lessons: what one agent learns, the next one knows
+
+Every target is a fresh conversation, so whatever an agent learned the hard way died with
+it: a flaky test and its exact signature, a tool that behaves unexpectedly, a command that
+outlasts the shell. On one measured project the same flaky browser test was rediscovered,
+investigated and dismissed in four separate targets.
+
+With `"lessons"` on (the default), every prompt carries a short list of lessons earlier
+agents verified, and every agent ends its final message with a block that updates it:
+
+```
+LESSONS
+ADD: when <condition> | <what happens, and what to do about it> | evidence: <test, command, log line>
+CONFIRM L3: <how it saved work in this target>
+WRONG L5: <the evidence that it is wrong or out of date>
+EDIT L2: when <condition> | <the corrected lesson> | evidence: <...>
+```
+
+or the single line `NONE`. phasekit, not the agent, applies it, one operation at a time:
+
+- **Scored.** A lesson starts at 2. Another target that confirms it adds 1, once per target;
+  the target that added it cannot vouch for it. `WRONG` takes 2, so one contradiction with
+  evidence retires a new lesson, and one several targets confirmed survives a single doubt.
+  At 0 a lesson is retired. The same lesson added again by another target counts as a
+  confirmation, not a copy.
+- **Bounded.** At most `"lessonsMax"` lessons (30) are kept, the weakest retired first, and
+  the prompt carries at most `"lessonsMaxChars"` (6000) characters of them, best first:
+  every line is read by every request of every target.
+- **Evidence and condition required.** An `ADD` without its three parts, or longer than
+  200 / 400 / 300 characters, is refused and the refusal is printed. The condition stays:
+  a lesson without its "when" becomes a wrong rule.
+- **Kept outside the branches.** The store is `lessons.json` in the log directory. It is
+  collected after every agent run whatever the outcome, so a target that failed, stopped
+  or was thrown away still leaves what it found. Retired lessons are kept with the reason.
+- **A hint, never a verdict.** The prompt says that a lesson never replaces running a
+  gate or reproducing a failure. The gates decide; phasekit runs them itself before every
+  merge in any case.
+- **Never in the way.** A store that cannot be read is reported and left untouched, never
+  overwritten. Collecting a lesson can fail; it cannot fail a run. Writers take a lock, and
+  a file is replaced whole, so a reader never sees half of one. Stop notes and the handoff
+  leave the block out, so it never pushes the agent's question out of view.
+
+Why this shape: a model asked to rewrite a growing list summarises it into something
+shorter and vaguer, so the list is only ever edited item by item
+([Agentic Context Engineering](https://arxiv.org/abs/2510.04618)). Scores that later
+agents raise and lower let the list clean itself
+([ExpeL](https://arxiv.org/abs/2308.10144)). And agents do write confident, wrong
+conclusions and then act on them
+([memory confabulation](https://arxiv.org/abs/2605.29463)), which is why evidence is
+required, one `WRONG` retires a new lesson, and the gates stay the judge.
+
+`phasekit lessons` lists them. An answer you give to a stop is often a lesson too; record
+it with `phasekit lessons add`. `"lessons": false` turns the whole thing off.
+
 `workingDir` is where the agent is launched; `codeDir` is the git repository that receives
 the branch and the commits. They differ when the plan lives in a separate notes repo — set
 `workingDir` to their common parent so the agent can see both.
@@ -610,6 +667,10 @@ which is why a conversation that outgrows its context window can simply be aband
 the same target picked up in a fresh one. Every other design here follows from that: one
 commit per task, a ledger checked against the git log, and gates that re-establish the
 truth from the repository rather than from anybody's memory of it.
+
+**What one agent learns, the next one knows.** A trap one target paid for is written down
+with its evidence and handed to every later target, scored by the ones it helped and
+retired by the one it misled. A lesson is a hint; the gates are the verdict.
 
 **Stopping is a success.** An agent that stops to say "this task's premise is false" has
 done the most valuable thing it can do. The runner shows the log tail when a run ends
