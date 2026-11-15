@@ -87,7 +87,9 @@ try {
         git -C $repo init -q -b main 2>$null
         git -C $repo config user.email 'test@example.invalid'
         git -C $repo config user.name 'test'
-        Set-Content -LiteralPath (Join-Path $repo 'PLAN.md') -Value "# Plan`n`n- [ ] A.1 the only task`n"
+        # A plan that passes `phasekit lint`, which `auto` now runs before anything else.
+        Set-Content -LiteralPath (Join-Path $repo 'PLAN.md') -Value ("# Plan`n`n## 1. PHASE A - Only`n`n### A.1 - The only task`n`n" +
+            "**Problem.** nothing yet`n`n**Done when.** good.txt exists`n`n## 2. Ledger`n`n- [ ] A.1 the only task`n")
         Set-Content -LiteralPath (Join-Path $repo 'PROMPTS.md') -Value "# Prompts`n`n## task`n`nDo {{TASK}}.`n"
         # The fake's notes and the isolated phasekit home live in the repo for tidiness, and
         # must not make the tree dirty: phasekit would rightly refuse to merge it.

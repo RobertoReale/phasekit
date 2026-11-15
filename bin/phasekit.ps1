@@ -116,6 +116,8 @@ function Show-Help {
 phasekit — plan-driven, unattended agent runs
 
   phasekit init [-Force]           scaffold PLAN.md, PROMPTS.md, phasekit.json here
+  phasekit draft [-Text "..."]     an interactive session that interviews you and writes the plan
+  phasekit lint                    check the plan mechanically: ledger, sections, sequence, gates
   phasekit run <phase>             execute one phase on its own branch
   phasekit reply <phase> -Text .   answer a question, in the same conversation
   phasekit reply <phase> -File .   the same, reading the answer from a file
@@ -620,7 +622,11 @@ function Invoke-Review {
     $safe = $Target -replace '[^\w.-]', '_'
     # Not phase-<target>-*.log: those are the target's own runs, and the handoff, the stop
     # notes and the pace statistics read them as such.
-    $log = Join-Path $Config.logDir ("review-{0}-{1}.log" -f $safe, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $log = Join-Path $Config.logDir ("review-{0}-{1}.log" -f $safe, $stamp)
+    # Two reviews can start within the same second (a quick fix round on a fast machine),
+    # and the second must not write into the first one's log.
+    for ($n = 2; Test-Path -LiteralPath $log; $n++) { $log = Join-Path $Config.logDir ("review-{0}-{1}-{2}.log" -f $safe, $stamp, $n) }
     $sessionFile = Join-Path $Config.logDir "review-$safe.session"
     Remove-Item -LiteralPath $sessionFile -Force -ErrorAction SilentlyContinue
 
@@ -783,6 +789,21 @@ What to do: $Next
 
         if ($cfg.notify) {
             Send-PhaseKitNotice -Kind 'attention' -Title "phasekit stopped at $Target" -Message "$Why`n`n$Next"
+        }
+    }
+
+    # A plan with a structural error - a ledger row with no task, a task the sequence never
+    # reaches - fails somewhere in the middle of an unattended night. Found here, it costs
+    # nothing. Warnings are printed and do not stop anything.
+    if ($cfg.lintBeforeAuto -and -not $DryRun) {
+        $lint = @(Test-PlanLint -Config $cfg)
+        $lintErrors = @($lint | Where-Object level -eq 'error')
+        if ($lint.Count) { Write-Host ''; Write-LintFindings $lint }
+        if ($lintErrors.Count) {
+            Stop-Auto -Target '(the plan)' -Why "the plan has $($lintErrors.Count) error(s), found before any target ran" `
+                -Detail ([pscustomobject]@{ name = 'phasekit lint'; code = $null; tail = (@($lintErrors | ForEach-Object { "$($_.where): $($_.message)" }) -join "`n") }) `
+                -Next 'phasekit lint   to see them; fix the plan, then rerun phasekit auto ("lintBeforeAuto": false skips this check)'
+            return 1
         }
     }
 
@@ -2128,6 +2149,75 @@ function Invoke-Resume {
     return 1
 }
 
+function Write-LintFindings {
+    param($Findings)
+    foreach ($f in @($Findings)) {
+        $colour = if ($f.level -eq 'error') { 'Red' } else { 'Yellow' }
+        Write-Host ("  {0,-7}  {1,-24} {2}" -f $f.level.ToUpperInvariant(), $f.where, $f.message) -ForegroundColor $colour
+    }
+}
+
+function Invoke-Lint {
+    <#
+        `phasekit lint`: the plan checked mechanically, no model, nothing changed. Exit 1
+        when there is an error.
+    #>
+    try { $cfg = Get-PhaseKitConfig -Path $Config }
+    catch {
+        Write-Host ''
+        Write-Host "  ERROR    phasekit.json            $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host ''
+        return 1
+    }
+    $findings = @(Test-PlanLint -Config $cfg)
+    $errors = @($findings | Where-Object level -eq 'error')
+    $warnings = @($findings | Where-Object level -eq 'warning')
+    Write-Host ''
+    Write-LintFindings $findings
+    if ($findings.Count) { Write-Host '' }
+    $tasks = @(Get-Content -LiteralPath $cfg.plan -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*- \[( |x|X)\]\s+[A-Za-z0-9]+\.\d+\b' }).Count
+    if ($errors.Count) {
+        Write-Host "  $($errors.Count) error(s), $($warnings.Count) warning(s). Fix the errors before running the plan." -ForegroundColor Red
+        Write-Host ''
+        return 1
+    }
+    Write-Host "  The plan checks out: $tasks task(s), $($warnings.Count) warning(s)." -ForegroundColor Green
+    Write-Host ''
+    return 0
+}
+
+function Invoke-Draft {
+    <#
+        `phasekit draft`: an interactive Claude session that interviews you and writes the
+        plan, the prompts, the agent rules and phasekit.json in phasekit's format, then
+        lints them. It talks in your language and writes the files in English. -Text gives
+        it a first description of what you want.
+    #>
+    $templates = Join-Path $root 'templates'
+    $prompt = (Get-Content -LiteralPath (Join-Path $templates 'DRAFT.md') -Raw)
+    $seed = if ($Text) { "`nWhat the person wants, in their own words, to start from:`n$($Text.Trim())`n" } else { '' }
+    $prompt = $prompt.Replace('{{PROJECT}}', (Get-Location).Path).Replace('{{PHASEKIT}}', $root).
+        Replace('{{TODAY}}', (Get-Date -Format 'yyyy-MM-dd')).Replace('{{SEED}}', $seed)
+
+    if ($DryRun) {
+        Write-Host ''
+        Write-Host '--- prompt ---' -ForegroundColor Cyan
+        Write-Host $prompt
+        return 0
+    }
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+        throw 'claude is not on PATH. Install Claude Code first: https://claude.com/claude-code'
+    }
+    Write-Host ''
+    Write-Host '  Starting an interactive session that will interview you and write the plan.' -ForegroundColor Cyan
+    Write-Host '  Answer in any language; the files are written in English. /exit when you are done.' -ForegroundColor DarkGray
+    Write-Host ''
+    # Interactive on purpose: a plan is a conversation, and the person's answers are the
+    # part no model can supply.
+    & claude $prompt
+    return $LASTEXITCODE
+}
+
 function Invoke-Lessons {
     <#
         `phasekit lessons` lists what the agents learned; `add` records one by hand (an
@@ -2280,6 +2370,8 @@ switch ($Command.ToLowerInvariant()) {
     'auto' { Set-MachineAwake; try { exit (Invoke-Auto) } finally { Set-MachineAwake -Off } }
     'logs' { exit (Invoke-Logs) }
     'lessons' { exit (Invoke-Lessons) }
+    'lint' { exit (Invoke-Lint) }
+    'draft' { exit (Invoke-Draft) }
     'review' {
         # The reviewer on demand, on a branch as it stands. Changes nothing; prints the
         # verdict and the findings.
