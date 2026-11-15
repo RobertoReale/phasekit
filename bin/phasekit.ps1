@@ -541,13 +541,22 @@ function Invoke-Merge {
 
     # Gates run on the branch as it stands, not on whatever the agent last reported. A
     # green report from an hour ago is a claim; this is a measurement.
+    # In fast verify mode, away from a checkpoint, the slow gates wait for the milestone's
+    # last target (see Get-GatePlan). Said on screen and in the journal, so a merge on the
+    # quick gates never reads as a merge on all of them.
+    $plan = Get-GatePlan -Config $cfg -Phase $Phase
     Write-Host '  Gates:' -ForegroundColor Cyan
-    $failed = Invoke-Gates -Config $cfg
+    if (@($plan.deferred).Count -gt 0) {
+        $deferred = (@($plan.deferred | ForEach-Object { $_.name })) -join ', '
+        Write-Host "  DEFER  $deferred  (fast verify mode: they run at $($plan.next))" -ForegroundColor Yellow
+        Write-AutoProgress "  DEFER $deferred to $($plan.next) (fast verify mode)"
+    }
+    $failed = Invoke-Gates -Config $cfg -Gates @($plan.run)
     Write-Host ''
 
     # Green on this exact tree: the next target starts from it, and its agent is told so
     # rather than spending a run of every gate to find out (see Get-GreenGatesNote).
-    if ($report.ok -and $failed -eq 0) { try { Save-GreenGates -Config $cfg } catch { } }
+    if ($report.ok -and $failed -eq 0) { try { Save-GreenGates -Config $cfg -Gates @($plan.run) } catch { } }
 
     if (-not $report.ok -or $failed -gt 0) {
         Write-Host 'Not merging.' -ForegroundColor Red

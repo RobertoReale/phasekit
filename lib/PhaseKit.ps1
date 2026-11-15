@@ -87,6 +87,12 @@ function Get-PhaseKitConfig {
         # default: an unattended run nobody is watching is exactly the one whose stop
         # costs hours before anyone notices.
         notify           = $true
+        # How much of the gate list every target pays for. 'full' runs every gate before
+        # every merge. 'fast' runs the gates marked "slow" only at the last target of each
+        # milestone (see Test-Checkpoint): the other targets merge on the quick gates, and
+        # a regression a slow gate would have caught surfaces at the milestone's end
+        # instead of at the target that caused it. A choice for the person, not a default.
+        verify           = 'full'
         gates            = @()
         # The targets `phasekit auto` walks, in order. See Get-AutoSequence.
         autoSequence     = @()
@@ -103,6 +109,15 @@ function Get-PhaseKitConfig {
     }
     if ($raw.PSObject.Properties.Name -contains 'strictMcp') {
         $cfg.strictMcp = [bool] $raw.strictMcp
+    }
+    if ($raw.PSObject.Properties.Name -contains 'verify' -and $raw.verify) {
+        $v = ([string] $raw.verify).Trim().ToLowerInvariant()
+        # A typo here must not quietly mean either mode: 'fats' read as 'full' hides the
+        # speed the person asked for, and read as 'fast' skips checks nobody agreed to skip.
+        if ($v -notin @('full', 'fast')) {
+            throw "phasekit.json: `"verify`" is '$($raw.verify)'. It must be `"full`" or `"fast`"."
+        }
+        $cfg.verify = $v
     }
     foreach ($k in @('skipVerifiedGates', 'handoff')) {
         if ($raw.PSObject.Properties.Name -contains $k) { $cfg[$k] = [bool] $raw.$k }
@@ -207,14 +222,91 @@ function Get-PlanSectionText {
     return (@($head) + @($t.body)) -join "`n"
 }
 
+function Get-TextFingerprint {
+    param([string] $Text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$Text")) } finally { $sha.Dispose() }
+    return (-join ($bytes[0..7] | ForEach-Object { $_.ToString('x2') }))
+}
+
 function Get-GatesFingerprint {
     # Which gates "green" was measured against. A changed gate list makes an old
     # measurement say nothing about the new one.
     param([Parameter(Mandatory)] $Config)
-    $json = (@($Config.gates) | ConvertTo-Json -Depth 6 -Compress)
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$json")) } finally { $sha.Dispose() }
-    return (-join ($bytes[0..7] | ForEach-Object { $_.ToString('x2') }))
+    return Get-TextFingerprint (@($Config.gates) | ConvertTo-Json -Depth 6 -Compress)
+}
+
+function Get-GateFingerprint {
+    # One gate, as it is written: a gate whose command changed is a different gate, even
+    # under the same name.
+    param([Parameter(Mandatory)] $Gate)
+    return Get-TextFingerprint ($Gate | ConvertTo-Json -Depth 6 -Compress)
+}
+
+function Test-SlowGate {
+    param($Gate)
+    return [bool] ($Gate -and $Gate.PSObject.Properties['slow'] -and $Gate.slow)
+}
+
+function Get-Milestone {
+    <#
+        The group a target belongs to: its id without the last dot-separated part, so
+        M4.3 is in M4 and 2.1.4 in 2.1. A target with no dot is its own milestone, which
+        makes it a checkpoint: the safe reading of an id this cannot split.
+    #>
+    param([Parameter(Mandatory)] [string] $Target)
+    if ($Target -match '^(.+)\.[^.]+$') { return $Matches[1] }
+    return $Target
+}
+
+function Get-CheckpointInfo {
+    <#
+        Whether this target is a checkpoint, the point where every gate runs, slow ones
+        included, and which target is the next checkpoint when it is not.
+
+        In 'full' mode every target is one. In 'fast' mode a target is one when it is the
+        last of the sequence, when the next target belongs to another milestone, or when
+        its autoSequence entry says "checkpoint": true. A target the sequence does not know
+        (a manual `phasekit merge` of something unlisted) is one too: when this cannot tell,
+        it checks everything.
+    #>
+    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Phase)
+    $yes = [pscustomobject]@{ checkpoint = $true; next = $Phase }
+    if ($Config.verify -ne 'fast') { return $yes }
+    $sequence = @()
+    try { $sequence = @(Get-AutoSequence -Config $Config) } catch { return $yes }
+    $index = -1
+    for ($i = 0; $i -lt $sequence.Count; $i++) { if ($sequence[$i].target -eq $Phase) { $index = $i; break } }
+    if ($index -lt 0) { return $yes }
+    for ($i = $index; $i -lt $sequence.Count; $i++) {
+        $here = $sequence[$i]
+        $last = ($i -eq $sequence.Count - 1)
+        $closes = $last -or $here.checkpoint -or
+                  ((Get-Milestone $here.target) -ne (Get-Milestone $sequence[$i + 1].target))
+        if ($closes) {
+            return [pscustomobject]@{ checkpoint = ($i -eq $index); next = $here.target }
+        }
+    }
+    return $yes
+}
+
+function Get-GatePlan {
+    <#
+        The gates this target merges on, and the ones it leaves to the next checkpoint.
+        Outside 'fast' mode, or at a checkpoint, nothing is deferred.
+    #>
+    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Phase)
+    $all = @($Config.gates | Where-Object { $_ })
+    $info = Get-CheckpointInfo -Config $Config -Phase $Phase
+    if ($info.checkpoint) {
+        return [pscustomobject]@{ run = $all; deferred = @(); checkpoint = $true; next = $info.next }
+    }
+    return [pscustomobject]@{
+        run        = @($all | Where-Object { -not (Test-SlowGate $_) })
+        deferred   = @($all | Where-Object { Test-SlowGate $_ })
+        checkpoint = $false
+        next       = $info.next
+    }
 }
 
 function Get-GreenGatesFile {
@@ -224,11 +316,12 @@ function Get-GreenGatesFile {
 
 function Save-GreenGates {
     <#
-        Records that every gate passed on the tree checked out now. Written by the merge
-        right after its gates pass, so the next target, which starts from that very tree,
-        can be told so instead of measuring it again.
+        Records which gates passed on the tree checked out now: all of them unless -Gates
+        names fewer. Written by the merge right after its gates pass, so the next target,
+        which starts from that very tree, can be told so instead of measuring it again.
     #>
-    param([Parameter(Mandatory)] $Config)
+    param([Parameter(Mandatory)] $Config, [object[]] $Gates)
+    if ($null -eq $Gates) { $Gates = @($Config.gates) }
     $tree = ([string] (git -C $Config.codeDir rev-parse 'HEAD^{tree}' 2>$null)).Trim()
     if (-not $tree) { return }
     $dirty = @(git -C $Config.codeDir status --porcelain 2>$null | Where-Object { $_ })
@@ -237,6 +330,9 @@ function Save-GreenGates {
     [ordered]@{
         tree  = $tree
         gates = (Get-GatesFingerprint -Config $Config)
+        # Each gate that passed, by its own fingerprint, so a target that needs fewer gates
+        # than were measured (a fast-mode target after a checkpoint) can still be told.
+        each  = @($Gates | Where-Object { $_ } | ForEach-Object { Get-GateFingerprint -Gate $_ })
         at    = (Get-Date).ToString('o')
     } | ConvertTo-Json | Set-Content -LiteralPath (Get-GreenGatesFile -Config $Config) -Encoding utf8
 }
@@ -248,24 +344,65 @@ function Get-GreenGatesNote {
         the working tree has changed since. Anything else returns '' and the agent measures
         for itself, as before.
     #>
-    param([Parameter(Mandatory)] $Config)
+    param([Parameter(Mandatory)] $Config, [string] $Phase)
     if (-not $Config.skipVerifiedGates) { return '' }
     $file = Get-GreenGatesFile -Config $Config
     if (-not (Test-Path -LiteralPath $file)) { return '' }
     try { $green = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json } catch { return '' }
     $tree = ([string] (git -C $Config.codeDir rev-parse 'HEAD^{tree}' 2>$null)).Trim()
     if (-not $tree -or $green.tree -ne $tree) { return '' }
-    if ($green.gates -ne (Get-GatesFingerprint -Config $Config)) { return '' }
+    # What this target needs measured: every gate, or in fast mode away from a
+    # checkpoint only the quick ones. It is covered when each of them passed on this tree.
+    $plan = if ($Phase) { Get-GatePlan -Config $Config -Phase $Phase } else { $null }
+    $needed = if ($plan) { @($plan.run) } else { @($Config.gates | Where-Object { $_ }) }
+    $partial = ($plan -and @($plan.deferred).Count -gt 0)
+    if ($green.PSObject.Properties['each'] -and $green.each) {
+        $passed = @($green.each)
+        foreach ($g in $needed) { if ((Get-GateFingerprint -Gate $g) -notin $passed) { return '' } }
+    }
+    elseif ($green.gates -ne (Get-GatesFingerprint -Config $Config)) { return '' }
     $dirty = @(git -C $Config.codeDir status --porcelain 2>$null | Where-Object { $_ })
     if ($dirty.Count -gt 0) { return '' }
     $when = try { ([datetime] $green.at).ToString('yyyy-MM-dd HH:mm') } catch { "$($green.at)" }
     $short = $tree.Substring(0, [Math]::Min(10, $tree.Length))
-    return ("ALREADY VERIFIED: phasekit ran every gate in phasekit.json at $when on exactly the tree " +
+    $which = if ($partial) { 'every gate this target needs (' + ((@($needed | ForEach-Object { $_.name })) -join ', ') + ')' }
+             else { 'every gate in phasekit.json' }
+    return ("ALREADY VERIFIED: phasekit ran $which at $when on exactly the tree " +
             "you start from (tree $short), as the last step before merging the previous target, and " +
             "all of them passed. Nothing has changed since. Wherever the instructions below tell you " +
             "to run the gates BEFORE you start work (a CHECK FIRST item, for example), report that " +
             "item as passed by this note and do not run them. Every instruction to run the gates " +
             "before you COMMIT still applies in full.`n`n")
+}
+
+function Get-FastModeNote {
+    <#
+        In fast mode, away from a checkpoint, the agent is told which gates it leaves to the
+        milestone's last target. Without this it follows its rules and runs every gate
+        before it commits, and the merge's saving buys nothing. At a checkpoint it is told
+        the opposite: the slow gates have not run since the last checkpoint, so a failure in
+        one may come from an earlier target and is still this target's to fix.
+    #>
+    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Phase)
+    if ($Config.verify -ne 'fast') { return '' }
+    $slow = @($Config.gates | Where-Object { Test-SlowGate $_ })
+    if ($slow.Count -eq 0) { return '' }
+    $plan = Get-GatePlan -Config $Config -Phase $Phase
+    $names = (@($slow | ForEach-Object { "`"$($_.name)`"" })) -join ', '
+    if ($plan.checkpoint) {
+        return ("CHECKPOINT: this run is in fast verify mode and $Phase closes its milestone, so " +
+                "every gate runs before this merge, including the slow ones ($names). The slow gates " +
+                "were skipped by the targets since the last checkpoint. If one fails, the cause may " +
+                "be in an earlier target's code; it is still yours to find and fix in this target, " +
+                "following your rules on gates.`n`n")
+    }
+    return ("FAST VERIFY MODE: phasekit will not run these slow gates before merging ${Phase}: " +
+            "$names. They run at $($plan.next), the last target of this milestone. Wherever the " +
+            "instructions below tell you to run the gates (before you start or before you commit), " +
+            "run every other gate and leave these out; name the rest explicitly if your gate runner " +
+            "takes names. In your report, list them as deferred to $($plan.next), not as passed. You " +
+            "may still run a single slow test file you wrote or changed, when that is the quickest " +
+            "way to know it works. Every other instruction about gates applies in full.`n`n")
 }
 
 function Get-HandoffNote {
@@ -375,7 +512,8 @@ function Build-PhasePrompt {
     # Measured facts the agent would otherwise spend requests establishing. Each is empty
     # when it does not hold, and a failure to compute one never costs the prompt.
     $known = ''
-    try { $known += Get-GreenGatesNote -Config $Config } catch { }
+    try { $known += Get-FastModeNote -Config $Config -Phase $Phase } catch { }
+    try { $known += Get-GreenGatesNote -Config $Config -Phase $Phase } catch { }
     try { $known += Get-HandoffNote -Config $Config -Phase $Phase } catch { }
 
     return $header + $where + $known + $block
@@ -1597,18 +1735,22 @@ function Invoke-Gates {
 
         Returns the number that failed. The names, exit codes and last output lines are
         left in $script:LastGateFailures for a caller that has to explain itself later.
+
+        -Gates runs that subset instead of the whole list (fast verify mode, Get-GatePlan).
     #>
-    param([Parameter(Mandatory)] $Config)
+    param([Parameter(Mandatory)] $Config, [object[]] $Gates)
 
     $script:LastGateFailures = @()
 
-    if (-not $Config.gates -or $Config.gates.Count -eq 0) {
-        Write-Host 'No gates defined in phasekit.json.' -ForegroundColor Yellow
+    $list = if ($null -ne $Gates) { @($Gates | Where-Object { $_ }) } else { @($Config.gates | Where-Object { $_ }) }
+    if ($list.Count -eq 0) {
+        $none = if ($null -ne $Gates) { 'No gates to run for this target.' } else { 'No gates defined in phasekit.json.' }
+        Write-Host $none -ForegroundColor Yellow
         return 0
     }
 
     $failed = 0
-    Write-AutoProgress "gates: $($Config.gates.Count) to run"
+    Write-AutoProgress "gates: $($list.Count) to run"
 
     # Every one of these gates is a test runner, and every test runner writes UTF-8. What
     # PowerShell decodes it with is the console's code page, which on a Windows machine is
@@ -1627,7 +1769,7 @@ function Invoke-Gates {
 
     try {
 
-    foreach ($g in $Config.gates) {
+    foreach ($g in $list) {
         $cwd = if ($g.cwd) { Join-Path $Config.configDir $g.cwd } else { $Config.workingDir }
         if (-not (Test-Path $cwd)) {
             Write-Host ("  FAIL  {0,-22} directory not found: {1}" -f $g.name, $cwd) -ForegroundColor Red
@@ -1809,14 +1951,14 @@ function Get-AutoSequence {
         # allowNoCommits flag still apply.
         $configured = @{}
         foreach ($e in @($Config.autoSequence)) {
-            if ($e -is [string]) { $configured[$e] = [pscustomobject]@{ target = $e; model = $null; effort = $null; note = $null; allowNoCommits = $false } }
-            elseif ($e.target)   { $configured[$e.target] = [pscustomobject]@{ target = $e.target; model = $e.model; effort = $e.effort; note = $e.note; allowNoCommits = [bool]$e.allowNoCommits } }
+            if ($e -is [string]) { $configured[$e] = [pscustomobject]@{ target = $e; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false } }
+            elseif ($e.target)   { $configured[$e.target] = [pscustomobject]@{ target = $e.target; model = $e.model; effort = $e.effort; note = $e.note; allowNoCommits = [bool]$e.allowNoCommits; checkpoint = [bool]$e.checkpoint } }
         }
 
         return @($flat | ForEach-Object {
             $name = $_.Trim()
             if ($configured.ContainsKey($name)) { $configured[$name] }
-            else { [pscustomobject]@{ target = $name; model = $null; effort = $null; note = $null; allowNoCommits = $false } }
+            else { [pscustomobject]@{ target = $name; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false } }
         })
     }
 
@@ -1827,7 +1969,7 @@ function Get-AutoSequence {
     $i = -1
     return @($Config.autoSequence | ForEach-Object {
         $i++
-        if ($_ -is [string]) { [pscustomobject]@{ target = $_; model = $null; effort = $null; note = $null; allowNoCommits = $false } }
+        if ($_ -is [string]) { [pscustomobject]@{ target = $_; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false } }
         else {
             # Say which entry is wrong and what it is missing. Without this the run
             # walks on with an empty target and dies several frames later on
@@ -1839,7 +1981,7 @@ function Get-AutoSequence {
                        'Each entry is either a bare string ("4.2") or an object with a ' +
                        '"target" key ({ "target": "4.2", "note": "..." }).')
             }
-            [pscustomobject]@{ target = $_.target; model = $_.model; effort = $_.effort; note = $_.note; allowNoCommits = [bool]$_.allowNoCommits }
+            [pscustomobject]@{ target = $_.target; model = $_.model; effort = $_.effort; note = $_.note; allowNoCommits = [bool]$_.allowNoCommits; checkpoint = [bool]$_.checkpoint }
         }
     })
 }
