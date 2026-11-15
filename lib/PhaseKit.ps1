@@ -122,6 +122,16 @@ function Get-PhaseKitConfig {
         # Antigravity ("agy:<slug>" models): whether a run may fall back on paid AI credits
         # once the plan's quota is spent. Off: it waits for the quota to refresh instead.
         agyCredits       = $false
+        # The model each tier of work runs on (see Resolve-TargetModel), and whether
+        # phasekit reads a target's tier from its plan section when the entry names none.
+        tiers            = $null
+        autoTier         = $false
+        # Models to hand a target to when its own runs out of usage allowance, in order,
+        # instead of waiting for the reset. Empty: wait, as always.
+        limitFallback    = @()
+        # Every reviewer; reviewModel is the first. More than one, ideally of different
+        # families, and a target passes only if none of them rejects it.
+        reviewModels     = @('opus')
         gates            = @()
         # The targets `phasekit auto` walks, in order. See Get-AutoSequence.
         autoSequence     = @()
@@ -157,8 +167,37 @@ function Get-PhaseKitConfig {
             $cfg[$k] = $n
         }
     }
-    foreach ($k in @('reviewModel', 'reviewEffort')) {
-        if ($raw.PSObject.Properties.Name -contains $k -and $raw.$k) { $cfg[$k] = [string] $raw.$k }
+    $specPattern = '^(agy:)?[\w.-]+(/[\w-]+)?$'
+    if ($raw.PSObject.Properties.Name -contains 'reviewModel' -and $raw.reviewModel) {
+        # One reviewer or several: "reviewModel": "opus" or ["opus", "agy:gemini-4-hydrogen-high"].
+        $list = @($raw.reviewModel | ForEach-Object { ([string] $_).Trim() } | Where-Object { $_ })
+        foreach ($m in $list) {
+            if ($m -notmatch $specPattern) { throw "phasekit.json: `"reviewModel`" has '$m', which is not a model name." }
+        }
+        $cfg.reviewModels = $list
+        $cfg.reviewModel = $list[0]
+    }
+    else { $cfg.reviewModels = @($cfg.reviewModel) }
+    if ($raw.PSObject.Properties.Name -contains 'reviewEffort' -and $raw.reviewEffort) { $cfg.reviewEffort = [string] $raw.reviewEffort }
+    if ($raw.PSObject.Properties.Name -contains 'tiers' -and $raw.tiers) {
+        $tiers = [ordered]@{}
+        foreach ($p in $raw.tiers.PSObject.Properties) {
+            if ($p.Name -notin @('mechanical', 'standard', 'hard')) {
+                throw "phasekit.json: `"tiers`" has '$($p.Name)'. The tiers are mechanical, standard and hard."
+            }
+            if (([string] $p.Value) -notmatch $specPattern) {
+                throw "phasekit.json: tier '$($p.Name)' is '$($p.Value)'. Write a model (`"sonnet`"), a model and effort (`"opus/xhigh`") or `"agy:<id>`"."
+            }
+            $tiers[$p.Name] = [string] $p.Value
+        }
+        $cfg.tiers = $tiers
+    }
+    if ($raw.PSObject.Properties.Name -contains 'limitFallback' -and $null -ne $raw.limitFallback) {
+        $fb = @($raw.limitFallback | ForEach-Object { ([string] $_).Trim() } | Where-Object { $_ })
+        foreach ($m in $fb) {
+            if ($m -notmatch $specPattern) { throw "phasekit.json: `"limitFallback`" has '$m', which is not a model name." }
+        }
+        $cfg.limitFallback = $fb
     }
     if ($raw.PSObject.Properties.Name -contains 'fixRounds' -and $null -ne $raw.fixRounds) {
         $rounds = @($raw.fixRounds | ForEach-Object { ([string] $_).Trim() })
@@ -175,7 +214,7 @@ function Get-PhaseKitConfig {
     if ($raw.PSObject.Properties.Name -contains 'planSections' -and $null -ne $raw.planSections) {
         $cfg.planSections = @($raw.planSections | ForEach-Object { ([string] $_).Trim() } | Where-Object { $_ })
     }
-    foreach ($k in @('skipVerifiedGates', 'handoff', 'lessons', 'review', 'lintBeforeAuto', 'agyCredits')) {
+    foreach ($k in @('skipVerifiedGates', 'handoff', 'lessons', 'review', 'lintBeforeAuto', 'agyCredits', 'autoTier')) {
         if ($raw.PSObject.Properties.Name -contains $k) { $cfg[$k] = [bool] $raw.$k }
     }
     if ($raw.usageLimit) {
@@ -924,11 +963,22 @@ function Build-PhasePrompt {
     $where = "Paths, because your working directory is not where these files live:`n" +
              ($whereLines -join "`n") + "`n`n"
 
+    # Measured facts the agent would otherwise spend requests establishing. Each is empty
+    # when it does not hold, and a failure to compute one never costs the prompt. Built
+    # before the fallback below, which used to return without any of them: a target with
+    # no prompt block lost its lessons, its handoff and the pointer to its project rules.
+    $known = ''
+    try { $known += Get-FastModeNote -Config $Config -Phase $Phase } catch { }
+    try { $known += Get-GreenGatesNote -Config $Config -Phase $Phase } catch { }
+    try { $known += Get-HandoffNote -Config $Config -Phase $Phase } catch { }
+    try { $known += Get-LessonsNote -Config $Config } catch { }
+    try { $known += Get-BackendNote -Config $Config -Model $Config.model } catch { }
+
     if (-not $block) {
         # No block for this phase: fall back to pointing at the file. Say so loudly,
         # because a missing block is usually a typo in the phase id, not a design choice.
         Write-Host "No '## Phase $Phase' block in $promptsName — falling back to a pointer prompt." -ForegroundColor Yellow
-        return $where + "Read $planName and $promptsName, then carry out the Phase $Phase prompt from $promptsName exactly as it is written there, including its CHECK FIRST step. Do not go beyond that phase."
+        return $where + $known + "Read $planName and $promptsName, then carry out the Phase $Phase prompt from $promptsName exactly as it is written there, including its CHECK FIRST step. Do not go beyond that phase."
     }
 
     # {{SECTION}} is opt-in: a prompt that does not use it keeps whatever it says today.
@@ -952,14 +1002,6 @@ function Build-PhasePrompt {
     $header = "You are executing $what$of, unattended, in a headless session.`n" +
               "The instructions below are the prompt for it, copied verbatim from $promptsName.`n" +
               "Follow them exactly. Do not go beyond what they ask for.`n`n"
-
-    # Measured facts the agent would otherwise spend requests establishing. Each is empty
-    # when it does not hold, and a failure to compute one never costs the prompt.
-    $known = ''
-    try { $known += Get-FastModeNote -Config $Config -Phase $Phase } catch { }
-    try { $known += Get-GreenGatesNote -Config $Config -Phase $Phase } catch { }
-    try { $known += Get-HandoffNote -Config $Config -Phase $Phase } catch { }
-    try { $known += Get-LessonsNote -Config $Config } catch { }
 
     return $header + $where + $known + $block
 }
@@ -2004,6 +2046,161 @@ function Write-AgyStreamEvent {
     }
 }
 
+function Format-ModelLabel {
+    # "opus/high", or just the identifier for an Antigravity model, whose effort is part of
+    # its name: printing "/ effort high" beside it would claim a setting that does not apply.
+    param([string] $Model, [string] $Effort, [string] $Separator = '/')
+    if (-not $Effort -or (Get-AgentBackend $Model) -eq 'agy') { return $Model }
+    return "$Model$Separator$Effort"
+}
+
+# ---------------------------------------------------------------------------
+# Choosing the model for each target
+# ---------------------------------------------------------------------------
+#
+# Three tiers - mechanical, standard, hard - each mapped to a model and an effort the person
+# chooses in "tiers". A target gets a tier from its autoSequence entry, or, with
+# "autoTier": true, from what its plan section says. An explicit "model" on an entry always
+# wins. This is the routing half of a cascade; fixRounds is the escalation half, and the
+# literature on model routing finds the two together beat either alone (Moslem & Kelleher,
+# arXiv 2603.04445). The classifier is deliberately plain - keywords and length - so that
+# `phasekit models` can say why each target got what it got.
+
+$script:TierNames = @('mechanical', 'standard', 'hard')
+$script:TierSignals = @{
+    hard       = 'algorithm|concurren\w*|race condition|\brace\b|deadlock|security|crypto\w*|authenticat\w*|migrat\w*|performance|perf budget|precision|parser|scheduler|state machine|reconcil\w*|invariant|data loss|architecture|consisten\w*|transaction'
+    mechanical = '\bdocs?\b|documentation|readme|changelog|screenshot\w*|store listing|rename|typo|translation|copy edit|bump|version number|licen[cs]e|\bicon\b|formatting|release notes|comment\w*'
+}
+
+function Get-TaskTier {
+    <#
+        mechanical, standard or hard, from the target's own plan section, with the reason.
+        Hard: two or more signs of a hard problem (races, security, migrations, invariants...)
+        or a section over 900 words. Mechanical: signs of mechanical work (docs, renames,
+        screenshots...), none of a hard one, and under 500 words. Everything else: standard.
+    #>
+    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Target)
+    $text = ''
+    try { $text = Get-PlanSectionText -Config $Config -Phase $Target } catch { }
+    if (-not $text) { return [pscustomobject]@{ tier = 'standard'; why = 'no plan section to read' } }
+    $words = @($text -split '\s+' | Where-Object { $_ }).Count
+    $hard = @([regex]::Matches($text, $script:TierSignals.hard, 'IgnoreCase') | ForEach-Object { $_.Value.ToLowerInvariant() } | Select-Object -Unique)
+    $mech = @([regex]::Matches($text, $script:TierSignals.mechanical, 'IgnoreCase') | ForEach-Object { $_.Value.ToLowerInvariant() } | Select-Object -Unique)
+    if ($hard.Count -ge 2 -or $words -gt 900) {
+        $why = @(); if ($hard.Count) { $why += 'mentions ' + (($hard | Select-Object -First 4) -join ', ') }; if ($words -gt 900) { $why += "$words words" }
+        return [pscustomobject]@{ tier = 'hard'; why = ($why -join '; ') }
+    }
+    if ($mech.Count -ge 1 -and $hard.Count -eq 0 -and $words -lt 500) {
+        return [pscustomobject]@{ tier = 'mechanical'; why = 'mentions ' + (($mech | Select-Object -First 4) -join ', ') + "; $words words" }
+    }
+    return [pscustomobject]@{ tier = 'standard'; why = "$words words, no strong sign either way" }
+}
+
+function ConvertFrom-ModelSpec {
+    # "opus/xhigh" -> opus, xhigh; "sonnet" -> sonnet, no effort; "agy:<id>" -> as is.
+    param([string] $Spec)
+    $s = ([string] $Spec).Trim()
+    if ((Get-AgentBackend $s) -eq 'agy') { return [pscustomobject]@{ model = $s; effort = $null } }
+    $m, $e = $s -split '/', 2
+    return [pscustomobject]@{ model = $m; effort = $(if ($e) { $e } else { $null }) }
+}
+
+function Get-TierSpec {
+    <#
+        The model and effort a tier runs on: the person's "tiers" when set, otherwise
+        mechanical = sonnet/medium, standard = the configured model and effort, hard = the
+        configured model at xhigh.
+    #>
+    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Tier)
+    $t = $Config.tiers
+    if ($t) {
+        $v = if ($t -is [System.Collections.IDictionary]) { $t[$Tier] } elseif ($t.PSObject.Properties[$Tier]) { $t.$Tier } else { $null }
+        if ($v) { return (ConvertFrom-ModelSpec $v) }
+    }
+    switch ($Tier) {
+        'mechanical' { return [pscustomobject]@{ model = 'sonnet'; effort = 'medium' } }
+        'hard' {
+            $e = if ((Get-AgentBackend $Config.model) -eq 'agy') { $null } else { 'xhigh' }
+            return [pscustomobject]@{ model = $Config.model; effort = $e }
+        }
+        default { return [pscustomobject]@{ model = $Config.model; effort = $Config.effort } }
+    }
+}
+
+function Resolve-TargetModel {
+    <#
+        The model and effort a target runs on, and why: the entry's own "model" first; then
+        its "tier", or the tier "autoTier" reads from the plan; then the defaults (the
+        command line's -Model and -Effort, else phasekit.json's). An entry's "effort" still
+        applies on top of a model it names.
+    #>
+    param([Parameter(Mandatory)] $Config, $Item, [string] $CliModel, [string] $CliEffort)
+    $itemEffort = if ($Item -and $Item.effort) { [string] $Item.effort } else { $null }
+    if ($Item -and $Item.model) {
+        $e = if ($itemEffort) { $itemEffort } else { $CliEffort }
+        return [pscustomobject]@{ model = [string] $Item.model; effort = $e; tier = $null; source = 'set on the entry' }
+    }
+    $tier = if ($Item -and $Item.PSObject.Properties['tier'] -and $Item.tier) { [string] $Item.tier } else { $null }
+    $why = 'tier set on the entry'
+    if (-not $tier -and $Config.autoTier -and $Item) {
+        $auto = Get-TaskTier -Config $Config -Target $Item.target
+        $tier = $auto.tier; $why = "auto: $($auto.why)"
+    }
+    if ($tier) {
+        $spec = Get-TierSpec -Config $Config -Tier $tier
+        $e = if ($itemEffort) { $itemEffort } else { $spec.effort }
+        return [pscustomobject]@{ model = $spec.model; effort = $e; tier = $tier; source = "$tier ($why)" }
+    }
+    $m = if ($CliModel) { $CliModel } else { $Config.model }
+    $e = if ($itemEffort) { $itemEffort } elseif ($CliEffort) { $CliEffort } else { $Config.effort }
+    $source = if ($itemEffort) { 'default model, effort set on the entry' } else { 'default' }
+    return [pscustomobject]@{ model = $m; effort = $e; tier = $null; source = $source }
+}
+
+# ---------------------------------------------------------------------------
+# What each CLI needs to be told
+# ---------------------------------------------------------------------------
+
+function Get-BackendNote {
+    <#
+        Two things a prompt says differently depending on the CLI that will run it.
+
+        The project's standing instructions. Claude Code loads CLAUDE.md; the Antigravity CLI
+        loads AGENTS.md and GEMINI.md and not CLAUDE.md (its rules documentation). A project
+        written for one would leave the other blind to its own rules, so the prompt names
+        whichever of them that CLI will not load by itself.
+
+        A few lines of working discipline, aimed at each family's documented failure modes.
+        Gemini agents are reported to add what nobody asked for, to guess API signatures, and
+        to stop at a surface fix; Google's guidance is concise, direct instructions. Claude's
+        guidance for harnesses that compact the context is to say so, so the model does not
+        cut the work short to save it.
+    #>
+    param([Parameter(Mandatory)] $Config, [string] $Model)
+    if (-not $Model) { $Model = $Config.model }
+    $backend = Get-AgentBackend $Model
+    $dirs = @($Config.workingDir, $Config.codeDir) | Where-Object { $_ } | Select-Object -Unique
+    $notLoaded = if ($backend -eq 'agy') { @('CLAUDE.md', 'CLAUDE.local.md') } else { @('AGENTS.md', 'GEMINI.md') }
+    $found = @(foreach ($d in $dirs) { foreach ($n in $notLoaded) { $p = Join-Path $d $n; if (Test-Path -LiteralPath $p) { $p } } }) | Select-Object -Unique
+    $out = ''
+    if ($found.Count) {
+        $out += ("PROJECT INSTRUCTIONS: this project keeps standing instructions in " + ($found -join ', ') +
+                 ". Your CLI does not load that file by itself. Read it in full before anything else and follow it " +
+                 "as your own instructions, together with any file it tells you to read.`n`n")
+    }
+    if ($backend -eq 'agy') {
+        $out += ("WORKING DISCIPLINE: stay strictly inside this task's scope; add no dependency, framework, file or " +
+                 "feature it does not ask for. Before you call a function or an API, find its definition in the code " +
+                 "or the installed package and match its real signature; never guess one. Fix the cause, not the " +
+                 "symptom. Report a check as passed only if you ran it in this session and read its output.`n`n")
+    }
+    else {
+        $out += ("CONTEXT: this conversation is compacted automatically as it grows. Do not cut the work short or skip " +
+                 "a check to save context; finish the task.`n`n")
+    }
+    return $out
+}
+
 function Invoke-Agent {
     <#
         Runs claude and renders its stream-json output as one readable line per event.
@@ -2116,6 +2313,19 @@ function Invoke-AgentWithLimitRetry {
             Write-Host 'Split the target, or narrow what it has to read, then run it again.' -ForegroundColor Red
             Write-Host ''
             Write-Host "Full log: $LogPath" -ForegroundColor Red
+            return $exit
+        }
+
+        # A spent allowance with somewhere else to go: `phasekit auto` hands the target to
+        # the next model in limitFallback (another CLI, another quota) instead of waiting.
+        # Only the sequence asks for this; a run by hand waits as it always did.
+        if ($reason -eq 'limit' -and $script:AllowLimitFallback -and @($Config.limitFallback).Count -gt 0) {
+            $note = "$script:NoteMarker Usage limit reached. Handing the target to the next model in limitFallback instead of waiting."
+            Write-Host ''
+            Write-Host $note -ForegroundColor Yellow
+            Add-Content -LiteralPath $LogPath -Value ''
+            Add-Content -LiteralPath $LogPath -Value $note
+            $script:LimitFallbackPending = $true
             return $exit
         }
 
@@ -2630,6 +2840,9 @@ function Open-AutoJournal {
     param([Parameter(Mandatory)] $Config)
     $script:AutoJournal = Join-Path $Config.logDir 'auto-progress.log'
     try {
+        # On a project's first sequence the log directory does not exist yet, and without
+        # this the journal was silently switched off for that whole run.
+        New-Item -ItemType Directory -Path $Config.logDir -Force | Out-Null
         Set-Content -LiteralPath $script:AutoJournal `
             -Value ("{0}  sequence started" -f (Get-Date -Format 'HH:mm:ss'))
     }
@@ -2661,6 +2874,17 @@ function Write-AutoProgress {
         # The journal is a convenience for whoever is watching. A locked file must not be
         # able to stop the sequence it is describing.
     }
+}
+
+function Get-EntryTier {
+    # An autoSequence entry's "tier", checked: a typo must fail at load, not pick a default.
+    param($Entry)
+    if (-not ($Entry -and $Entry.PSObject.Properties['tier'] -and $Entry.tier)) { return $null }
+    $t = ([string] $Entry.tier).Trim().ToLowerInvariant()
+    if ($t -notin @('mechanical', 'standard', 'hard')) {
+        throw "autoSequence entry $($Entry.target) has tier '$($Entry.tier)'. The tiers are mechanical, standard and hard."
+    }
+    return $t
 }
 
 function ConvertTo-OptionalBool {
@@ -2856,14 +3080,14 @@ function Get-AutoSequence {
         # allowNoCommits flag still apply.
         $configured = @{}
         foreach ($e in @($Config.autoSequence)) {
-            if ($e -is [string]) { $configured[$e] = [pscustomobject]@{ target = $e; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false; review = $null } }
-            elseif ($e.target)   { $configured[$e.target] = [pscustomobject]@{ target = $e.target; model = $e.model; effort = $e.effort; note = $e.note; allowNoCommits = [bool]$e.allowNoCommits; checkpoint = [bool]$e.checkpoint; review = (ConvertTo-OptionalBool $e 'review') } }
+            if ($e -is [string]) { $configured[$e] = [pscustomobject]@{ target = $e; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false; review = $null; tier = $null } }
+            elseif ($e.target)   { $configured[$e.target] = [pscustomobject]@{ target = $e.target; model = $e.model; effort = $e.effort; note = $e.note; allowNoCommits = [bool]$e.allowNoCommits; checkpoint = [bool]$e.checkpoint; review = (ConvertTo-OptionalBool $e 'review'); tier = (Get-EntryTier $e) } }
         }
 
         return @($flat | ForEach-Object {
             $name = $_.Trim()
             if ($configured.ContainsKey($name)) { $configured[$name] }
-            else { [pscustomobject]@{ target = $name; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false; review = $null } }
+            else { [pscustomobject]@{ target = $name; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false; review = $null; tier = $null } }
         })
     }
 
@@ -2874,7 +3098,7 @@ function Get-AutoSequence {
     $i = -1
     return @($Config.autoSequence | ForEach-Object {
         $i++
-        if ($_ -is [string]) { [pscustomobject]@{ target = $_; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false; review = $null } }
+        if ($_ -is [string]) { [pscustomobject]@{ target = $_; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false; review = $null; tier = $null } }
         else {
             # Say which entry is wrong and what it is missing. Without this the run
             # walks on with an empty target and dies several frames later on
@@ -2886,7 +3110,7 @@ function Get-AutoSequence {
                        'Each entry is either a bare string ("4.2") or an object with a ' +
                        '"target" key ({ "target": "4.2", "note": "..." }).')
             }
-            [pscustomobject]@{ target = $_.target; model = $_.model; effort = $_.effort; note = $_.note; allowNoCommits = [bool]$_.allowNoCommits; checkpoint = [bool]$_.checkpoint; review = (ConvertTo-OptionalBool $_ 'review') }
+            [pscustomobject]@{ target = $_.target; model = $_.model; effort = $_.effort; note = $_.note; allowNoCommits = [bool]$_.allowNoCommits; checkpoint = [bool]$_.checkpoint; review = (ConvertTo-OptionalBool $_ 'review'); tier = (Get-EntryTier $_) }
         }
     })
 }
@@ -3508,8 +3732,33 @@ function Get-OrphanedWorkPrompt {
     #>
     param(
         [Parameter(Mandatory)] $Config,
-        [Parameter(Mandatory)] [string] $Target
+        [Parameter(Mandatory)] [string] $Target,
+        # Why a session on another model takes over: a fix round on the other CLI, or a
+        # spent allowance. The work so far may be committed already, so the wording differs.
+        [string] $Handover
     )
+
+    if ($Handover) {
+        $main = Get-MainBranch -Config $Config
+        $handoverText = @"
+Another session has been working on $Target, on a different model or CLI, and its
+conversation is not available to you. Its work so far is on the branch that is already
+checked out: the commits since $main (``git log $main..HEAD``, ``git diff $main``) and any
+uncommitted changes (``git status``). Read all of it as a reviewer, not as its author.
+
+Why you are taking over:
+$Handover
+
+Then carry the task to the end, following its prompt below. Its CHECK FIRST step may ask
+for a clean tree or no commits yet; those conditions do not apply here. Commit following
+the project's rules on commits (fold your changes into this task's commit if they ask for
+one commit per task), and tick the $Target row in the ledger if it is not ticked yet.
+
+---------------------------------------------------------------------------
+
+"@
+        return $handoverText + (Build-PhasePrompt -Config $Config -Phase $Target)
+    }
 
     $preamble = @"
 An earlier attempt at $Target ended without committing, and its conversation is gone, so
@@ -3694,6 +3943,24 @@ function Get-LogSpend {
     $seen = @{}
     $lastCtx = 0
     foreach ($line in $lines) {
+        # Antigravity: each agent_response step is one model request and carries its own
+        # usage. Context is the fresh input plus the cached read; thinking counts as output.
+        if ($line -match '"step_type":"agent_response"' -and $line -match '"usage"') {
+            try { $ev = $line | ConvertFrom-Json } catch { continue }
+            $s = $ev.step_update
+            if (-not $s -or -not $s.usage) { continue }
+            $u = $s.usage
+            $rec = [pscustomobject]@{
+                ctx   = [int64] $u.input_tokens + [int64] $u.cache_read_tokens
+                read  = [int64] $u.cache_read_tokens
+                write = [int64] 0
+                fresh = [int64] $u.input_tokens
+                out   = [int64] $u.output_tokens + [int64] $u.thinking_tokens
+            }
+            $seen["agy:$($s.conversation_id):$($s.step_index)"] = $rec
+            $lastCtx = $rec.ctx
+            continue
+        }
         if ($line -notmatch '"request_id"') { continue }
         try { $ev = $line | ConvertFrom-Json } catch { continue }
         if ($ev.type -ne 'assistant') { continue }
@@ -4611,8 +4878,11 @@ function Test-PlanLint {
 
     # Antigravity models need the agy CLI, found now rather than at the first target that
     # uses one.
-    $models = @($Config.model, $Config.reviewModel) + @($seq | ForEach-Object { $_.model }) +
-              @(@($Config.fixRounds) | ForEach-Object { ([string] $_) -replace '/.*$', '' })
+    $tierModels = @()
+    if ($Config.tiers) { $tierModels = @($Config.tiers.Values | ForEach-Object { ([string] $_) -replace '/.*$', '' }) }
+    $models = @($Config.model) + @($Config.reviewModels) + @($seq | ForEach-Object { $_.model }) +
+              @(@($Config.fixRounds) | ForEach-Object { ([string] $_) -replace '/.*$', '' }) +
+              @(@($Config.limitFallback) | ForEach-Object { ([string] $_) -replace '/.*$', '' }) + $tierModels
     $agyModels = @($models | Where-Object { $_ -and (Get-AgentBackend ([string] $_)) -eq 'agy' } | Select-Object -Unique)
     if ($agyModels.Count -and -not (Get-AgyExecutable)) {
         & $add 'error' 'phasekit.json' ("$($agyModels -join ', ') need the Antigravity CLI (agy), which is not installed: " +
@@ -4688,8 +4958,10 @@ function Get-DashboardFrame {
         # resolves it: a sequence entry overrides the configured default, and nothing
         # else does. A dashboard that printed the config's model would be right about
         # the file and wrong about the target actually running.
-        $model = if ($item.model) { $item.model } else { $Config.model }
-        $effort = if ($item.effort) { $item.effort } else { $Config.effort }
+        # The same choice the sequence will make: the entry's model, its tier, or autoTier.
+        $chosen = Resolve-TargetModel -Config $Config -Item $item
+        $model = $chosen.model
+        $effort = $chosen.effort
 
         # Only for the row actually being worked on, and only from the tail of its log:
         # this runs on every dashboard refresh, and the answer is in the last few
@@ -4706,7 +4978,7 @@ function Get-DashboardFrame {
             model    = $model
             effort   = $effort
             context  = $context
-            custom   = [bool] ($item.model -or $item.effort)
+            custom   = [bool] ($model -ne $Config.model -or $effort -ne $Config.effort)
             note     = $item.note
             state    = $state
             commits  = $carries

@@ -22,6 +22,15 @@ Add-Content -LiteralPath (Join-Path $dir 'prompts.txt') -Value ("=== $kind`n" + 
 $count = @(Get-Content -LiteralPath (Join-Path $dir 'calls.txt') | Where-Object { $_ -like "$kind *" }).Count
 
 $sid = if ($kind -eq 'resume') { Get-Arg '--resume' } else { [guid]::NewGuid().ToString() }
+
+# PK_CLAUDE_LIMIT=1: the account's allowance is spent, the way the CLI reports it.
+if ($env:PK_CLAUDE_LIMIT -eq '1' -and $kind -ne 'review') {
+    '{"type":"system","subtype":"init","session_id":"' + $sid + '","cwd":"."}'
+    # The real CLI prints this on stderr, which the runner's 2>&1 captures; a script's
+    # [Console]::Error would bypass that, so it goes to the output here.
+    "You've hit your usage limit · resets 9pm (Europe/Rome)"
+    exit 1
+}
 '{"type":"system","subtype":"init","session_id":"' + $sid + '","cwd":"."}'
 
 $text = ''

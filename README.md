@@ -7,8 +7,9 @@ Run a long refactor as a series of unattended agent sessions that you can actual
 One plan, split into phases. One phase per headless run, on its own git branch, one commit
 per task, gates green before every commit. The runner survives usage limits, pins the
 conversation so your answers reach the right session, prints what the agent is doing
-while it does it, forecasts when the sequence ends, and hands every new agent the lessons
-the earlier ones verified.
+while it does it, forecasts when the sequence ends, hands every new agent the lessons
+the earlier ones verified, and runs each task on the model that suits it, Claude's through
+Claude Code or Gemini's and others through Google Antigravity.
 
 It exists because "let the agent go and see what happens" produces a diff nobody can read
 and a repository nobody can revert. The unit of trust here is the commit, not the session.
@@ -27,6 +28,7 @@ the agent is doing.*
 [Lessons](#lessons-what-one-agent-learns-the-next-one-knows) ·
 [Review and fix rounds](#a-second-opinion-and-a-second-chance-review-and-fixrounds) ·
 [Antigravity models](#models-from-google-antigravity-agymodel) ·
+[Many models, one plan](#many-models-one-plan-tiers-the-right-model-per-task-and-a-second-quota) ·
 [What a target costs](#what-a-target-costs-and-why-it-is-not-the-clock) ·
 [What makes it work](#what-makes-it-work) · [Sources](#sources-why-it-is-built-this-way) ·
 [Related projects](#related-projects)
@@ -158,6 +160,7 @@ anything.
 | `phasekit lessons add -Text "…"` | Record one by hand: `when <condition> \| <lesson> \| evidence: <what shows it>` |
 | `phasekit lessons drop <id>` | Retire one by hand; `-Text` says why |
 | `phasekit review <target>` | An independent, read-only review of a target's branch as it stands ([details](#a-second-opinion-and-a-second-chance-review-and-fixrounds)) |
+| `phasekit models` | Which model and effort each target runs on, and why ([details](#many-models-one-plan-tiers-the-right-model-per-task-and-a-second-quota)) |
 
 Useful flags: `-Detach` (survives closing the terminal), `-DryRun` (print the prompt and
 the exact `claude` command, run nothing), `-Watch` (redraw the dashboard), `-NoBranch`,
@@ -741,8 +744,70 @@ What phasekit does, measured against agy 1.5.9:
   `waitMinutes`, repeated up to `maxRetries`; for a weekly limit raise those, or let the
   sequence stop.
 
-Not yet: `phasekit spend` and the forecast count Claude's usage only, and the account
-switch (`phasekit account`) is for Claude accounts.
+`phasekit spend` counts Antigravity's usage too (each response's own token count). The
+forecast's allowance model and `phasekit account` are Claude's only.
+
+### Many models, one plan: tiers, the right model per task, and a second quota
+
+With Claude and Antigravity both available there are a dozen models to choose from. You
+can choose for each task yourself (`"model"` on its entry), or let phasekit choose from
+the plan, using a model per **tier** that you set once:
+
+```json
+"autoTier": true,
+"tiers": {
+  "mechanical": "agy:gemini-3.8-flash-medium",
+  "standard":   "opus/medium",
+  "hard":       "opus/xhigh"
+},
+"review": true,
+"reviewModel": ["agy:gemini-4-hydrogen-high"],
+"fixRounds": ["same", "opus/xhigh"],
+"limitFallback": ["agy:claude-opus-5-5-high", "agy:gemini-4-argon-high"]
+```
+
+- **Tiers.** A task is *mechanical*, *standard* or *hard*. An entry can name its tier
+  (`{ "target": "4.2", "tier": "hard" }`); with `"autoTier": true` phasekit reads it from the
+  task's plan section: two or more signs of a hard problem (a race, an invariant, a
+  migration, security, performance, data loss...) or more than 900 words make it hard;
+  signs of mechanical work (docs, README, screenshots, renames, version bumps) with no hard
+  sign and under 500 words make it mechanical; the rest is standard. Deliberately plain,
+  so it can explain itself: **`phasekit models`** prints every target's model and effort
+  and why. An entry's own `"model"` always wins, and its `"effort"` applies on top. Without
+  `"tiers"`, mechanical is sonnet/medium, standard the configured model, hard the
+  configured model at xhigh. Routing up front and escalating on failure (`fixRounds`) is
+  the combination the routing literature finds best.
+- **Several reviewers.** `"reviewModel"` takes a list. Each reviews on its own; one
+  rejection sends the work back, with every rejecting reviewer's findings, named. A
+  reviewer of another family than the builder is the cheapest gain: judges tend to favour
+  output like their own, and different families share fewer blind spots, though not none.
+- **A second quota instead of a wait.** `"limitFallback"`: when the target's model runs out
+  of allowance in the middle of the task, `phasekit auto` hands it, in a fresh session over
+  the branch, to the next model in the list instead of waiting for the reset. Antigravity
+  carries Claude models too, under its own quota, so `"agy:claude-opus-5-5-high"` continues
+  with the same family. When the list runs out, the last one waits, as before.
+
+What phasekit tells each family, from their own vendors' guidance and the measured
+differences between them:
+
+- **Project instructions reach both.** Claude Code loads `CLAUDE.md`; Antigravity loads
+  `AGENTS.md` and `GEMINI.md`, not `CLAUDE.md`. The prompt names the files the CLI running it
+  will not load, so a project written for one is not invisible to the other.
+- **Gemini** gets a short working discipline: stay in scope, look up an API's real signature
+  before calling it, fix the cause, claim a check only after running it. Those are the
+  failure modes reported for Gemini agents (scope creep, guessed signatures, surface
+  fixes), and Google's guidance is concise, direct instructions. Its thinking level is
+  part of the model id: medium is Google's default for agentic coding, high for the hardest
+  tasks, and higher levels also make it call more tools.
+- **Claude** is told that its context is compacted automatically, so it does not cut work
+  short to save it, which is Anthropic's guidance for harnesses that compact.
+
+Where each tends to fit, as the published comparisons stand in November 2026: Claude Opus
+leads on terminal-based agentic coding and on full coding-agent benchmarks; Gemini models
+are close on code, cheaper, with very long context. So: Claude for the hard tasks, Gemini
+Flash for mechanical ones, a Gemini reviewer for Claude's work, and the other quota as the
+fallback. Measure on your own plan: `phasekit spend` shows what each target cost and the
+stop notes show what failed.
 
 `workingDir` is where the agent is launched; `codeDir` is the git repository that receives
 the branch and the commits. They differ when the plan lives in a separate notes repo — set
@@ -857,6 +922,31 @@ it done like this?" has an answer you can check.
   [Ralph loop](https://ghuntley.com/ralph/), the simplest form of the idea:
   `while :; do cat PROMPT.md | claude; done`. phasekit is the same loop with a plan,
   branches, gates, limit handling and a verdict on every iteration.
+- **Route by difficulty, escalate on failure.** Moslem & Kelleher,
+  [Dynamic model routing and cascading for efficient LLM inference](https://arxiv.org/abs/2603.04445)
+  (2026): cascade routing beats routing or cascading alone, and quality estimation is the
+  key factor. Here: tiers (routing) plus fixRounds (escalation), and a classifier that says
+  why it chose. Agent-level results: [AgentRouter](https://arxiv.org/abs/2609.22951) (2026).
+- **A reviewer of another family.** Judges favour outputs like their own
+  ([Wataoka et al.](https://arxiv.org/abs/2410.21819), [arXiv 2604.22891](https://arxiv.org/abs/2604.22891));
+  a verifier from a different family catches inconsistencies the same model misses
+  ([arXiv 2604.21282](https://arxiv.org/abs/2604.21282)); but different providers still fail
+  together more than chance ([arXiv 2609.03422](https://arxiv.org/abs/2609.03422)), and most
+  shared failures trace back to the specification ([N-version programming with coding agents](https://arxiv.org/abs/2606.20158)).
+  Here: reviewModel takes several, of any family, and the plan stays the first defence.
+- **What each CLI loads, and how to prompt each family.** Antigravity's
+  [rules](https://antigravity.google/docs/rules/) and [CLI best practices](https://antigravity.google/docs/cli/best-practices/)
+  (AGENTS.md / GEMINI.md, verification, plan then execute); Google's
+  [Gemini 3 developer guide](https://ai.google.dev/gemini-api/docs/gemini-3) and
+  [what's new in Gemini 3.5](https://ai.google.dev/gemini-api/docs/whats-new-gemini-3.5)
+  (concise prompts, thinking levels, more tool calls at higher levels); Anthropic's
+  [prompting best practices](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices)
+  (state in git and structured files, verification tools, say when context is compacted).
+  Measured behaviour of Gemini and Claude agents: [DataCamp](https://www.datacamp.com/blog/gemini-cli-vs-claude-code)
+  and [index.dev](https://www.index.dev/blog/gemini-pro-vs-claude-for-coding) comparisons;
+  benchmarks of [Gemini 4 Argon vs Claude Opus 5.5](https://www.datacamp.com/blog/gemini-4-argon-vs-claude-opus-5-5)
+  and [Gemini 4 Carbon vs Claude Opus 5.5](https://www.lindy.ai/blog/gemini-4-carbon-vs-claude-opus-5-5),
+  whose small gaps come from different harnesses and deserve caution.
 
 ## Related projects
 

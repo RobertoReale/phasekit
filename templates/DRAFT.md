@@ -51,7 +51,9 @@ already answers; state what you found instead. Cover, in roughly this order:
   which tasks deserve a higher effort and which are mechanical enough for a cheaper model,
   and whether some should run on Google Antigravity's models ("agy:<id>", from
   `agy models`, if the person has Antigravity) to use that quota too, a Gemini reviewer
-  being the usual first choice.
+  being the usual first choice. Offer the simple way too: "autoTier": true with a model
+  per tier in "tiers" (mechanical, standard, hard), and "limitFallback" to continue on the
+  other quota instead of waiting. Mark each task's tier in autoSequence where you know it.
   Explain each in one plain sentence; the README of phasekit describes them.
 
 ## What you write
