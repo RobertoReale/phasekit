@@ -176,9 +176,9 @@ try {
         configDir  = $gateDir
         workingDir = $gateDir
         gates      = @(
-            [pscustomobject]@{ name = 'tests'; cwd = '.'; run = 'cmd /c exit 0' }
-            [pscustomobject]@{ name = 'browser suite'; cwd = '.'; run = 'cmd /c exit 3' }
-            [pscustomobject]@{ name = 'nowhere'; cwd = 'no-such-dir'; run = 'cmd /c exit 0' }
+            [pscustomobject]@{ name = 'tests'; cwd = '.'; run = 'pwsh -NoProfile -Command exit 0' }
+            [pscustomobject]@{ name = 'browser suite'; cwd = '.'; run = 'pwsh -NoProfile -Command exit 3' }
+            [pscustomobject]@{ name = 'nowhere'; cwd = 'no-such-dir'; run = 'pwsh -NoProfile -Command exit 0' }
         )
     }
 
@@ -201,7 +201,7 @@ try {
     # since been fixed - which is worse than saying nothing.
     $green = [pscustomobject]@{
         configDir = $gateDir; workingDir = $gateDir
-        gates = @([pscustomobject]@{ name = 'tests'; cwd = '.'; run = 'cmd /c exit 0' })
+        gates = @([pscustomobject]@{ name = 'tests'; cwd = '.'; run = 'pwsh -NoProfile -Command exit 0' })
     }
     $null = Invoke-Gates -Config $green
     Test-Case 'a green run forgets the last failures' @(Get-LastGateFailures).Count 0
@@ -232,7 +232,7 @@ try {
     # The retry is a second chance, not an exemption.
     $never = [pscustomobject]@{
         configDir = $gateDir; workingDir = $gateDir
-        gates = @([pscustomobject]@{ name = 'browser suite'; cwd = '.'; run = 'cmd /c exit 3'; retries = 2 })
+        gates = @([pscustomobject]@{ name = 'browser suite'; cwd = '.'; run = 'pwsh -NoProfile -Command exit 3'; retries = 2 })
     }
     Test-Case 'a gate that refuses every time fails with retries too' (Invoke-Gates -Config $never) 1
     Test-Case 'and reports the exit code it really gave' @(Get-LastGateFailures)[0].code 3

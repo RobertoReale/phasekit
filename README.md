@@ -1,5 +1,7 @@
 # phasekit
 
+[![tests](https://github.com/RobertoReale/phasekit/actions/workflows/tests.yml/badge.svg)](https://github.com/RobertoReale/phasekit/actions/workflows/tests.yml)
+
 Run a long refactor as a series of unattended agent sessions that you can actually review.
 
 One plan, split into phases. One phase per headless run, on its own git branch, one commit
@@ -18,6 +20,7 @@ the usage allowance it is planned against. `phasekit logs -Follow` shows, line b
 the agent is doing.*
 
 **Contents.** [Requirements](#requirements) · [Install](#install) · [Quickstart](#quickstart) ·
+[Writing the plan](#writing-the-plan-draft-and-lint) ·
 [Commands](#commands) · [Unattended sequences](#unattended-sequences) ·
 [How far along](#how-far-along-and-how-much-longer) · [Configuration](#configuration) ·
 [How much to verify](#how-much-to-verify-verify) ·
@@ -55,6 +58,11 @@ a machine with no notification daemon must not take a run down, and a run that c
 prevent sleep is still a run. The terminal bell is the fallback everywhere, which is
 also the one that survives ssh.
 
+The whole test suite runs on all three, on every push ([the badge above](https://github.com/RobertoReale/phasekit/actions/workflows/tests.yml)).
+It drives `phasekit auto` end to end against a fake `claude` (`tests/fake-claude`), so
+reviews, fix rounds, lessons and the plan check are exercised on each platform without an
+account.
+
 `tools/resume-at-logon.ps1` and `tools/watchdog.ps1` register **Windows** Task Scheduler
 tasks. Elsewhere they refuse and print the launchd, systemd or cron equivalent to set up
 by hand.
@@ -69,37 +77,66 @@ Then either call it by path, or add a function to your PowerShell profile
 (`$PROFILE`) so `phasekit` works anywhere:
 
 ```powershell
-function phasekit { & "C:\path\to\phasekit\bin\phasekit.ps1" @args }
+function phasekit { & "C:\path\to\phasekit\bin\phasekit.ps1" @args }   # Windows
+function phasekit { & "$HOME/phasekit/bin/phasekit.ps1" @args }         # macOS, Linux
 ```
 
 ## Quickstart
 
 ```powershell
 cd my-project
-phasekit init          # writes phasekit.json, PLAN.md, PROMPTS.md, AGENT-RULES.md
+phasekit draft         # an interview that writes the plan, the prompts, the rules and phasekit.json
+phasekit lint          # the plan checked mechanically
+phasekit gates         # the gates actually run
+phasekit auto -Detach  # go; follow it with  phasekit dashboard -Watch
 ```
 
-1. Edit `phasekit.json`: point `codeDir` at the git repo, and list the **gates** — the
-   exact commands that must be green before every commit.
-2. Write `PLAN.md`, in English. This is the work. See [docs/method.md](docs/method.md) and
-   [docs/writing-a-plan.md](docs/writing-a-plan.md).
-3. Write the phase blocks in `PROMPTS.md`. Each one opens by verifying the previous phase.
-4. Check the gates actually run:
+Or by hand: `phasekit init` writes the four files from the templates. Then edit
+`phasekit.json` (the **gates**: the exact commands that must be green before every commit),
+write `PLAN.md` in English (see [docs/method.md](docs/method.md) and
+[docs/writing-a-plan.md](docs/writing-a-plan.md)) and the blocks in `PROMPTS.md`, and run
+`phasekit lint`, `phasekit gates` and `phasekit run 0`.
 
-```powershell
-phasekit gates
-```
+## Writing the plan: draft and lint
 
-5. Go:
+The plan decides how good everything after it is, and it is the hardest part to write.
 
-```powershell
-phasekit run 0
-```
+**`phasekit draft`** opens an interactive Claude session in the project that does it with
+you. It reads phasekit's own guides and templates, audits the code if there is any (read
+only, with evidence for every finding), then interviews you: a few questions at a time, each
+with options and its recommendation, about the goal, the scope, the gates, the invariants,
+the order of the phases, the decisions only you can make, and how unattended the run should
+be (review, fix rounds, verify mode, models per task). Then it writes `PLAN.md`,
+`PROMPTS.md`, `AGENT-RULES.md` and `phasekit.json` in phasekit's format, runs
+`phasekit lint` until it is clean, and shows you the outline. It changes nothing that
+exists without your yes, and it does not start the run. `-Text "…"` gives it a first
+description of what you want.
+
+It talks in whatever language you write in, and writes the files in **English**: the
+agents that execute the plan read English instructions and write English code and commits,
+and a plan in another language makes every session translate
+([why](docs/writing-a-plan.md#write-it-in-english)). Strings a user of your product will
+see stay in their language, quoted verbatim.
+
+**`phasekit lint`** checks the plan with no model involved, for the mistakes that otherwise
+surface hours into an unattended night: a ledger row with no task section, a task with no
+ledger row or no "Done when", a target listed twice or unknown to the plan, an unticked
+task the sequence never reaches, the template's placeholder gate. It reads only the markers
+phasekit itself reads (`### <id>` headings, `- [ ] <id>` ledger rows, the prompt blocks,
+`phasekit.json`), so a plan written in another language checks out too: name its own label
+for "Done when" in `"planSections"`. A numbered chapter of the plan ("### 1.1 The gates")
+is not mistaken for a task.
+
+`phasekit auto` runs the same check before it starts and refuses a plan with errors, with a
+stop note that lists them (`"lintBeforeAuto": false` turns that off). Warnings never stop
+anything.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
+| `phasekit draft [-Text "…"]` | An interactive session that interviews you and writes the plan in phasekit's format ([details](#writing-the-plan-draft-and-lint)) |
+| `phasekit lint` | Check the plan mechanically: ledger, task sections, sequence, gates |
 | `phasekit init [-Force]` | Scaffold the four files into the current directory |
 | `phasekit run <phase>` | Create `plan/phase-<n>`, send the phase block, stream the run |
 | `phasekit reply <phase> -Text "…"` | Answer a question **in the same conversation** |
@@ -777,7 +814,8 @@ Others solve the same problem differently, and two of phasekit's options come fr
 - [claude-autopilot](https://github.com/Timothy1102/claude-autopilot): plan once, then one
   verified commit per task overnight in a worktree. Its optional reviewer session per task
   and its escalation of a failing task to a stronger model are where `"review"` and
-  `"fixRounds"` come from.
+  `"fixRounds"` come from, and its planning session, which asks each question with a
+  recommended answer, is the model for `phasekit draft`.
 - [harnessd](https://github.com/samhagman/harnessd): builder and evaluator negotiate a
   contract per work packet before any code, and a read-only adversarial evaluator tries to
   disprove the builder's claims, which is the stance phasekit's reviewer takes.

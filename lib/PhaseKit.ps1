@@ -112,6 +112,13 @@ function Get-PhaseKitConfig {
         # entry is one more round in the target's own conversation, told what was wrong:
         # "same" keeps the target's model, "opus/xhigh" (or just "opus") moves up.
         fixRounds        = @()
+        # The labels every task section must contain (see Test-PlanLint). Only "Done when"
+        # by default: it is what makes a task checkable unattended. A plan written in
+        # another language names its own label here.
+        planSections     = @('Done when')
+        # `phasekit auto` checks the plan before it starts, and refuses a plan with errors:
+        # a broken plan found at the first target is cheaper than one found at the tenth.
+        lintBeforeAuto   = $true
         gates            = @()
         # The targets `phasekit auto` walks, in order. See Get-AutoSequence.
         autoSequence     = @()
@@ -161,7 +168,10 @@ function Get-PhaseKitConfig {
         }
         $cfg.fixRounds = $rounds
     }
-    foreach ($k in @('skipVerifiedGates', 'handoff', 'lessons', 'review')) {
+    if ($raw.PSObject.Properties.Name -contains 'planSections' -and $null -ne $raw.planSections) {
+        $cfg.planSections = @($raw.planSections | ForEach-Object { ([string] $_).Trim() } | Where-Object { $_ })
+    }
+    foreach ($k in @('skipVerifiedGates', 'handoff', 'lessons', 'review', 'lintBeforeAuto')) {
         if ($raw.PSObject.Properties.Name -contains $k) { $cfg[$k] = [bool] $raw.$k }
     }
     if ($raw.usageLimit) {
@@ -4183,6 +4193,128 @@ function Get-PlanOutline {
     }
 
     return [pscustomobject]@{ phases = $phases; targets = $targets }
+}
+
+function Test-PlanLint {
+    <#
+        Checks a plan mechanically, with no model involved, for the mistakes that otherwise
+        surface hours into an unattended run: a ledger row with no task section, a section
+        with no ledger row, a task with no "Done when", a sequence naming a target the plan
+        does not have, an unticked task the sequence never reaches, a gate whose directory
+        does not exist.
+
+        It reads only the markers phasekit itself reads - `### <id>` headings, `- [ ] <id>`
+        ledger rows, the PROMPTS blocks, phasekit.json - so it works the same for a plan
+        written in any language. The labels a section must contain are configurable
+        (planSections).
+
+        Returns findings: level (error or warning), where, message. Errors are what would
+        break or mislead a run; warnings are worth a look.
+    #>
+    param([Parameter(Mandatory)] $Config)
+
+    $out = [System.Collections.Generic.List[object]]::new()
+    $add = { param($level, $where, $message) $out.Add([pscustomobject]@{ level = $level; where = $where; message = $message }) }
+    $planName = Split-Path -Leaf $Config.plan
+
+    if (-not (Test-Path -LiteralPath $Config.plan)) { & $add 'error' $planName "the plan file does not exist: $($Config.plan)"; return @($out) }
+    if (-not (Test-Path -LiteralPath $Config.prompts)) { & $add 'error' (Split-Path -Leaf $Config.prompts) "the prompts file does not exist: $($Config.prompts)" }
+
+    $lines = @(Get-Content -LiteralPath $Config.plan)
+    $outline = Get-PlanOutline -PlanLines $lines
+
+    # The ledger: every "- [ ] <id> ..." / "- [x] <id> ..." row.
+    $ledger = [ordered]@{}
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\s*- \[( |x|X)\]\s+(?<id>[A-Za-z0-9]+\.\d+)\b') {
+            $id = $Matches['id']
+            $ticked = $Matches[1] -ne ' '
+            if ($ledger.Contains($id)) { & $add 'error' "$planName line $($i + 1)" "ledger row $id appears twice" }
+            else { $ledger[$id] = $ticked }
+        }
+    }
+    if ($ledger.Count -eq 0) { & $add 'error' $planName 'no ledger rows ("- [ ] <id> <title>"): nothing records what is done' }
+
+    foreach ($id in $ledger.Keys) {
+        if (-not $outline.targets.ContainsKey($id)) {
+            & $add 'error' $planName "ledger row $id has no task section (### $id - <title>): the agent would get no instructions"
+        }
+    }
+    # A "### 1.1" heading is not always a task: plans number their own chapters the same
+    # way ("### 1.1 The gates"). A section is a task when the ledger lists it. One the
+    # ledger does not list but that carries the labels of a task is a task whose row was
+    # forgotten; one that carries neither is just a chapter.
+    $labels = @($Config.planSections | Where-Object { $_ })
+    $hasLabel = {
+        param($body, $label)
+        $pattern = '(?i)^\s*(?:\*\*|__|#+\s*)?\s*' + [regex]::Escape($label) + '\b'
+        return [bool] (@($body) | Where-Object { $_ -match $pattern })
+    }
+    foreach ($id in $outline.targets.Keys) {
+        if ($ledger.Contains($id)) { continue }
+        $body = @($outline.targets[$id].body)
+        $looksLikeTask = $labels.Count -and @($labels | Where-Object { & $hasLabel $body $_ }).Count -eq $labels.Count
+        if ($looksLikeTask) {
+            & $add 'error' "$planName line $($outline.targets[$id].line + 1)" "task $id has no ledger row (- [ ] $id <title>): nothing would record it as done"
+        }
+    }
+
+    # Every task must carry the configured labels, "Done when" above all.
+    foreach ($id in $ledger.Keys) {
+        if (-not $outline.targets.ContainsKey($id)) { continue }
+        foreach ($label in $labels) {
+            if (-not (& $hasLabel $outline.targets[$id].body $label)) {
+                & $add 'error' "$planName line $($outline.targets[$id].line + 1)" "task $id has no '$label' section"
+            }
+        }
+    }
+
+    # The sequence.
+    $seq = @()
+    if ($Config.autoSequence -and @($Config.autoSequence).Count) {
+        try { $seq = @(Get-AutoSequence -Config $Config) }
+        catch { & $add 'error' 'phasekit.json' $_.Exception.Message }
+    }
+    else { & $add 'warning' 'phasekit.json' 'no autoSequence: `phasekit auto` has nothing to walk unless given -Targets' }
+
+    $seen = @{}
+    foreach ($s in $seq) {
+        $t = $s.target
+        if ($seen.ContainsKey($t)) { & $add 'error' 'phasekit.json' "autoSequence lists $t twice"; continue }
+        $seen[$t] = $true
+        # A target is a task ("4.2") or a whole phase ("4"), which covers every 4.x row.
+        $rows = @($ledger.Keys | Where-Object { $_ -eq $t -or $_ -like "$t.*" })
+        if ($rows.Count -eq 0) { & $add 'error' 'phasekit.json' "autoSequence names $t, which has no ledger row in $planName" }
+        if (Test-Path -LiteralPath $Config.prompts) {
+            $block = Read-PhasePrompt -PromptsFile $Config.prompts -Phase $t
+            if (-not $block -and $t -match '\.') { $block = Read-PhasePrompt -PromptsFile $Config.prompts -Phase 'task' }
+            if (-not $block) { & $add 'warning' (Split-Path -Leaf $Config.prompts) "no prompt block for $t (neither '## Phase $t' nor a generic '## task'): it would get a bare pointer prompt" }
+        }
+    }
+    if ($seq.Count) {
+        foreach ($id in $ledger.Keys) {
+            if ($ledger[$id]) { continue }
+            $phase = $id -replace '\.\d+$', ''
+            if (-not ($seen.ContainsKey($id) -or $seen.ContainsKey($phase))) {
+                & $add 'error' 'phasekit.json' "task $id is not done and autoSequence never reaches it"
+            }
+        }
+    }
+
+    # The gates.
+    $gates = @($Config.gates | Where-Object { $_ })
+    if ($gates.Count -eq 0) { & $add 'warning' 'phasekit.json' 'no gates: nothing checks the work before a merge' }
+    foreach ($g in $gates) {
+        if (-not $g.name -or -not $g.run) { & $add 'error' 'phasekit.json' "a gate has no name or no run command: $($g | ConvertTo-Json -Compress)"; continue }
+        if ($g.run -match '^\s*echo\s+replace me\s*$') { & $add 'error' 'phasekit.json' "gate '$($g.name)' is still the template's placeholder" }
+        if ($g.cwd) {
+            $dir = Join-Path $Config.configDir $g.cwd
+            # A warning, not an error: in a new project the first task is often the one
+            # that creates that directory.
+            if (-not (Test-Path -LiteralPath $dir)) { & $add 'warning' 'phasekit.json' "gate '$($g.name)' runs in $($g.cwd), which does not exist yet" }
+        }
+    }
+    return @($out)
 }
 
 function Get-DashboardFrame {

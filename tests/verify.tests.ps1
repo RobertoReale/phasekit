@@ -72,7 +72,7 @@ try {
     Test-Case 'at a checkpoint everything runs' (Get-Names (Get-GatePlan -Config $cfg -Phase 'M1.2').run) 'unit,e2e'
     Test-Case 'Invoke-Gates runs the subset it is given' (Invoke-Gates -Config $cfg -Gates @($unit)) 0
     Test-Case 'an empty subset fails nothing' (Invoke-Gates -Config $cfg -Gates @()) 0
-    $bad = [pscustomobject]@{ name = 'bad'; run = 'cmd /c exit 3' }
+    $bad = [pscustomobject]@{ name = 'bad'; run = 'pwsh -NoProfile -Command exit 3' }
     $withBad = [pscustomobject]@{ codeDir = $repo; logDir = $logs; configDir = $repo; workingDir = $repo; gates = @($unit, $bad) }
     Test-Case 'a gate left out of the subset is not run' (Invoke-Gates -Config $withBad -Gates @($unit)) 0
     Test-Case 'without -Gates the whole list still runs' (Invoke-Gates -Config $withBad) 1

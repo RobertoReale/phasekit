@@ -1,0 +1,34 @@
+name: tests
+
+# The whole suite on the three platforms phasekit supports, on every push and pull request.
+# The tests drive phasekit end to end against a fake claude (tests/fake-claude), so they
+# need no account and spend nothing.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run every test file
+        shell: pwsh
+        run: |
+          $PSVersionTable.PSVersion
+          $failed = @()
+          foreach ($t in Get-ChildItem tests -Filter '*.tests.ps1' | Sort-Object Name) {
+            Write-Host "::group::$($t.Name)"
+            pwsh -NoProfile -File $t.FullName
+            $code = $LASTEXITCODE
+            Write-Host '::endgroup::'
+            if ($code -ne 0) { $failed += $t.Name; Write-Host "::error::$($t.Name) failed (exit $code)" }
+            else { Write-Host "ok  $($t.Name)" }
+          }
+          if ($failed.Count) { Write-Host "Failed: $($failed -join ', ')"; exit 1 }
