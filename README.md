@@ -4,8 +4,9 @@ Run a long refactor as a series of unattended agent sessions that you can actual
 
 One plan, split into phases. One phase per headless run, on its own git branch, one commit
 per task, gates green before every commit. The runner survives usage limits, pins the
-conversation so your answers reach the right session, and prints what the agent is doing
-while it does it.
+conversation so your answers reach the right session, prints what the agent is doing
+while it does it, forecasts when the sequence ends, and hands every new agent the lessons
+the earlier ones verified.
 
 It exists because "let the agent go and see what happens" produces a diff nobody can read
 and a repository nobody can revert. The unit of trust here is the commit, not the session.
@@ -15,6 +16,15 @@ and a repository nobody can revert. The unit of trust here is the commit, not th
 *`phasekit dashboard -Watch` during a real run: 37 of 46 targets done, the forecast end and
 the usage allowance it is planned against. `phasekit logs -Follow` shows, line by line, what
 the agent is doing.*
+
+**Contents.** [Requirements](#requirements) · [Install](#install) · [Quickstart](#quickstart) ·
+[Commands](#commands) · [Unattended sequences](#unattended-sequences) ·
+[How far along](#how-far-along-and-how-much-longer) · [Configuration](#configuration) ·
+[How much to verify](#how-much-to-verify-verify) ·
+[Lessons](#lessons-what-one-agent-learns-the-next-one-knows) ·
+[What a target costs](#what-a-target-costs-and-why-it-is-not-the-clock) ·
+[What makes it work](#what-makes-it-work) · [Sources](#sources-why-it-is-built-this-way) ·
+[Related projects](#related-projects)
 
 ## What it is not
 
@@ -676,6 +686,56 @@ retired by the one it misled. A lesson is a hint; the gates are the verdict.
 done the most valuable thing it can do. The runner shows the log tail when a run ends
 non-zero, because a stop-to-ask and a crash look identical from the outside, and answering
 costs one turn while restarting the phase costs the whole baseline.
+
+## Sources: why it is built this way
+
+Most of phasekit came from running it and fixing what broke. These are the published
+sources that reached the same conclusions, or that shaped a later change, so that "why is
+it done like this?" has an answer you can check.
+
+- **A fresh session per unit of work, oriented by notes and git, verified at the start.**
+  Anthropic, [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
+  (2025): each session reads a progress file and the git log, checks the app still works,
+  does one feature, tests it and ends with a commit. Here: one target per conversation,
+  the handoff, CHECK FIRST, one commit per task.
+- **Compaction, structured notes kept outside the context window.** Anthropic,
+  [Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+  (2025). Here: `autoCompact`, the handoff, the lessons store.
+- **Instructions are context, not enforcement.** Claude Code documentation,
+  [How Claude remembers your project](https://code.claude.com/docs/en/memory): to guarantee
+  something happens, do not rely on a line in a prompt. Here: the gates are run by
+  phasekit itself before every merge, whatever the agent reported.
+- **Edit a growing list item by item, never rewrite it whole.** Zhang et al.,
+  [Agentic Context Engineering](https://arxiv.org/abs/2510.04618) (2025), on "context
+  collapse". Here: the LESSONS operations.
+- **Let later experience raise and lower what was learned.** Zhao et al.,
+  [ExpeL: LLM Agents Are Experiential Learners](https://arxiv.org/abs/2308.10144) (AAAI
+  2024), with its ADD / EDIT / UPVOTE / DOWNVOTE insight list. Here: lesson scores.
+- **Agents write confident, wrong conclusions and then act on them.**
+  [Honest Lying: memory confabulation in reflexive agents](https://arxiv.org/abs/2605.29463)
+  (2026), and the survey [Memory for Autonomous LLM Agents](https://arxiv.org/abs/2603.07670)
+  (2026), which proposes requiring evidence for every reflection. Here: evidence is
+  mandatory, a target cannot confirm its own lesson, one contradiction retires a new one,
+  and a lesson never overrides a gate.
+- **Fresh context every iteration beats one long conversation.** Geoffrey Huntley's
+  [Ralph loop](https://ghuntley.com/ralph/), the simplest form of the idea:
+  `while :; do cat PROMPT.md | claude; done`. phasekit is the same loop with a plan,
+  branches, gates, limit handling and a verdict on every iteration.
+
+## Related projects
+
+Others solve the same problem differently; some do things phasekit does not.
+
+- [claude-autopilot](https://github.com/Timothy1102/claude-autopilot): plan once, then one
+  verified commit per task overnight in a worktree. Has an optional independent reviewer
+  session per task, and escalates a failing task to a stronger model instead of stopping.
+- [harnessd](https://github.com/samhagman/harnessd): builder and evaluator negotiate a
+  contract per work packet before any code, and a read-only adversarial evaluator tries to
+  disprove the builder's claims.
+- [continuous-claude](https://github.com/AnandChowdhary/continuous-claude): a loop that
+  opens a pull request per iteration, waits for CI and merges.
+- [GitHub Spec Kit](https://github.com/github/spec-kit): turns a specification into a plan
+  and a task list for any coding agent. A good way to write the plan phasekit then runs.
 
 ## Documentation
 
