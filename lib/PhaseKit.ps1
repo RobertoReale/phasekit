@@ -1589,6 +1589,80 @@ function Reset-StreamClock {
     $script:LastStreamTime = $null
 }
 
+# The detailed view (`phasekit logs -Follow -Full`): whole commands, the edits, and the head
+# of every tool's output. Off everywhere else.
+$script:StreamFull = $false
+
+function Format-StreamBlock {
+    # A block of text, indented under its event, at most $MaxLines lines and $MaxChars
+    # characters, saying how much was left out.
+    param([AllowEmptyString()] [string] $Text, [string] $Prefix = '      ', [int] $MaxLines = 12, [int] $MaxChars = 2000)
+    if (-not $Text) { return @() }
+    $t = $Text.TrimEnd()
+    $cut = $false
+    if ($t.Length -gt $MaxChars) { $t = $t.Substring(0, $MaxChars); $cut = $true }
+    $lines = @($t -split "`r?`n")
+    $more = 0
+    if ($lines.Count -gt $MaxLines) { $more = $lines.Count - $MaxLines; $lines = $lines[0..($MaxLines - 1)] }
+    $out = @($lines | ForEach-Object { $Prefix + $_ })
+    if ($more -gt 0) { $out += "$Prefix... $more more line(s)" }
+    elseif ($cut) { $out += "$Prefix... (cut)" }
+    return $out
+}
+
+function Write-StreamToolUse {
+    param([Parameter(Mandatory)] [string] $Time, [Parameter(Mandatory)] $Tool)
+    $i = $Tool.input
+    $head = "$Time  -> $($Tool.name)"
+    $body = @()
+    switch ($Tool.name) {
+        { $_ -in @('Bash', 'PowerShell') } {
+            if ($i.description) { $head += "  ($($i.description))" }
+            $body = Format-StreamBlock -Text ([string] $i.command) -MaxLines 20
+        }
+        'Read' {
+            $head += " $($i.file_path)"
+            if ($i.offset -or $i.limit) { $head += "  (from line $($i.offset), $($i.limit) lines)" }
+        }
+        'Edit' {
+            $head += " $($i.file_path)"
+            $body = @(Format-StreamBlock -Text ([string] $i.old_string) -Prefix '      - ' -MaxLines 8) +
+                    @(Format-StreamBlock -Text ([string] $i.new_string) -Prefix '      + ' -MaxLines 8)
+        }
+        'Write' {
+            $head += " $($i.file_path)"
+            $body = Format-StreamBlock -Text ([string] $i.content) -Prefix '      + ' -MaxLines 8
+        }
+        { $_ -in @('Grep', 'Glob') } {
+            $head += " $($i.pattern)"
+            if ($i.path) { $head += "  in $($i.path)" }
+            if ($i.glob) { $head += "  ($($i.glob))" }
+        }
+        'TodoWrite' {
+            $body = @($i.todos | ForEach-Object {
+                    $mark = switch ($_.status) { 'completed' { '[x]' } 'in_progress' { '[>]' } default { '[ ]' } }
+                    "      $mark $($_.content)"
+                })
+        }
+        default {
+            $json = ($i | ConvertTo-Json -Depth 4 -Compress)
+            if ($json.Length -gt 300) { $json = $json.Substring(0, 300) + '...' }
+            $head += " $json"
+        }
+    }
+    Write-Host $head -ForegroundColor DarkCyan
+    foreach ($l in $body) { Write-Host $l -ForegroundColor Cyan }
+}
+
+function Write-StreamToolResult {
+    param([Parameter(Mandatory)] $Result)
+    $text = if ($Result.content -is [string]) { $Result.content }
+            else { (@($Result.content) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
+    $colour = if ($Result.is_error) { 'Red' } else { 'DarkGray' }
+    if (-not $text -or -not $text.Trim()) { Write-Host '      | (no output)' -ForegroundColor $colour; return }
+    foreach ($l in (Format-StreamBlock -Text $text -Prefix '      | ' -MaxLines 12)) { Write-Host $l -ForegroundColor $colour }
+}
+
 function Write-StreamLine {
     <#
         Renders one stream-json line as a readable line of terminal output. Shared by the
@@ -1639,7 +1713,14 @@ function Write-StreamLine {
                     'text' {
                         if ($c.text.Trim()) { Write-Host "$t  $($c.text.Trim())" }
                     }
+                    'thinking' {
+                        # Headless runs record that the model reasoned, not what it thought:
+                        # the text arrives empty. The marker still says it is working.
+                        if ($script:StreamFull) { Write-Host "$t  (thinking)" -ForegroundColor DarkGray }
+                    }
                     'tool_use' {
+                        # break leaves this switch only: the compact line below is skipped.
+                        if ($script:StreamFull) { Write-StreamToolUse -Time $t -Tool $c; break }
                         $detail = switch ($c.name) {
                             'Bash' { $c.input.command }
                             'PowerShell' { $c.input.command }
@@ -1655,6 +1736,15 @@ function Write-StreamLine {
                         if ($detail.Length -gt 100) { $detail = $detail.Substring(0, 100) + '...' }
                         Write-Host "$t  -> $($c.name) $detail" -ForegroundColor DarkCyan
                     }
+                }
+            }
+        }
+        'user' {
+            # What each tool gave back. Only in the detailed view: the compact one is meant
+            # to be read at a glance, and a test run's output is hundreds of lines.
+            if ($script:StreamFull) {
+                foreach ($c in @($ev.message.content)) {
+                    if ($c -and $c.type -eq 'tool_result') { Write-StreamToolResult -Result $c }
                 }
             }
         }
