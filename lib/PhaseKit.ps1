@@ -89,10 +89,18 @@ function Get-PhaseKitConfig {
         notify           = $true
         # How much of the gate list every target pays for. 'full' runs every gate before
         # every merge. 'fast' runs the gates marked "slow" only at the last target of each
-        # milestone (see Test-Checkpoint): the other targets merge on the quick gates, and
-        # a regression a slow gate would have caught surfaces at the milestone's end
+        # milestone (see Get-CheckpointInfo): the other targets merge on the quick gates,
+        # and a regression a slow gate would have caught surfaces at the milestone's end
         # instead of at the target that caused it. A choice for the person, not a default.
         verify           = 'full'
+        # What one agent learned the hard way reaches the next ones: a short, scored list of
+        # verified lessons kept outside the task branches, so a failed or discarded target
+        # still leaves what it found. See Get-LessonsNote and Update-LessonsFromLog.
+        lessons          = $true
+        # At most this many lessons are kept, and the prompt carries at most this many
+        # characters of them: every line is read by every request of every target.
+        lessonsMax       = 30
+        lessonsMaxChars  = 6000
         gates            = @()
         # The targets `phasekit auto` walks, in order. See Get-AutoSequence.
         autoSequence     = @()
@@ -119,7 +127,16 @@ function Get-PhaseKitConfig {
         }
         $cfg.verify = $v
     }
-    foreach ($k in @('skipVerifiedGates', 'handoff')) {
+    foreach ($k in @('lessonsMax', 'lessonsMaxChars')) {
+        if ($raw.PSObject.Properties.Name -contains $k -and $null -ne $raw.$k) {
+            $n = 0
+            if (-not [int]::TryParse("$($raw.$k)", [ref] $n) -or $n -lt 1) {
+                throw "phasekit.json: `"$k`" is '$($raw.$k)'. It must be a whole number above 0."
+            }
+            $cfg[$k] = $n
+        }
+    }
+    foreach ($k in @('skipVerifiedGates', 'handoff', 'lessons')) {
         if ($raw.PSObject.Properties.Name -contains $k) { $cfg[$k] = [bool] $raw.$k }
     }
     if ($raw.usageLimit) {
@@ -405,6 +422,390 @@ function Get-FastModeNote {
             "way to know it works. Every other instruction about gates applies in full.`n`n")
 }
 
+# ---------------------------------------------------------------------------
+# Lessons
+# ---------------------------------------------------------------------------
+#
+# Every target is a fresh conversation, so whatever an agent learned the hard way - a
+# flaky test and its exact signature, a tool that behaves unexpectedly, a command that
+# outlasts the shell - died with it, and the next agent paid for it again. One measured
+# project rediscovered the same flaky browser test in four separate targets.
+#
+# The design follows what the literature found to work and to fail:
+#   - The list is edited one item at a time and never rewritten whole. A model asked to
+#     rewrite a growing context summarises it into something shorter and vaguer
+#     ("context collapse", Agentic Context Engineering, arXiv 2510.04618).
+#   - Each lesson carries a score that later agents raise or lower, and a lesson whose
+#     score reaches zero is retired (ExpeL, arXiv 2308.10144). That is how the list
+#     cleans itself without anyone curating it.
+#   - A lesson must name its evidence and keep its condition. Agents write confident,
+#     wrong conclusions and then act on them ("memory confabulation", arXiv 2605.29463),
+#     and a merged lesson that lost its "when" becomes a wrong rule.
+#   - A lesson is a hint. The gates are the judge, and the prompt says so.
+#
+# The store lives in the log directory, outside every task branch, so a target that fails
+# or is thrown away still leaves what it found. phasekit, not the agent, writes it: the
+# agent ends its final message with a LESSONS block, and phasekit applies it.
+
+$script:LessonOps = @('ADD', 'CONFIRM', 'WRONG', 'EDIT')
+$script:LessonLimits = @{ when = 200; lesson = 400; evidence = 300 }
+
+function Get-LessonsFile {
+    param([Parameter(Mandatory)] $Config)
+    return Join-Path $Config.logDir 'lessons.json'
+}
+
+function New-LessonStore {
+    return [ordered]@{ version = 1; nextId = 1; lessons = @(); retired = @(); applied = @() }
+}
+
+function Read-LessonStore {
+    <#
+        The store, or a fresh one when there is none yet. A file that cannot be read is
+        reported (ok = $false) and must never be overwritten: losing every lesson to a
+        half-written file is worse than not learning one more.
+    #>
+    param([Parameter(Mandatory)] $Config)
+    $file = Get-LessonsFile -Config $Config
+    if (-not (Test-Path -LiteralPath $file)) { return [pscustomobject]@{ ok = $true; store = (New-LessonStore); why = '' } }
+    try {
+        $raw = Get-Content -LiteralPath $file -Raw
+        if (-not $raw -or -not $raw.Trim()) { return [pscustomobject]@{ ok = $true; store = (New-LessonStore); why = '' } }
+        $d = $raw | ConvertFrom-Json -AsHashtable
+        if ($d -isnot [System.Collections.IDictionary] -or -not $d.Contains('lessons')) { throw 'not a lessons file' }
+        $store = New-LessonStore
+        foreach ($k in @('version', 'nextId')) { if ($d.Contains($k)) { $store[$k] = [int] $d[$k] } }
+        foreach ($k in @('lessons', 'retired', 'applied')) { if ($d.Contains($k) -and $d[$k]) { $store[$k] = @($d[$k]) } }
+        return [pscustomobject]@{ ok = $true; store = $store; why = '' }
+    }
+    catch {
+        return [pscustomobject]@{ ok = $false; store = $null; why = "$file could not be read ($($_.Exception.Message)); it was left untouched" }
+    }
+}
+
+function Save-LessonStore {
+    <#
+        Written to a temporary file and moved into place, so a reader never sees half a
+        file and a crash mid-write leaves the previous version.
+    #>
+    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] $Store)
+    $file = Get-LessonsFile -Config $Config
+    New-Item -ItemType Directory -Path (Split-Path -Parent $file) -Force | Out-Null
+    $tmp = "$file.$PID.tmp"
+    $Store | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tmp -Encoding utf8
+    # Windows refuses to replace a file another process has open, and a prompt being built
+    # reads this one without the lock. That read takes milliseconds, so a few tries win.
+    for ($try = 1; ; $try++) {
+        try { Move-Item -LiteralPath $tmp -Destination $file -Force; break }
+        catch {
+            if ($try -ge 5) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; throw }
+            Start-Sleep -Milliseconds (100 * $try)
+        }
+    }
+}
+
+function Invoke-WithLessonLock {
+    <#
+        The runner and a person adding a lesson by hand may write at the same moment. A
+        lock file opened exclusively serialises them on every platform; after ten seconds
+        the caller gets an error rather than a lost update.
+    #>
+    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [scriptblock] $Action)
+    $lock = (Get-LessonsFile -Config $Config) + '.lock'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $lock) -Force | Out-Null
+    $stream = $null
+    $deadline = (Get-Date).AddSeconds(10)
+    while (-not $stream) {
+        try { $stream = [System.IO.File]::Open($lock, 'OpenOrCreate', 'ReadWrite', 'None') }
+        catch {
+            if ((Get-Date) -gt $deadline) { throw "the lessons file is locked by another process ($lock)" }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    try { return (& $Action) } finally { $stream.Dispose() }
+}
+
+function Remove-LessonsBlock {
+    <#
+        The text without its trailing LESSONS block: everything from the last line that
+        reads LESSONS (as a heading, bold or plain) to the end.
+    #>
+    param([AllowEmptyString()] [string] $Text)
+    if (-not $Text) { return '' }
+    $lines = $Text -split "`r?`n"
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        if ($lines[$i] -match '^\s*(?:#+\s*|\*\*)?LESSONS\b') {
+            if ($i -eq 0) { return '' }
+            return ($lines[0..($i - 1)] -join "`n").TrimEnd()
+        }
+    }
+    return $Text
+}
+
+function ConvertFrom-LessonOps {
+    <#
+        The operations in the LESSONS block that ends an agent's final message:
+
+            LESSONS
+            ADD: when <condition> | <what happens, what to do> | evidence: <what shows it>
+            CONFIRM L3: <how it applied>
+            WRONG L5: <the evidence that it is wrong>
+            EDIT L2: when <condition> | <corrected lesson> | evidence: <...>
+
+        Only the last block counts: an earlier one is usually the agent quoting the format.
+        Returns valid operations and rejected lines, each rejection with its reason.
+    #>
+    param([AllowEmptyString()] [string] $Text)
+    $ops = [System.Collections.Generic.List[object]]::new()
+    $rejected = [System.Collections.Generic.List[object]]::new()
+    $result = [pscustomobject]@{ ops = $ops; rejected = $rejected; found = $false }
+    if (-not $Text) { return $result }
+
+    $lines = $Text -split "`r?`n"
+    $start = -1
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        if ($lines[$i] -match '^\s*(?:#+\s*|\*\*)?LESSONS\b') { $start = $i; break }
+    }
+    if ($start -lt 0) { return $result }
+    $result.found = $true
+    # A range runs backwards in PowerShell when its end is below its start, so a LESSONS
+    # line with nothing after it must stop here rather than reread the lines before it.
+    if ($start -ge $lines.Count - 1) { return $result }
+
+    foreach ($line in $lines[($start + 1)..($lines.Count - 1)]) {
+        $l = $line.Trim()
+        if (-not $l -or $l -match '^```') { continue }
+        $l = $l -replace '^[-*]\s+', '' -replace '^`(.*)`$', '$1'
+        if ($l -match '^(?i)none\.?$') { continue }
+        if ($l -notmatch '^(?<op>[A-Za-z]+)\s*(?<id>L\d+)?\s*:\s*(?<body>.*)$') {
+            $rejected.Add([pscustomobject]@{ line = $l; why = 'not an operation (ADD, CONFIRM, WRONG, EDIT)' })
+            continue
+        }
+        $op = $Matches['op'].ToUpperInvariant()
+        $id = if ($Matches['id']) { $Matches['id'].ToUpperInvariant() } else { '' }
+        $body = $Matches['body'].Trim()
+        if ($op -notin $script:LessonOps) {
+            $rejected.Add([pscustomobject]@{ line = $l; why = "unknown operation '$op'" }); continue
+        }
+        if ($op -in @('CONFIRM', 'WRONG', 'EDIT') -and -not $id) {
+            $rejected.Add([pscustomobject]@{ line = $l; why = "$op needs a lesson id, such as $op L3" }); continue
+        }
+        if ($op -eq 'ADD' -and $id) {
+            $rejected.Add([pscustomobject]@{ line = $l; why = 'ADD takes no id; phasekit assigns one' }); continue
+        }
+        if ($op -eq 'WRONG' -and -not $body) {
+            $rejected.Add([pscustomobject]@{ line = $l; why = 'WRONG needs the evidence that the lesson is wrong' }); continue
+        }
+        $entry = [pscustomobject]@{ op = $op; id = $id; note = $body; when = ''; lesson = ''; evidence = '' }
+        if ($op -in @('ADD', 'EDIT')) {
+            $parts = @($body -split '\|' | ForEach-Object { $_.Trim() })
+            if ($parts.Count -ne 3) {
+                $rejected.Add([pscustomobject]@{ line = $l; why = 'needs three parts: when <condition> | <lesson> | evidence: <evidence>' }); continue
+            }
+            $entry.when = ($parts[0] -replace '^(?i)when\s*:?\s*', '').Trim()
+            $entry.lesson = $parts[1]
+            $entry.evidence = ($parts[2] -replace '^(?i)evidence\s*:?\s*', '').Trim()
+            $missing = @(foreach ($k in @('when', 'lesson', 'evidence')) { if (-not $entry.$k) { $k } })
+            if ($missing.Count) {
+                $rejected.Add([pscustomobject]@{ line = $l; why = "empty: $($missing -join ', ')" }); continue
+            }
+            $long = @(foreach ($k in @('when', 'lesson', 'evidence')) { if ($entry.$k.Length -gt $script:LessonLimits[$k]) { "$k over $($script:LessonLimits[$k]) characters" } })
+            if ($long.Count) {
+                $rejected.Add([pscustomobject]@{ line = $l; why = ($long -join ', ') }); continue
+            }
+        }
+        $ops.Add($entry)
+    }
+    return $result
+}
+
+function Get-LessonKey {
+    param([string] $Text)
+    return (($Text.ToLowerInvariant() -replace '[^\p{L}\p{Nd}]+', ' ').Trim())
+}
+
+function Update-LessonStore {
+    <#
+        Applies operations to a store, in order, and returns what happened. Pure: it reads
+        and writes nothing but the store it is given, so every rule here is testable.
+
+        - ADD starts a lesson at score 2. The same lesson worded the same way again is a
+          confirmation of the first, not a second copy.
+        - CONFIRM raises a lesson by 1, once per target, and never by the target that
+          added it: an agent cannot vouch for its own conclusion.
+        - WRONG lowers it by 2, so one contradiction with evidence retires a new lesson,
+          and one that several targets confirmed survives a single doubt.
+        - EDIT rewrites it, keeping its id and score.
+        - A lesson at 0 or below is retired, and so are the lowest when the list is over
+          its cap. Retired lessons are kept, with the reason, for anyone auditing.
+        - The same operation from the same target is applied once, however many times
+          the log is read.
+    #>
+    param(
+        [Parameter(Mandatory)] $Store,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Ops,
+        [Parameter(Mandatory)] [string] $Source,
+        [int] $Max = 30
+    )
+    $done = [System.Collections.Generic.List[string]]::new()
+    $refused = [System.Collections.Generic.List[string]]::new()
+    $now = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+    $lessons = [System.Collections.Generic.List[object]]::new()
+    foreach ($x in @($Store.lessons)) { if ($x) { $lessons.Add($x) } }
+    $retired = [System.Collections.Generic.List[object]]::new()
+    foreach ($x in @($Store.retired)) { if ($x) { $retired.Add($x) } }
+    $applied = [System.Collections.Generic.List[string]]::new()
+    foreach ($x in @($Store.applied)) { if ($x) { $applied.Add([string] $x) } }
+
+    $find = { param($id) $lessons | Where-Object { $_['id'] -eq $id } | Select-Object -First 1 }
+    $retire = {
+        param($l, $why)
+        [void] $lessons.Remove($l)
+        $l['retired'] = $now; $l['why'] = $why
+        $retired.Add($l)
+    }
+
+    foreach ($op in $Ops) {
+        $key = Get-TextFingerprint "$Source|$($op.op)|$($op.id)|$($op.note)"
+        if ($applied.Contains($key)) { continue }
+        switch ($op.op) {
+            'ADD' {
+                $same = $lessons | Where-Object { (Get-LessonKey $_['lesson']) -eq (Get-LessonKey $op.lesson) } | Select-Object -First 1
+                if ($same) {
+                    if ($same['from'] -ne $Source -and @($same['confirmedBy']) -notcontains $Source) {
+                        $same['score'] = [Math]::Min(10, [int] $same['score'] + 1)
+                        $same['confirmedBy'] = @(@($same['confirmedBy']) + $Source | Where-Object { $_ })
+                        $done.Add("$($same['id']) added again by $Source - counted as a confirmation")
+                    }
+                    else { $done.Add("$($same['id']) already known") }
+                    break
+                }
+                $id = "L$($Store.nextId)"
+                $Store.nextId = [int] $Store.nextId + 1
+                $lessons.Add([ordered]@{
+                        id = $id; when = $op.when; lesson = $op.lesson; evidence = $op.evidence
+                        from = $Source; added = $now; score = 2; confirmedBy = @(); history = @()
+                    })
+                $done.Add("$id added")
+            }
+            'CONFIRM' {
+                $l = & $find $op.id
+                if (-not $l) { $refused.Add("CONFIRM $($op.id): no such lesson"); break }
+                if ($l['from'] -eq $Source) { $refused.Add("CONFIRM $($op.id): a target cannot confirm its own lesson"); break }
+                if (@($l['confirmedBy']) -contains $Source) { break }
+                $l['score'] = [Math]::Min(10, [int] $l['score'] + 1)
+                $l['confirmedBy'] = @(@($l['confirmedBy']) + $Source | Where-Object { $_ })
+                $done.Add("$($op.id) confirmed (score $($l['score']))")
+            }
+            'WRONG' {
+                $l = & $find $op.id
+                if (-not $l) { $refused.Add("WRONG $($op.id): no such lesson"); break }
+                $l['score'] = [int] $l['score'] - 2
+                $l['history'] = @(@($l['history']) + "$now $Source WRONG: $($op.note)" | Where-Object { $_ })
+                if ([int] $l['score'] -le 0) { & $retire $l "contradicted by $Source`: $($op.note)"; $done.Add("$($op.id) retired as wrong") }
+                else { $done.Add("$($op.id) doubted (score $($l['score']))") }
+            }
+            'EDIT' {
+                $l = & $find $op.id
+                if (-not $l) { $refused.Add("EDIT $($op.id): no such lesson"); break }
+                $l['history'] = @(@($l['history']) + "$now $Source EDIT, was: when $($l['when']) | $($l['lesson'])" | Where-Object { $_ })
+                $l['when'] = $op.when; $l['lesson'] = $op.lesson; $l['evidence'] = $op.evidence
+                $done.Add("$($op.id) edited")
+            }
+        }
+        $applied.Add($key)
+    }
+
+    # Over the cap: the lowest score goes first, and between equals the oldest.
+    $ranked = @($lessons | Sort-Object @{ e = { [int] $_['score'] }; Descending = $true }, @{ e = { [string] $_['added'] }; Descending = $true })
+    for ($i = $Max; $i -lt $ranked.Count; $i++) { & $retire $ranked[$i] "over the cap of $Max"; $done.Add("$($ranked[$i]['id']) retired (over the cap)") }
+
+    $Store.lessons = @($lessons)
+    $Store.retired = @($retired | Select-Object -Last 100)
+    $Store.applied = @($applied | Select-Object -Last 500)
+    return [pscustomobject]@{ done = @($done); refused = @($refused) }
+}
+
+function Update-LessonsFromLog {
+    <#
+        Reads the LESSONS block at the end of the agent's last message in this log and
+        applies it. Called after every agent run, whatever its outcome: a target that
+        failed or stopped is exactly the one whose lessons are worth keeping. Never
+        throws: learning is a bonus and must not take a run down.
+    #>
+    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Phase, [Parameter(Mandatory)] [string] $LogPath)
+    if (-not $Config.lessons) { return $null }
+    try {
+        if (-not (Test-Path -LiteralPath $LogPath)) { return $null }
+        $words = Get-AgentLastWords -LogTail ((Get-Content -LiteralPath $LogPath -Tail 600) -join "`n") -MaxChars 20000 -KeepLessons
+        $parsed = ConvertFrom-LessonOps -Text $words
+        if (-not $parsed.found) { return $null }
+        $max = if ($Config.lessonsMax) { [int] $Config.lessonsMax } else { 30 }
+        $outcome = Invoke-WithLessonLock -Config $Config -Action {
+            $read = Read-LessonStore -Config $Config
+            if (-not $read.ok) { return [pscustomobject]@{ done = @(); refused = @($read.why) } }
+            $r = Update-LessonStore -Store $read.store -Ops @($parsed.ops) -Source $Phase -Max $max
+            Save-LessonStore -Config $Config -Store $read.store
+            $r
+        }
+        $refused = @($outcome.refused) + @($parsed.rejected | ForEach-Object { "'$($_.line)': $($_.why)" })
+        foreach ($d in $outcome.done) { Write-Host "  lesson  $d" -ForegroundColor DarkCyan; Write-AutoProgress "$Phase : lesson $d" }
+        foreach ($r in $refused) { Write-Host "  lesson refused  $r" -ForegroundColor DarkYellow; Write-AutoProgress "$Phase : lesson refused - $r" }
+        return [pscustomobject]@{ done = @($outcome.done); refused = $refused }
+    }
+    catch {
+        Write-Host "  lessons not updated: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        return $null
+    }
+}
+
+function Format-Lesson {
+    param([Parameter(Mandatory)] $Lesson)
+    return ("{0} [score {1}, from {2}] when {3}: {4} (evidence: {5})" -f
+        $Lesson['id'], $Lesson['score'], $Lesson['from'], $Lesson['when'], $Lesson['lesson'], $Lesson['evidence'])
+}
+
+function Get-LessonsNote {
+    <#
+        The prompt section: the lessons kept so far, best first and within a character
+        budget, and how to report new ones. Present whenever lessons are on, even with
+        none kept yet, because the first agent is the one that starts the list.
+    #>
+    param([Parameter(Mandatory)] $Config)
+    if (-not $Config.lessons) { return '' }
+    $budget = if ($Config.lessonsMaxChars) { [int] $Config.lessonsMaxChars } else { 6000 }
+    $read = Read-LessonStore -Config $Config
+    $lines = [System.Collections.Generic.List[string]]::new()
+    if ($read.ok) {
+        $ranked = @($read.store.lessons | Where-Object { $_ } |
+            Sort-Object @{ e = { [int] $_['score'] }; Descending = $true }, @{ e = { [string] $_['added'] }; Descending = $true })
+        $used = 0
+        foreach ($l in $ranked) {
+            $text = '  ' + (Format-Lesson -Lesson $l)
+            if ($used + $text.Length -gt $budget) { break }
+            $lines.Add($text); $used += $text.Length + 1
+        }
+    }
+    $list = if ($lines.Count) { $lines -join "`n" } else { '  (none yet)' }
+    return ("LESSONS FROM EARLIER TARGETS: what earlier agents on this project hit, checked and " +
+            "wrote down, ranked by how many later agents confirmed them. They are hints, not rules: " +
+            "the repository, the plan and the gates decide. A lesson never replaces running a gate or " +
+            "reproducing a failure, and never makes a red gate acceptable. If one does not match what " +
+            "you see, trust what you see.`n" + $list + "`n" +
+            "At the very end of your final message, after everything else, add a block whose first " +
+            "line is LESSONS, then one operation per line, or the single line NONE:`n" +
+            "  ADD: when <condition> | <what happens, and what to do about it> | evidence: <the test, command, log line or file that shows it>`n" +
+            "  CONFIRM L<n>: <how it saved you work in this target>`n" +
+            "  WRONG L<n>: <the evidence that it is wrong or out of date>`n" +
+            "  EDIT L<n>: when <condition> | <the corrected lesson> | evidence: <...>`n" +
+            "ADD a lesson only when it cost you real time, you verified it, and it would cost the " +
+            "next agent on this project the same: a trap in the tools, a flaky test and its exact " +
+            "signature, a command that behaves unexpectedly. Keep its condition: a lesson without its " +
+            "'when' turns into a wrong rule. Never add what the plan, the rules or the code already " +
+            "say, a decision about the product, or a guess. Limits: condition 200 characters, lesson " +
+            "400, evidence 300. Use WRONG, with evidence, for a lesson that misled you.`n`n")
+}
+
 function Get-HandoffNote {
     <#
         The previous target's final report, so a fresh session knows what just landed:
@@ -433,7 +834,11 @@ function Get-HandoffNote {
     if ($logs.Count -eq 0) { return '' }
     $words = ''
     foreach ($log in $logs) {
-        $said = Get-AgentLastWords -LogTail ((Get-Content -LiteralPath $log.FullName -Tail 400) -join "`n") -MaxChars $MaxChars
+        # The LESSONS block that ends a report is phasekit's to collect, and every prompt
+        # carries the lessons already: repeated here it would only push the report out.
+        $said = Get-AgentLastWords -LogTail ((Get-Content -LiteralPath $log.FullName -Tail 400) -join "`n") -MaxChars ($MaxChars * 4)
+        $said = (Remove-LessonsBlock -Text $said).Trim()
+        if ($said.Length -gt $MaxChars) { $said = '[...] ' + $said.Substring($said.Length - $MaxChars) }
         if (-not $said -or -not $said.Trim()) { continue }
         if (-not $words) { $words = $said }
         if ($said.Trim().Length -ge 800) { $words = $said; break }
@@ -515,6 +920,7 @@ function Build-PhasePrompt {
     try { $known += Get-FastModeNote -Config $Config -Phase $Phase } catch { }
     try { $known += Get-GreenGatesNote -Config $Config -Phase $Phase } catch { }
     try { $known += Get-HandoffNote -Config $Config -Phase $Phase } catch { }
+    try { $known += Get-LessonsNote -Config $Config } catch { }
 
     return $header + $where + $known + $block
 }
@@ -1042,11 +1448,15 @@ function Get-AgentLastWords {
         at seven in the morning. Only the agent's own prose counts here: a tool result
         is whatever it happened to read, not something it said.
 
-        Long messages keep their end, which is where the question is.
+        Long messages keep their end, which is where the question is. The LESSONS block an
+        agent ends with is phasekit's to collect, not something a person needs in a stop
+        note, and it would push the question out of the kept end: it is dropped unless
+        -KeepLessons asks for it.
     #>
     param(
         [Parameter(Mandatory)] [AllowEmptyString()] [string] $LogTail,
-        [int] $MaxChars = 4000
+        [int] $MaxChars = 4000,
+        [switch] $KeepLessons
     )
 
     $result = ''
@@ -1063,6 +1473,7 @@ function Get-AgentLastWords {
     }
 
     $words = if ($result) { $result } else { $prose }
+    if (-not $KeepLessons) { $words = Remove-LessonsBlock -Text $words }
     $words = $words.Trim()
     if ($words.Length -gt $MaxChars) { $words = '[...] ' + $words.Substring($words.Length - $MaxChars) }
     return $words

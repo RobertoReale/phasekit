@@ -30,6 +30,8 @@
 param(
     [Parameter(Position = 0)] [string] $Command = 'help',
     [Parameter(Position = 1)] [string] $Phase,
+    # lessons drop <id>: the lesson to drop.
+    [Parameter(Position = 2)] [string] $Item,
 
     # reply: the answer text, or a file containing it. A file is easier to edit and
     # survives being retyped after a shell mangles the quoting.
@@ -130,6 +132,9 @@ phasekit — plan-driven, unattended agent runs
   phasekit auto [-Push]            walk autoSequence unattended: run, verify, merge, next
   phasekit logs [-Follow]          follow the run, rolling over as each phase starts
   phasekit account [<name>|next]   list the Claude accounts here, or switch the one runs use
+  phasekit lessons                 what the agents learned so far, best first
+  phasekit lessons add -Text .     add one by hand: "when <cond> | <lesson> | evidence: <...>"
+  phasekit lessons drop <id>       retire one by hand (-Text gives the reason)
   phasekit pause                   stop the sequence now; nothing restarts it until resume
   phasekit resume                  carry on where the pause stopped, same conversation
 
@@ -497,6 +502,10 @@ function Invoke-Run {
 
     $exit = Invoke-AgentWithLimitRetry -Config $cfg -Phase $Phase -FirstArgs $first `
         -LogPath $log -SessionFile $sessionFile -Common $common
+
+    # Whatever the outcome: a run that failed or stopped is the one most likely to have
+    # learned something the next agent should not pay for again.
+    $null = Update-LessonsFromLog -Config $cfg -Phase $Phase -LogPath $log
 
     Show-RunResult -Config $cfg -Phase $Phase -Branch $branch -ExitCode $exit -LogPath $log
     return $exit
@@ -1961,6 +1970,78 @@ function Invoke-Resume {
     return 1
 }
 
+function Invoke-Lessons {
+    <#
+        `phasekit lessons` lists what the agents learned; `add` records one by hand (an
+        answer you gave to a stop is often one), `drop <id>` retires one. Hand-added
+        lessons come from "owner" and follow the same rules as the agents' own.
+    #>
+    $cfg = Get-PhaseKitConfig -Path $Config
+    $sub = if ($Phase) { $Phase.ToLowerInvariant() } else { 'list' }
+
+    switch ($sub) {
+        'add' {
+            if ($File) { $Text = Get-Content -LiteralPath $File -Raw }
+            if (-not $Text) { throw 'What lesson? phasekit lessons add -Text "when <condition> | <lesson> | evidence: <what shows it>"' }
+            $parsed = ConvertFrom-LessonOps -Text ("LESSONS`nADD: " + $Text.Trim())
+            if (@($parsed.ops).Count -eq 0) {
+                foreach ($r in $parsed.rejected) { Write-Host "  Not added: $($r.why)" -ForegroundColor Red }
+                return 1
+            }
+            $max = [int] $cfg.lessonsMax
+            $r = Invoke-WithLessonLock -Config $cfg -Action {
+                $read = Read-LessonStore -Config $cfg
+                if (-not $read.ok) { throw $read.why }
+                $out = Update-LessonStore -Store $read.store -Ops @($parsed.ops) -Source 'owner' -Max $max
+                Save-LessonStore -Config $cfg -Store $read.store
+                $out
+            }
+            foreach ($d in $r.done) { Write-Host "  $d" -ForegroundColor Green }
+            foreach ($d in $r.refused) { Write-Host "  refused: $d" -ForegroundColor Yellow }
+            return 0
+        }
+        'drop' {
+            if (-not $Item) { throw 'Which lesson? e.g.  phasekit lessons drop L3' }
+            $id = $Item.ToUpperInvariant()
+            $why = if ($Text) { "dropped by hand: $Text" } else { 'dropped by hand' }
+            $found = Invoke-WithLessonLock -Config $cfg -Action {
+                $read = Read-LessonStore -Config $cfg
+                if (-not $read.ok) { throw $read.why }
+                $l = @($read.store.lessons) | Where-Object { $_ -and $_['id'] -eq $id } | Select-Object -First 1
+                if (-not $l) { return $false }
+                $read.store.lessons = @(@($read.store.lessons) | Where-Object { $_ -and $_['id'] -ne $id })
+                $l['retired'] = (Get-Date).ToString('yyyy-MM-dd HH:mm'); $l['why'] = $why
+                $read.store.retired = @(@($read.store.retired) + $l | Where-Object { $_ } | Select-Object -Last 100)
+                Save-LessonStore -Config $cfg -Store $read.store
+                return $true
+            }
+            if ($found) { Write-Host "  $id retired." -ForegroundColor Green; return 0 }
+            Write-Host "  No lesson $id." -ForegroundColor Yellow
+            return 1
+        }
+        default {
+            $read = Read-LessonStore -Config $cfg
+            Write-Host ''
+            if (-not $read.ok) { Write-Host "  $($read.why)" -ForegroundColor Red; return 1 }
+            if (-not $cfg.lessons) { Write-Host '  Lessons are off ("lessons": false in phasekit.json): agents are not told them.' -ForegroundColor Yellow }
+            $ranked = @($read.store.lessons | Where-Object { $_ } |
+                Sort-Object @{ e = { [int] $_['score'] }; Descending = $true }, @{ e = { [string] $_['added'] }; Descending = $true })
+            if ($ranked.Count -eq 0) { Write-Host '  No lessons yet.' -ForegroundColor DarkGray }
+            foreach ($l in $ranked) {
+                Write-Host ("  {0,-4} score {1,-2} from {2,-8} added {3}" -f $l['id'], $l['score'], $l['from'], $l['added']) -ForegroundColor Cyan
+                Write-Host "       when $($l['when'])"
+                Write-Host "       $($l['lesson'])"
+                Write-Host "       evidence: $($l['evidence'])" -ForegroundColor DarkGray
+                if (@($l['confirmedBy']).Count) { Write-Host "       confirmed by: $(@($l['confirmedBy']) -join ', ')" -ForegroundColor DarkGray }
+            }
+            Write-Host ''
+            Write-Host "  $($ranked.Count) kept (cap $($cfg.lessonsMax)), $(@($read.store.retired).Count) retired.  $(Get-LessonsFile -Config $cfg)" -ForegroundColor DarkGray
+            Write-Host ''
+            return 0
+        }
+    }
+}
+
 function Invoke-Account {
     <#
         `phasekit account` lists the accounts; `phasekit account <name>` or `next`
@@ -2040,5 +2121,6 @@ switch ($Command.ToLowerInvariant()) {
     # ends. An unattended run is not idle, whatever the power settings think.
     'auto' { Set-MachineAwake; try { exit (Invoke-Auto) } finally { Set-MachineAwake -Off } }
     'logs' { exit (Invoke-Logs) }
+    'lessons' { exit (Invoke-Lessons) }
     default { Show-Help; exit 0 }
 }
