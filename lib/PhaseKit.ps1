@@ -119,6 +119,9 @@ function Get-PhaseKitConfig {
         # `phasekit auto` checks the plan before it starts, and refuses a plan with errors:
         # a broken plan found at the first target is cheaper than one found at the tenth.
         lintBeforeAuto   = $true
+        # Antigravity ("agy:<slug>" models): whether a run may fall back on paid AI credits
+        # once the plan's quota is spent. Off: it waits for the quota to refresh instead.
+        agyCredits       = $false
         gates            = @()
         # The targets `phasekit auto` walks, in order. See Get-AutoSequence.
         autoSequence     = @()
@@ -162,8 +165,9 @@ function Get-PhaseKitConfig {
         foreach ($r in $rounds) {
             # A typo must not become a model name that fails hours later, at the one moment
             # the round was needed.
-            if ($r -ne 'same' -and $r -notmatch '^[\w.-]+(/[\w-]+)?$') {
-                throw "phasekit.json: `"fixRounds`" has '$r'. Each entry is `"same`", a model (`"opus`") or a model and effort (`"opus/xhigh`")."
+            if ($r -ne 'same' -and $r -notmatch '^(agy:)?[\w.-]+(/[\w-]+)?$') {
+                throw ("phasekit.json: `"fixRounds`" has '$r'. Each entry is `"same`", a model (`"opus`"), a model and " +
+                       "effort (`"opus/xhigh`") or an Antigravity model (`"agy:gemini-4-hydrogen-high`").")
             }
         }
         $cfg.fixRounds = $rounds
@@ -171,7 +175,7 @@ function Get-PhaseKitConfig {
     if ($raw.PSObject.Properties.Name -contains 'planSections' -and $null -ne $raw.planSections) {
         $cfg.planSections = @($raw.planSections | ForEach-Object { ([string] $_).Trim() } | Where-Object { $_ })
     }
-    foreach ($k in @('skipVerifiedGates', 'handoff', 'lessons', 'review', 'lintBeforeAuto')) {
+    foreach ($k in @('skipVerifiedGates', 'handoff', 'lessons', 'review', 'lintBeforeAuto', 'agyCredits')) {
         if ($raw.PSObject.Properties.Name -contains $k) { $cfg[$k] = [bool] $raw.$k }
     }
     if ($raw.usageLimit) {
@@ -1422,10 +1426,27 @@ function Get-LimitSignal {
         # phasekit's own notes are not evidence about the account — skip them first.
         if ($trimmed.StartsWith($script:NoteMarker)) { continue }
 
-        # Not JSON: the CLI's own stderr, where its limit banner lands.
-        if (-not $trimmed.StartsWith('{')) { $parts.Add($trimmed); continue }
+        # Not JSON: the CLI's own stderr, where its limit banner lands. agy writes its
+        # errors there as "error: ...": a spent quota in its words is said in phasekit's.
+        if (-not $trimmed.StartsWith('{')) {
+            $parts.Add($trimmed)
+            if ($trimmed -match '^error:' -and $trimmed -match $script:AgyLimitPattern) { $parts.Add('usage limit (Antigravity)') }
+            continue
+        }
 
         try { $d = $trimmed | ConvertFrom-Json } catch { $parts.Add($trimmed); continue }
+
+        # Antigravity's result. A failed one carries the runtime's own error text.
+        if ($d.PSObject.Properties['event'] -and -not $d.PSObject.Properties['type']) {
+            if ($d.event -eq 'result' -and $d.result -and $d.result.status -ne 'SUCCESS' -and $d.result.error) {
+                $parts.Add([string] $d.result.error)
+                if ([string] $d.result.error -match $script:AgyLimitPattern) { $parts.Add('usage limit (Antigravity)') }
+            }
+            elseif (-not $RuntimeOnly -and $d.event -eq 'step_update' -and $d.step_update.step_type -eq 'agent_response' -and $d.step_update.text_delta) {
+                $parts.Add([string] $d.step_update.text_delta)
+            }
+            continue
+        }
 
         switch ($d.type) {
             'result' {
@@ -1500,6 +1521,16 @@ function Get-AgentLastWords {
         $trimmed = $line.Trim()
         if (-not $trimmed.StartsWith('{')) { continue }
         try { $d = $trimmed | ConvertFrom-Json } catch { continue }
+        # Antigravity: the result's response, or failing that the last prose step.
+        if ($d.PSObject.Properties['event'] -and -not $d.PSObject.Properties['type']) {
+            if ($d.event -eq 'result' -and $d.result) {
+                $result = if ($d.result.response) { [string] $d.result.response } elseif ($d.result.error) { [string] $d.result.error } else { '' }
+            }
+            elseif ($d.event -eq 'step_update' -and $d.step_update.step_type -eq 'agent_response' -and $d.step_update.text_delta) {
+                $prose = [string] $d.step_update.text_delta
+            }
+            continue
+        }
         if ($d.type -eq 'result' -and $d.result) { $result = [string] $d.result }
         elseif ($d.type -eq 'assistant') {
             $texts = @($d.message.content | Where-Object { $_.type -eq 'text' -and $_.text } | ForEach-Object { [string] $_.text })
@@ -1684,6 +1715,12 @@ function Write-StreamLine {
 
     try { $ev = $Line | ConvertFrom-Json } catch { return }
 
+    # Antigravity speaks its own shape: {"event": ...}. Claude's events have "type".
+    if ($ev.PSObject.Properties['event'] -and -not $ev.PSObject.Properties['type']) {
+        Write-AgyStreamEvent -Event $ev -SessionFile $SessionFile
+        return
+    }
+
     # Not every event carries a timestamp, and the result event - the one most worth
     # dating, because it is the line saying the phase ended - carries none at all. Falling
     # back to the clock there prints a log from three hours ago as though it had just
@@ -1800,6 +1837,173 @@ function Add-LogLine {
     Write-Host "  log busy for 10 s - one line of output not written to $LogPath" -ForegroundColor Yellow
 }
 
+# ---------------------------------------------------------------------------
+# Agent backends: Claude Code and Google Antigravity
+# ---------------------------------------------------------------------------
+#
+# A model written "agy:<slug>" runs on the Antigravity CLI (agy) with that model, under the
+# Antigravity account's own plan quota; any other model runs on Claude Code. Every caller
+# keeps building claude's arguments, and ConvertTo-AgentCommand decides which CLI runs them
+# and translates for agy, so one place knows the difference. Measured against agy 1.5.9:
+# `-p`, `--model <slug>`, `--output-format stream-json`, `--conversation <id>` to resume,
+# `--dangerously-skip-permissions`, `--settings <json>` for this session only; events are
+# {"event":"init"|"step_update"|"result", ...} carrying a conversation_id.
+
+# Antigravity's own words for a spent quota. Kept apart from LimitPattern and matched only
+# against what agy itself reports (its result error and stderr), never the agent's prose.
+$script:AgyLimitPattern = 'quota|RESOURCE_EXHAUSTED|rate.?limit|usage limit|\b429\b|exhausted'
+
+function Get-AgentBackend {
+    param([string] $Model)
+    if ($Model -match '^(?i)agy:') { return 'agy' }
+    return 'claude'
+}
+
+function Get-AgyExecutable {
+    <#
+        Where agy is. PATH first; then the installer's default places, because a runner
+        started by a scheduler or a terminal opened before the install has an older PATH.
+    #>
+    $c = Get-Command agy -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { return $c.Source }
+    $candidates = @()
+    if ($env:LOCALAPPDATA) { $candidates += (Join-Path $env:LOCALAPPDATA 'agy' 'bin' 'agy.exe') }
+    if ($HOME) { $candidates += (Join-Path $HOME '.local' 'bin' 'agy'); $candidates += (Join-Path $HOME '.agy' 'bin' 'agy') }
+    foreach ($p in $candidates) { if (Test-Path -LiteralPath $p) { return $p } }
+    return $null
+}
+
+function ConvertTo-AgentCommand {
+    <#
+        Which CLI runs these claude-style arguments, and the arguments it gets.
+
+        Antigravity is chosen when the model is "agy:<slug>", or when the conversation being
+        resumed is an Antigravity one (its pinned id is "agy:<id>"). Its arguments are
+        translated: --resume becomes --conversation, claude-only flags are dropped (effort
+        is part of an agy model's slug), and two are added. --dangerously-skip-permissions,
+        because a headless run has nobody to approve a tool - except for a read-only run
+        (the reviewer, recognised by its --allowedTools), which runs in plan mode instead,
+        where nothing in the project can be changed. And --settings with
+        useG1Credits, so a spent plan quota never quietly turns into spending paid AI
+        credits unless the person allowed it ("agyCredits": true).
+    #>
+    param([Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $ClaudeArgs, [bool] $AllowCredits = $false)
+
+    $a = @($ClaudeArgs)
+    $model = ''
+    $i = [array]::IndexOf($a, '--model')
+    if ($i -ge 0 -and $i + 1 -lt $a.Count) { $model = [string] $a[$i + 1] }
+    $r = [array]::IndexOf($a, '--resume')
+    $resumeId = if ($r -ge 0 -and $r + 1 -lt $a.Count) { [string] $a[$r + 1] } else { '' }
+    $backend = if ($resumeId -match '^(?i)agy:') { 'agy' } else { Get-AgentBackend $model }
+    if ($backend -eq 'claude') { return [pscustomobject]@{ exe = 'claude'; args = $a; backend = 'claude' } }
+
+    $exe = Get-AgyExecutable
+    if (-not $exe) { throw 'The Antigravity CLI (agy) is not installed or not on PATH: see https://antigravity.google/docs/getting-started?tab=cli' }
+
+    $readOnly = $a -contains '--allowedTools'
+    $withValue = @('--permission-mode', '--effort', '--output-format', '--autocompact')
+    $alone = @('--verbose', '--strict-mcp-config')
+    $lists = @('--allowedTools', '--disallowedTools')
+    $out = [System.Collections.Generic.List[string]]::new()
+    for ($k = 0; $k -lt $a.Count; $k++) {
+        $x = [string] $a[$k]
+        if ($x -eq '-p' -and $k + 1 -lt $a.Count) { $out.Add('-p'); $out.Add([string] $a[$k + 1]); $k++; continue }
+        if ($x -eq '--resume' -and $k + 1 -lt $a.Count) { $out.Add('--conversation'); $out.Add((([string] $a[$k + 1]) -replace '^(?i)agy:', '')); $k++; continue }
+        if ($x -eq '-c') { $out.Add('--continue'); continue }
+        if ($x -eq '--model' -and $k + 1 -lt $a.Count) {
+            $m = [string] $a[$k + 1]
+            # A Claude alias ("opus") means nothing to agy: a resumed Antigravity
+            # conversation then keeps its own model.
+            if ($m -match '^(?i)agy:') { $out.Add('--model'); $out.Add(($m -replace '^(?i)agy:', '')) }
+            $k++; continue
+        }
+        if ($x -in $withValue) { $k++; continue }
+        if ($x -in $alone) { continue }
+        if ($x -in $lists) {
+            while ($k + 1 -lt $a.Count -and -not ([string] $a[$k + 1]).StartsWith('-')) { $k++ }
+            continue
+        }
+        $out.Add($x)
+    }
+    $out.Add('--output-format'); $out.Add('stream-json')
+    # Measured on agy 1.5.9: with no approvals at all, a headless run is refused shell
+    # commands but still writes files. Plan mode writes nothing in the project. So the
+    # read-only reviewer runs in plan mode, and phasekit still checks the tree afterwards.
+    if ($readOnly) { $out.Add('--mode'); $out.Add('plan') }
+    else { $out.Add('--dangerously-skip-permissions') }
+    $settings = [ordered]@{ useG1Credits = [bool] $AllowCredits }
+    # A plan-mode reviewer that tries a command is refused, and then ends with no answer at
+    # all (measured). The git commands that only read are allowed, and nothing else.
+    if ($readOnly) { $settings.permissions = @{ allow = @('command(regex:git (diff|log|show|status|blame)( .*)?)') } }
+    $out.Add('--settings'); $out.Add(($settings | ConvertTo-Json -Compress -Depth 4))
+    return [pscustomobject]@{ exe = $exe; args = @($out); backend = 'agy' }
+}
+
+function Get-AgyConversationId {
+    param($Event)
+    foreach ($p in @($Event.init, $Event.step_update, $Event.result, $Event)) {
+        if ($p -and $p.PSObject.Properties['conversation_id'] -and $p.conversation_id) { return [string] $p.conversation_id }
+    }
+    return ''
+}
+
+function Write-AgyStreamEvent {
+    <#
+        One Antigravity stream event as a readable line, in the same shape as Claude's: the
+        session, the agent's prose, one line per tool (with its parameters and output in the
+        detailed view), and the ending. agy's events carry no timestamp, so the clock is
+        used, and a replayed log shows when it was read rather than when it happened.
+    #>
+    param([Parameter(Mandatory)] $Event, [string] $SessionFile)
+
+    $t = (Get-Date).ToString('HH:mm:ss')
+    $cid = Get-AgyConversationId -Event $Event
+    if ($SessionFile -and $cid -and "agy:$cid" -ne $script:SessionId) {
+        $script:SessionId = "agy:$cid"
+        Set-Content -LiteralPath $SessionFile -Value "agy:$cid"
+    }
+
+    switch ($Event.event) {
+        'init' {
+            $m = if ($Event.init.model) { "  model $($Event.init.model)" } else { '' }
+            Write-Host "$t  session agy:$cid$m  cwd $($Event.init.cwd)" -ForegroundColor DarkGray
+        }
+        'step_update' {
+            $s = $Event.step_update
+            if ($s.state -ne 'DONE') { break }
+            switch ($s.step_type) {
+                'agent_response' { if ($s.text_delta -and $s.text_delta.Trim()) { Write-Host "$t  $($s.text_delta.Trim())" } }
+                'tool' {
+                    $params = $s.tool_info.parameters
+                    $values = @()
+                    if ($params) { $values = @($params.PSObject.Properties | ForEach-Object { [string] $_.Value } | Where-Object { $_ }) }
+                    if ($script:StreamFull) {
+                        Write-Host "$t  -> $($s.tool_name)" -ForegroundColor DarkCyan
+                        foreach ($v in $values) { foreach ($l in (Format-StreamBlock -Text $v -MaxLines 20)) { Write-Host $l -ForegroundColor Cyan } }
+                        if ($s.tool_info.output) { foreach ($l in (Format-StreamBlock -Text ([string] $s.tool_info.output) -Prefix '      | ' -MaxLines 12)) { Write-Host $l -ForegroundColor DarkGray } }
+                    }
+                    else {
+                        $detail = (($values | Select-Object -First 1) -join '') -replace '\s+', ' '
+                        if ($detail.Length -gt 100) { $detail = $detail.Substring(0, 100) + '...' }
+                        Write-Host "$t  -> $($s.tool_name) $detail" -ForegroundColor DarkCyan
+                    }
+                }
+            }
+        }
+        'result' {
+            $res = $Event.result
+            Write-Host ''
+            if ($res.status -eq 'SUCCESS') { Write-Host "$t  DONE  turns=$($res.num_turns)" -ForegroundColor Green }
+            else {
+                Write-Host "$t  FAILED  $($res.status)" -ForegroundColor Red
+                if ($res.error) { Write-Host "          $($res.error)" -ForegroundColor Red }
+            }
+            if ($res.response) { Write-Host $res.response }
+        }
+    }
+}
+
 function Invoke-Agent {
     <#
         Runs claude and renders its stream-json output as one readable line per event.
@@ -1813,15 +2017,19 @@ function Invoke-Agent {
     )
 
     Reset-StreamClock
+    # Claude Code or Antigravity, decided by the model or by the conversation resumed.
+    $cmd = ConvertTo-AgentCommand -ClaudeArgs $ClaudeArgs -AllowCredits ([bool] $script:AgyCredits)
     Write-Host ''
     Write-Host ('-' * 72) -ForegroundColor DarkGray
-    Write-Host "claude $($ClaudeArgs -join ' ')" -ForegroundColor DarkGray
+    $shown = if ($cmd.backend -eq 'agy') { 'agy' } else { 'claude' }
+    Write-Host "$shown $($cmd.args -join ' ')" -ForegroundColor DarkGray
 
     # Read at every start, not once per run, so `phasekit account` reaches the very next
-    # claude - including the resume that follows a usage-limit wait.
+    # claude - including the resume that follows a usage-limit wait. Claude accounts only:
+    # Antigravity runs under the account its own CLI signed in with.
     $account = Get-ActiveAccount
     $previousConfigDir = $env:CLAUDE_CONFIG_DIR
-    if ($account.chosen) {
+    if ($cmd.backend -eq 'claude' -and $account.chosen) {
         Write-Host "account $($account.name)  ($($account.dir))" -ForegroundColor DarkGray
         $at = [array]::IndexOf($ClaudeArgs, '--resume')
         if ($at -ge 0 -and $at + 1 -lt $ClaudeArgs.Count) {
@@ -1846,7 +2054,9 @@ function Invoke-Agent {
     catch { $priorEncoding = $null }
 
     try {
-        & claude @ClaudeArgs 2>&1 | ForEach-Object {
+        $exe = $cmd.exe
+        $runArgs = @($cmd.args)
+        & $exe @runArgs 2>&1 | ForEach-Object {
             $line = [string] $_
             Add-LogLine -LogPath $LogPath -Line $line
             Write-StreamLine -Line $line -SessionFile $SessionFile
@@ -1883,6 +2093,7 @@ function Invoke-AgentWithLimitRetry {
         [Parameter(Mandatory)] [string[]] $Common
     )
 
+    $script:AgyCredits = [bool] $Config.agyCredits
     $exit = Invoke-Agent -ClaudeArgs $FirstArgs -LogPath $LogPath -SessionFile $SessionFile
 
     $attempt = 0
@@ -2502,7 +2713,10 @@ function Get-ReviewPrompt {
         [Parameter(Mandatory)] [string] $Target,
         [Parameter(Mandatory)] [string] $Base,
         [Parameter(Mandatory)] [string] $Branch,
-        $Previous
+        $Previous,
+        # The diff itself, for a reviewer that cannot run git (an Antigravity reviewer: its
+        # read-only run approves no command).
+        [string] $Diff
     )
     $section = ''
     try { $section = Get-PlanSectionText -Config $Config -Phase $Target } catch { }
@@ -2516,16 +2730,20 @@ function Get-ReviewPrompt {
                   "Judge the answers. Accept one that shows evidence (a file and line, a test, a quoted " +
                   "requirement). Raise a finding again only if its answer does not resolve it.`n")
     }
+    $start = "Start with:`n  git diff $Base..$Branch --stat`n  git diff $Base..$Branch`n  git log --format=%B $Base..$Branch"
+    if ($Diff) {
+        $d = if ($Diff.Length -gt 80000) { $Diff.Substring(0, 80000) + "`n[... the diff goes on; read the files themselves for the rest]" } else { $Diff }
+        $start = ("Here it is (git diff $Base..$Branch); read any file in full where you need more. " +
+                  "You need no command: the only ones you may run are git diff, log, show, status and blame, " +
+                  "and any other is refused.`n--- diff ---`n$d`n--- end of diff ---")
+    }
     return @"
 You are an independent reviewer of $Target, unattended, in a headless session. Another agent
 did this work. You did not, and you cannot change anything: your tools read files and run
 read-only git commands, and nothing else.
 
 Paths: the plan is $($Config.plan); the code repository is $($Config.codeDir).
-The work is the commits on $Branch since $Base. Start with:
-  git diff $Base..$Branch --stat
-  git diff $Base..$Branch
-  git log --format=%B $Base..$Branch
+The work is the commits on $Branch since $Base. $start
 
 $task
 
@@ -4389,6 +4607,16 @@ function Test-PlanLint {
                 & $add 'error' 'phasekit.json' "task $id is not done and autoSequence never reaches it"
             }
         }
+    }
+
+    # Antigravity models need the agy CLI, found now rather than at the first target that
+    # uses one.
+    $models = @($Config.model, $Config.reviewModel) + @($seq | ForEach-Object { $_.model }) +
+              @(@($Config.fixRounds) | ForEach-Object { ([string] $_) -replace '/.*$', '' })
+    $agyModels = @($models | Where-Object { $_ -and (Get-AgentBackend ([string] $_)) -eq 'agy' } | Select-Object -Unique)
+    if ($agyModels.Count -and -not (Get-AgyExecutable)) {
+        & $add 'error' 'phasekit.json' ("$($agyModels -join ', ') need the Antigravity CLI (agy), which is not installed: " +
+            'https://antigravity.google/docs/getting-started?tab=cli')
     }
 
     # The gates.

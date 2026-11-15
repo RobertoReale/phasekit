@@ -26,6 +26,7 @@ the agent is doing.*
 [How much to verify](#how-much-to-verify-verify) ·
 [Lessons](#lessons-what-one-agent-learns-the-next-one-knows) ·
 [Review and fix rounds](#a-second-opinion-and-a-second-chance-review-and-fixrounds) ·
+[Antigravity models](#models-from-google-antigravity-agymodel) ·
 [What a target costs](#what-a-target-costs-and-why-it-is-not-the-clock) ·
 [What makes it work](#what-makes-it-work) · [Sources](#sources-why-it-is-built-this-way) ·
 [Related projects](#related-projects)
@@ -692,6 +693,56 @@ the stop note says how many there were.
 
 Rounds do not apply to a target that ended without finishing (a question, uncommitted
 work): those are the stops that need a person, and are handled as before.
+
+### Models from Google Antigravity: `"agy:<model>"`
+
+Any model can also be one of Google Antigravity's, run through its CLI (`agy`) under the
+Antigravity account's own plan quota, separate from Claude's. Write it as `agy:` and the
+model's identifier, as `agy models` lists them:
+
+```json
+"model": "opus",
+"reviewModel": "agy:gemini-4-hydrogen-high",
+"fixRounds": ["same", "agy:claude-opus-5-5-high"],
+"autoSequence": [ "1.1", { "target": "1.2", "model": "agy:gemini-3.8-flash-medium" } ]
+```
+
+That reads: tasks on Claude Opus through Claude Code; the reviewer is Gemini, a different
+family from the builder, which is what an adversarial review wants; a rejected task gets
+one more round on its own model, then one on Opus through Antigravity's quota; task 1.2,
+mechanical, runs on Gemini Flash. The identifiers carry their effort (`-low`, `-medium`,
+`-high`, `-xhigh`), so `effort` does not apply to them. Antigravity offers Gemini
+(Argon, Hydrogen, Flash, Orchestrator), Claude and GPT-OSS models, depending on the plan;
+its quotas are two pools, Gemini models and "Claude and GPT models", each with a weekly
+and a five-hour limit.
+
+Setup, once: install the CLI (`irm https://antigravity.google/cli/install.ps1 | iex` on
+Windows; [other systems](https://antigravity.google/docs/getting-started?tab=cli)), run
+`agy` once to sign in, and `agy models` to see your identifiers. `phasekit lint` refuses a
+plan that names an `agy:` model when the CLI is not installed.
+
+What phasekit does, measured against agy 1.5.9:
+
+- **The same loop.** A target on Antigravity is run, resumed (`--conversation`), verified,
+  reviewed and merged like any other; its log reads the same in `phasekit logs`, its last
+  words reach stop notes and the handoff, its LESSONS block is collected.
+- **No paid credits by surprise.** Every session is started with `useG1Credits` off, so a
+  spent plan quota waits for its refresh instead of drawing on purchased AI credits.
+  `"agyCredits": true` allows them.
+- **A read-only reviewer that really is.** A headless agy run with no approvals still
+  writes files (measured), so the Antigravity reviewer runs in plan mode, which changes
+  nothing in the project, with only `git diff/log/show/status/blame` allowed and the diff
+  handed to it in the prompt. phasekit still checks the tree afterwards.
+- **Changing CLI between rounds.** A conversation cannot move between Claude Code and
+  Antigravity, so a fix round on the other CLI starts a fresh session over the branch,
+  told what was rejected.
+- **A spent quota is a wait.** When agy reports one (`RESOURCE_EXHAUSTED`, "quota"), the
+  run waits and resumes the same conversation. agy announces no reset time, so the wait is
+  `waitMinutes`, repeated up to `maxRetries`; for a weekly limit raise those, or let the
+  sequence stop.
+
+Not yet: `phasekit spend` and the forecast count Claude's usage only, and the account
+switch (`phasekit account`) is for Claude accounts.
 
 `workingDir` is where the agent is launched; `codeDir` is the git repository that receives
 the branch and the commits. They differ when the plan lives in a separate notes repo — set
