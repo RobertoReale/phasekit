@@ -6,8 +6,10 @@
       run      (no --conversation, no --mode plan)  commits the target's work, ticks the box
       resume   (--conversation <id>)                creates good.txt and commits it
       review   (--mode plan)                        answers PK_REVIEWS' next verdict
-      fresh    (no --conversation, and the prompt   a fix round that changed CLI: creates
-                says "was rejected" or "failed")    good.txt and commits it
+      fresh    (no --conversation, and the prompt   a hand-over (a fix round on another CLI, a
+                says "Why you are taking over")     spent allowance): does the task, commits
+
+    PK_AGY_REVIEWS, when set, gives the agy reviewer its own verdicts (else PK_REVIEWS).
 
     PK_AGY_LIMIT=1 makes every call fail with a quota error, the way a spent plan would.
     Calls go to $env:PK_FAKE_DIR/calls.txt as "agy-<kind> <model> <mode>", prompts to
@@ -19,7 +21,7 @@ $dir = $env:PK_FAKE_DIR
 $prompt = Get-Arg '-p'
 $conv = Get-Arg '--conversation'
 $mode = Get-Arg '--mode'
-$kind = if ($mode -eq 'plan') { 'review' } elseif ($conv) { 'resume' } elseif ($prompt -match 'was rejected|they failed|rejected it') { 'fresh' } else { 'run' }
+$kind = if ($mode -eq 'plan') { 'review' } elseif ($conv) { 'resume' } elseif ($prompt -match 'Why you are taking over') { 'fresh' } else { 'run' }
 Add-Content -LiteralPath (Join-Path $dir 'calls.txt') -Value ("agy-{0} {1} {2}" -f $kind, (Get-Arg '--model'), $mode)
 Add-Content -LiteralPath (Join-Path $dir 'prompts.txt') -Value ("=== agy-$kind`n$prompt")
 Add-Content -LiteralPath (Join-Path $dir 'settings.txt') -Value (Get-Arg '--settings')
@@ -49,13 +51,19 @@ switch ($kind) {
         $text = "Done on Antigravity.`n`nLESSONS`nNONE"
     }
     { $_ -in @('resume', 'fresh') } {
+        # Taking over may find the task's own work missing (a session cut off by its
+        # allowance before it committed): do that part too.
+        Set-Content -LiteralPath 'work.txt' -Value 'work'
+        $plan = Get-Content -LiteralPath 'PLAN.md' -Raw
+        Set-Content -LiteralPath 'PLAN.md' -Value ($plan -replace '- \[ \] A\.1', '- [x] A.1') -NoNewline
         Set-Content -LiteralPath 'good.txt' -Value 'fixed'
         git add -A 2>&1 | Out-Null
         git commit -q -m 'fix: A.1' 2>&1 | Out-Null
         $text = 'Fixed it on Antigravity.'
     }
     'review' {
-        $verdicts = @(($env:PK_REVIEWS -split ',') | Where-Object { $_ })
+        $list = if ($env:PK_AGY_REVIEWS) { $env:PK_AGY_REVIEWS } else { $env:PK_REVIEWS }
+        $verdicts = @(($list -split ',') | Where-Object { $_ })
         $v = if ($count -le $verdicts.Count) { $verdicts[$count - 1] } else { 'PASS' }
         $text = "Read the diff.`n`nVERDICT: $v`n1. work.txt:1 - wrong - the task says so"
     }

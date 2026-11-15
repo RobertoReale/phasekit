@@ -121,6 +121,7 @@ phasekit — plan-driven, unattended agent runs
   phasekit init [-Force]           scaffold PLAN.md, PROMPTS.md, phasekit.json here
   phasekit draft [-Text "..."]     an interactive session that interviews you and writes the plan
   phasekit lint                    check the plan mechanically: ledger, sections, sequence, gates
+  phasekit models                  which model and effort each target runs on, and why
   phasekit run <phase>             execute one phase on its own branch
   phasekit reply <phase> -Text .   answer a question, in the same conversation
   phasekit reply <phase> -File .   the same, reading the answer from a file
@@ -472,10 +473,9 @@ function Invoke-Run {
         'finish' {
             # A fresh conversation over work already on the branch. No --resume: the point
             # of this mode is that there is nothing left to resume.
-            $prompt = Get-OrphanedWorkPrompt -Config $cfg -Target $Phase
-            # A fix round that changes CLI (Claude to Antigravity, or back) cannot resume the
-            # other one's conversation; it starts here, told what was rejected.
-            if ($script:ExtraPrompt) { $prompt += "`n`n" + $script:ExtraPrompt }
+            # A fix round on the other CLI, or a hand-over after a spent allowance, cannot
+            # resume the earlier conversation; it starts here, told why it is taking over.
+            $prompt = Get-OrphanedWorkPrompt -Config $cfg -Target $Phase -Handover ([string] $script:ExtraPrompt)
             $first = @('-p', $prompt) + $common
         }
     }
@@ -503,7 +503,7 @@ function Invoke-Run {
     Write-Host "  Code repo   : $($cfg.codeDir)"
     if ($branch) { Write-Host "  Branch      : $($branch.name)" }
     if ($script:SessionId) { Write-Host "  Session     : $($script:SessionId)" }
-    Write-Host "  Model       : $($cfg.model) / effort $($cfg.effort)"
+    Write-Host "  Model       : $(Format-ModelLabel -Model $cfg.model -Effort $cfg.effort -Separator ' / effort ')"
     Write-Host "  Context     : compacts at $($cfg.autoCompact)"
     Write-Host "  Log         : $log"
     Write-Host "  Usage limit : wait $($cfg.waitMinutes) min, resume, up to $($cfg.maxRetries) times."
@@ -608,6 +608,41 @@ function Invoke-Merge {
 }
 
 function Invoke-Review {
+    <#
+        Every reviewer in reviewModel, one after the other, and one verdict out of them:
+        TAMPERED if any changed the repository, FAIL if any rejected the work (with every
+        rejecting reviewer's findings, each named), PASS if at least one passed it and none
+        rejected it, INCONCLUSIVE if none could say. Reviewers of different families make
+        fewer errors in common than two of the same (arXiv 2604.21282), though not none
+        (arXiv 2609.03422), so a second one is worth its cost where a miss is expensive.
+    #>
+    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Target, $Previous)
+
+    $models = @($Config.reviewModels | Where-Object { $_ })
+    if ($models.Count -le 1) { return (Invoke-OneReview -Config $Config -Target $Target -Previous $Previous) }
+
+    $results = foreach ($m in $models) {
+        $one = [pscustomobject] @{}
+        foreach ($p in $Config.PSObject.Properties) { $one | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value }
+        $one.reviewModel = $m
+        $r = Invoke-OneReview -Config $one -Target $Target -Previous $Previous
+        [pscustomobject]@{ model = $m; verdict = $r.verdict; findings = $r.findings; log = $r.log }
+        if ($r.verdict -eq 'TAMPERED') { break }
+    }
+    $results = @($results)
+    $logs = ($results | ForEach-Object { $_.log }) -join ', '
+    $tampered = @($results | Where-Object verdict -eq 'TAMPERED')
+    if ($tampered.Count) { return [pscustomobject]@{ verdict = 'TAMPERED'; findings = $tampered[0].findings; log = $logs } }
+    $failed = @($results | Where-Object verdict -eq 'FAIL')
+    if ($failed.Count) {
+        $text = ($failed | ForEach-Object { "[reviewer $($_.model)]`n$($_.findings)" }) -join "`n`n"
+        return [pscustomobject]@{ verdict = 'FAIL'; findings = $text; log = $logs }
+    }
+    if (@($results | Where-Object verdict -eq 'PASS').Count) { return [pscustomobject]@{ verdict = 'PASS'; findings = ''; log = $logs } }
+    return [pscustomobject]@{ verdict = 'INCONCLUSIVE'; findings = (($results | ForEach-Object { "$($_.model): $($_.findings)" }) -join '; '); log = $logs }
+}
+
+function Invoke-OneReview {
     <#
         Runs the independent reviewer on a finished target's branch and returns its verdict:
         PASS, FAIL (with findings), INCONCLUSIVE (no verdict, or the session failed) or
@@ -857,8 +892,11 @@ What to do: $Next
         if (-not $item) { break }
         [void] $attempted.Add($item.target)
         $target = $item.target
-        $Model = if ($item.model) { $item.model } else { $cliModel }
-        $Effort = if ($item.effort) { $item.effort } else { $cliEffort }
+        # The entry's own model, else its tier (named, or read from the plan with autoTier),
+        # else the defaults. Said in the journal, with the reason.
+        $pick = Resolve-TargetModel -Config $cfg -Item $item -CliModel $cliModel -CliEffort $cliEffort
+        $Model = $pick.model
+        $Effort = $pick.effort
 
         if (Test-TargetDone -Config $cfg -Target $target -AllowNoCommits:$item.allowNoCommits) {
             Write-Host "  $target already done — skipping." -ForegroundColor DarkGray
@@ -940,16 +978,43 @@ What to do: $Next
             Remove-Item -LiteralPath $sessionFile -Force -ErrorAction SilentlyContinue
         }
 
-        Write-AutoProgress ("$target : {0} the agent" -f @{
+        Write-AutoProgress ("$target : {0} the agent on {1} ({2})" -f @{
             continue = 'resuming'; finish = 'finishing what was left on the branch with'; run = 'running'
-        }[$mode])
+        }[$mode], (Format-ModelLabel -Model $(if ($Model) { $Model } else { $cfg.model }) -Effort $(if ($Effort) { $Effort } else { $cfg.effort })), $pick.source)
         # A precondition that throws - a dirty tree left by the target before this one is
         # the way it happens - used to travel straight out of here and end the process.
         # That leaves a runner mark with no stop note, which reads as a killed runner, so
         # the watchdog restarts it into the very same refusal. Stopping on purpose says
         # what happened once and leaves it said.
+        $script:AllowLimitFallback = $true
+        $script:LimitFallbackPending = $false
         try {
             $exit = @(Invoke-Run -Mode $mode)[-1]
+
+            # A spent allowance with limitFallback set: the run returned instead of waiting,
+            # and the target goes on, on the next model, in a fresh session over the branch.
+            # When the list runs out, the last session waits for its reset as always.
+            $fallbacks = @(@($cfg.limitFallback) | ForEach-Object { ConvertFrom-ModelSpec $_ })
+            $fb = 0
+            while ($script:LimitFallbackPending) {
+                $script:LimitFallbackPending = $false
+                $from = Format-ModelLabel -Model $(if ($Model) { $Model } else { $cfg.model }) -Effort $Effort
+                if ($fb -ge $fallbacks.Count) {
+                    Write-AutoProgress "$target : limitFallback exhausted - waiting for the reset on $from"
+                    $script:AllowLimitFallback = $false
+                    $exit = @(Invoke-Run -Mode 'continue')[-1]
+                    break
+                }
+                $next = $fallbacks[$fb]; $fb++
+                $Model = $next.model; $Effort = $next.effort
+                Write-AutoProgress "$target : usage limit on $from - handing over to $(Format-ModelLabel -Model $next.model -Effort $next.effort)"
+                $script:ExtraPrompt = ("The session on $from stopped because its usage allowance ran out, in the middle of " +
+                                       "the task. You continue it on another model; nothing of its work is lost.")
+                try { $exit = @(Invoke-Run -Mode 'finish')[-1] } finally { $script:ExtraPrompt = '' }
+                # From here the target belongs to this model: a "same" fix round must not
+                # go back to the one whose allowance is spent.
+                $pick = [pscustomobject]@{ model = $Model; effort = $Effort; tier = $pick.tier; source = 'limitFallback' }
+            }
         }
         catch {
             Stop-Auto -Target $target -Why "$target could not start: $($_.Exception.Message)" `
@@ -957,6 +1022,7 @@ What to do: $Next
                        "  usual cause, and the fix is to finish or discard that work, not to rerun this target.")
             return 1
         }
+        finally { $script:AllowLimitFallback = $false }
         Write-AutoProgress "$target : the agent ended with exit $exit"
 
         # Usage limits are already handled inside the run. What reaches here is a question,
@@ -1146,8 +1212,8 @@ What to do: $Next
                     -Detail $rejection.stopDetail -Next $rejection.next
                 return 1
             }
-            $Model = if ($step.model) { $step.model } elseif ($item.model) { $item.model } else { $cliModel }
-            $Effort = if ($step.effort) { $step.effort } elseif ($step.model) { $null } elseif ($item.effort) { $item.effort } else { $cliEffort }
+            $Model = if ($step.model) { $step.model } else { $pick.model }
+            $Effort = if ($step.effort) { $step.effort } elseif ($step.model) { $null } else { $pick.effort }
             Write-Host ''
             Write-Host "  $target was rejected ($($rejection.kind)) - fix round $round of $($rounds.Count), $($step.label)." -ForegroundColor Yellow
             Write-AutoProgress "$target : rejected by the $($rejection.kind) - fix round $round of $($rounds.Count) ($($step.label))"
@@ -1663,7 +1729,7 @@ function Show-Dashboard {
             $spent = if ($r.context -gt 0) {
                 ('   context {0}k' -f [math]::Round($r.context / 1000))
             } else { '' }
-            Write-Host ("            on {0} / effort {1}{2}" -f $r.model, $r.effort, $spent) -ForegroundColor DarkGray
+            Write-Host ("            on {0}{1}" -f (Format-ModelLabel -Model $r.model -Effort $r.effort -Separator " / effort "), $spent) -ForegroundColor DarkGray
         }
     }
     elseif ($running.Count -gt 0) {
@@ -1676,7 +1742,7 @@ function Show-Dashboard {
             $spent = if ($r.context -gt 0) {
                 ('   context {0}k' -f [math]::Round($r.context / 1000))
             } else { '' }
-            Write-Host ("            on {0} / effort {1}{2}" -f $r.model, $r.effort, $spent) -ForegroundColor DarkGray
+            Write-Host ("            on {0}{1}" -f (Format-ModelLabel -Model $r.model -Effort $r.effort -Separator " / effort "), $spent) -ForegroundColor DarkGray
         }
     }
     elseif ($stalled.Count -gt 0) {
@@ -1689,7 +1755,7 @@ function Show-Dashboard {
             $spent = if ($r.context -gt 0) {
                 ('   context {0}k' -f [math]::Round($r.context / 1000))
             } else { '' }
-            Write-Host ("            on {0} / effort {1}{2}" -f $r.model, $r.effort, $spent) -ForegroundColor DarkGray
+            Write-Host ("            on {0}{1}" -f (Format-ModelLabel -Model $r.model -Effort $r.effort -Separator " / effort "), $spent) -ForegroundColor DarkGray
         }
     }
     elseif ($Frame.remaining -gt 0) {
@@ -1736,9 +1802,9 @@ function Show-Dashboard {
     # effort actually cost. A target that overrides either is named, because an
     # unexplained difference in the finished code usually traces back to one.
     $off = @($Frame.rows | Where-Object { $_.custom -and $_.state -ne 'done' })
-    Write-Host ('  model     {0} / effort {1}' -f $Frame.model, $Frame.effort) -ForegroundColor DarkGray -NoNewline
+    Write-Host ('  model     {0}' -f (Format-ModelLabel -Model $Frame.model -Effort $Frame.effort -Separator ' / effort ')) -ForegroundColor DarkGray -NoNewline
     if ($off.Count -gt 0) {
-        $named = @($off | Select-Object -First 4 | ForEach-Object { '{0} {1}/{2}' -f $_.target, $_.model, $_.effort })
+        $named = @($off | Select-Object -First 4 | ForEach-Object { '{0} {1}' -f $_.target, (Format-ModelLabel -Model $_.model -Effort $_.effort) })
         $more = if ($off.Count -gt 4) { ", +$($off.Count - 4)" } else { '' }
         Write-Host ('   except ' + ($named -join ', ') + $more) -ForegroundColor Yellow
     } else { Write-Host '' }
@@ -2391,6 +2457,26 @@ switch ($Command.ToLowerInvariant()) {
     'lessons' { exit (Invoke-Lessons) }
     'lint' { exit (Invoke-Lint) }
     'draft' { exit (Invoke-Draft) }
+    'models' {
+        # Which model and effort each target of the sequence will run on, and why. Not $item:
+        # at this level that is the script's own -Item parameter, typed [string], and a
+        # sequence entry assigned to it becomes an empty string.
+        $cfg = Get-PhaseKitConfig -Path $Config
+        Write-Host ''
+        foreach ($entry in @(Get-AutoSequence -Config $cfg)) {
+            $p = Resolve-TargetModel -Config $cfg -Item $entry
+            $done = Test-TargetDone -Config $cfg -Target $entry.target -AllowNoCommits:$entry.allowNoCommits
+            $colour = if ($done) { 'DarkGray' } else { 'White' }
+            Write-Host ("  {0,-8} {1,-34} {2}" -f $entry.target, (Format-ModelLabel -Model $p.model -Effort $p.effort), $p.source) -ForegroundColor $colour
+        }
+        Write-Host ''
+        $reviewers = (@($cfg.reviewModels) | ForEach-Object { Format-ModelLabel -Model $_ -Effort $cfg.reviewEffort }) -join ', '
+        Write-Host ("  review: {0}   fixRounds: {1}   limitFallback: {2}" -f $(if ($cfg.review) { $reviewers } else { 'off' }),
+            $(if (@($cfg.fixRounds).Count) { $cfg.fixRounds -join ', ' } else { 'none' }),
+            $(if (@($cfg.limitFallback).Count) { $cfg.limitFallback -join ', ' } else { 'none (wait for the reset)' })) -ForegroundColor DarkGray
+        Write-Host ''
+        exit 0
+    }
     'review' {
         # The reviewer on demand, on a branch as it stands. Changes nothing; prints the
         # verdict and the findings.
