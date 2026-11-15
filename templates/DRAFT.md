@@ -48,7 +48,10 @@ already answers; state what you found instead. Cover, in roughly this order:
 - decision gates: questions that only the person can answer, and which tasks wait on them;
 - how unattended it should be: "review" (an independent read-only reviewer before every
   merge), "fixRounds" (for example ["same", "opus/xhigh"]), "verify" ("full" or "fast"),
-  which tasks deserve a higher effort and which are mechanical enough for a cheaper model.
+  which tasks deserve a higher effort and which are mechanical enough for a cheaper model,
+  and whether some should run on Google Antigravity's models ("agy:<id>", from
+  `agy models`, if the person has Antigravity) to use that quota too, a Gemini reviewer
+  being the usual first choice.
   Explain each in one plain sentence; the README of phasekit describes them.
 
 ## What you write

@@ -473,6 +473,9 @@ function Invoke-Run {
             # A fresh conversation over work already on the branch. No --resume: the point
             # of this mode is that there is nothing left to resume.
             $prompt = Get-OrphanedWorkPrompt -Config $cfg -Target $Phase
+            # A fix round that changes CLI (Claude to Antigravity, or back) cannot resume the
+            # other one's conversation; it starts here, told what was rejected.
+            if ($script:ExtraPrompt) { $prompt += "`n`n" + $script:ExtraPrompt }
             $first = @('-p', $prompt) + $common
         }
     }
@@ -633,7 +636,11 @@ function Invoke-Review {
     $sessionFile = Join-Path $Config.logDir "review-$safe.session"
     Remove-Item -LiteralPath $sessionFile -Force -ErrorAction SilentlyContinue
 
-    $prompt = Get-ReviewPrompt -Config $Config -Target $Target -Base $base -Branch $branch -Previous $Previous
+    $diff = ''
+    if ((Get-AgentBackend $Config.reviewModel) -eq 'agy') {
+        $diff = (@(git -C $Config.codeDir diff "$base..$branch" 2>$null) -join "`n")
+    }
+    $prompt = Get-ReviewPrompt -Config $Config -Target $Target -Base $base -Branch $branch -Previous $Previous -Diff $diff
     $common = @(
         '--model', $Config.reviewModel
         '--effort', $Config.reviewEffort
@@ -1144,13 +1151,21 @@ What to do: $Next
             Write-Host ''
             Write-Host "  $target was rejected ($($rejection.kind)) - fix round $round of $($rounds.Count), $($step.label)." -ForegroundColor Yellow
             Write-AutoProgress "$target : rejected by the $($rejection.kind) - fix round $round of $($rounds.Count) ($($step.label))"
+            # The same CLI resumes the target's own conversation. A round on the other one
+            # (a Claude target, an "agy:" round, or the reverse) cannot: it starts a fresh
+            # session over the branch, told what was rejected.
+            $pinned = [string] (Get-PinnedSession -Config $cfg -Phase $target)
+            $sessionBackend = if ($pinned -match '^(?i)agy:') { 'agy' } else { 'claude' }
+            $roundModel = if ($Model) { $Model } else { $cfg.model }
+            $how = if ((Get-AgentBackend $roundModel) -eq $sessionBackend) { 'reply' } else { 'finish' }
             try {
-                $Text = Get-RejectionMessage -Target $target -Kind $rejection.kind -Detail $rejection.detail -Round "$round of $($rounds.Count)"
+                $message = Get-RejectionMessage -Target $target -Kind $rejection.kind -Detail $rejection.detail -Round "$round of $($rounds.Count)"
+                if ($how -eq 'reply') { $Text = $message } else { $script:ExtraPrompt = $message }
                 $File = ''
-                $null = @(Invoke-Run -Mode 'reply')[-1]
+                $null = @(Invoke-Run -Mode $how)[-1]
             }
             catch { Write-Host "  the fix round did not get through ($($_.Exception.Message))." -ForegroundColor Yellow }
-            finally { $Text = '' }
+            finally { $Text = ''; $script:ExtraPrompt = '' }
 
             if ($rejection.kind -eq 'review') {
                 $lastLog = Get-ChildItem -Path $cfg.logDir -Filter "phase-$($target -replace '[^\w.-]', '_')-*.log" -ErrorAction SilentlyContinue |
