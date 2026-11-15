@@ -132,6 +132,7 @@ phasekit — plan-driven, unattended agent runs
   phasekit auto [-Push]            walk autoSequence unattended: run, verify, merge, next
   phasekit logs [-Follow]          follow the run, rolling over as each phase starts
   phasekit account [<name>|next]   list the Claude accounts here, or switch the one runs use
+  phasekit review <target>         an independent, read-only review of a target's branch
   phasekit lessons                 what the agents learned so far, best first
   phasekit lessons add -Text .     add one by hand: "when <cond> | <lesson> | evidence: <...>"
   phasekit lessons drop <id>       retire one by hand (-Text gives the reason)
@@ -598,6 +599,72 @@ function Invoke-Merge {
     return 0
 }
 
+function Invoke-Review {
+    <#
+        Runs the independent reviewer on a finished target's branch and returns its verdict:
+        PASS, FAIL (with findings), INCONCLUSIVE (no verdict, or the session failed) or
+        TAMPERED (the repository changed while it ran, which a read-only reviewer must not
+        do - the verdict is then worthless and a person has to look).
+
+        Read-only is enforced by the tools it is given, not asked for: file reads and the
+        git commands that only read. Usage limits are waited out like any other run.
+    #>
+    param([Parameter(Mandatory)] $Config, [Parameter(Mandatory)] [string] $Target, $Previous)
+
+    $report = Test-PhaseReady -Config $Config -Phase $Target -AllowNoCommits
+    $base = if ($report.base) { $report.base } else { Get-MainBranch -Config $Config }
+    $branch = "$($Config.branchPrefix)$Target"
+    $headBefore = ([string] (git -C $Config.codeDir rev-parse HEAD 2>$null)).Trim()
+    $treeBefore = (@(git -C $Config.codeDir status --porcelain 2>$null) -join "`n")
+
+    $safe = $Target -replace '[^\w.-]', '_'
+    # Not phase-<target>-*.log: those are the target's own runs, and the handoff, the stop
+    # notes and the pace statistics read them as such.
+    $log = Join-Path $Config.logDir ("review-{0}-{1}.log" -f $safe, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $sessionFile = Join-Path $Config.logDir "review-$safe.session"
+    Remove-Item -LiteralPath $sessionFile -Force -ErrorAction SilentlyContinue
+
+    $prompt = Get-ReviewPrompt -Config $Config -Target $Target -Base $base -Branch $branch -Previous $Previous
+    $common = @(
+        '--model', $Config.reviewModel
+        '--effort', $Config.reviewEffort
+        '--output-format', 'stream-json'
+        '--verbose'
+        '--allowedTools', 'Read', 'Grep', 'Glob', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git show:*)', 'Bash(git status:*)', 'Bash(git blame:*)'
+        '--disallowedTools', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'WebSearch'
+    )
+    if ($Config.autoCompact -and "$($Config.autoCompact)" -notin @('off', 'none')) { $common += @('--autocompact', "$($Config.autoCompact)") }
+    if ($Config.strictMcp) { $common += '--strict-mcp-config' }
+
+    Write-Host ''
+    Write-Host "  Independent review of $Target  ($($Config.reviewModel) / $($Config.reviewEffort), read-only)" -ForegroundColor Cyan
+    Write-Host "  Log: $log"
+
+    # A copy of the config that never restarts on a full context: that restart picks the
+    # TARGET up again with its continue prompt, which is not what a reviewer is for.
+    $rc = [pscustomobject] @{}
+    foreach ($p in $Config.PSObject.Properties) { $rc | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value }
+    $rc.maxContextRestarts = 0
+    $savedSession = $script:SessionId
+    $script:SessionId = $null
+    try {
+        $exit = Invoke-AgentWithLimitRetry -Config $rc -Phase $Target -FirstArgs (@('-p', $prompt) + $common) `
+            -LogPath $log -SessionFile $sessionFile -Common $common
+    }
+    finally { $script:SessionId = $savedSession }
+
+    $headAfter = ([string] (git -C $Config.codeDir rev-parse HEAD 2>$null)).Trim()
+    $treeAfter = (@(git -C $Config.codeDir status --porcelain 2>$null) -join "`n")
+    if ($headAfter -ne $headBefore -or $treeAfter -ne $treeBefore) {
+        return [pscustomobject]@{ verdict = 'TAMPERED'; findings = 'the repository changed while the read-only reviewer ran'; log = $log }
+    }
+    $words = if (Test-Path -LiteralPath $log) { Get-AgentLastWords -LogTail ((Get-Content -LiteralPath $log -Tail 400) -join "`n") -MaxChars 12000 } else { '' }
+    $v = ConvertFrom-ReviewVerdict -Text $words
+    if ($exit -ne 0 -and $v.verdict -eq 'INCONCLUSIVE') { $v.findings = "the review session ended with exit $exit" }
+    Write-Host ("  Review verdict: {0}" -f $v.verdict) -ForegroundColor $(switch ($v.verdict) { 'PASS' { 'Green' } 'FAIL' { 'Yellow' } default { 'DarkYellow' } })
+    return [pscustomobject]@{ verdict = $v.verdict; findings = $v.findings; log = $log }
+}
+
 function Invoke-Auto {
     <#
         Walks a list of targets unattended: run, verify, merge, next. Stops at the first
@@ -980,16 +1047,107 @@ What to do: $Next
             return 1
         }
 
-        # Last element, not the whole thing: if any callee ever leaks to the output stream
-        # again, this reads the exit code rather than the noise in front of it.
-        Write-AutoProgress "$target : merging - the gates run first"
-        $merged = @(Invoke-Merge -Quiet -AllowNoCommits:$item.allowNoCommits)[-1]
-        if ($merged -ne 0) {
-            $why = Format-GateFailures -Failures (Get-LastGateFailures)
-            Stop-Auto -Target $target -Why $why -Detail (Get-LastGateFailures) `
-                -Next "phasekit merge $target   to see what blocked it"
-            return 1
+        # Review (when on), then the gates and the merge. A rejection by either is told to
+        # the target in its own conversation for as many rounds as fixRounds allows, each
+        # optionally on a stronger model; when the rounds run out, the stop is the one this
+        # always made. With review off and no rounds, this is exactly the old path.
+        $reviewWanted = Test-ReviewWanted -Config $cfg -Item $item
+        $rounds = @(Get-FixRounds -Config $cfg)
+        $round = 0
+        $previousReview = $null
+        $landed = $false
+        while ($true) {
+            $rejection = $null
+            if ($reviewWanted) {
+                Write-AutoProgress "$target : independent review"
+                $review = $null
+                try { $review = Invoke-Review -Config $cfg -Target $target -Previous $previousReview }
+                catch { $review = [pscustomobject]@{ verdict = 'INCONCLUSIVE'; findings = $_.Exception.Message; log = '' } }
+                Write-AutoProgress "$target : review $($review.verdict)"
+                if ($review.verdict -eq 'TAMPERED') {
+                    Stop-Auto -Target $target -Why 'the repository changed while the read-only reviewer ran' `
+                        -Detail ([pscustomobject]@{ name = 'review log'; code = $null; tail = $review.log }) `
+                        -Next "git -C `"$($cfg.codeDir)`" status  and  git log  on the branch, then rerun phasekit auto"
+                    return 1
+                }
+                if ($review.verdict -eq 'FAIL') {
+                    $rejection = [pscustomobject]@{
+                        kind = 'review'; detail = $review.findings
+                        why = "the independent review rejected $target"
+                        stopDetail = [pscustomobject]@{ name = 'review findings'; code = $null; tail = $review.findings }
+                        next = "Read the findings and the review log ($($review.log)), then answer:  phasekit reply $target -File <answer>"
+                    }
+                }
+                elseif ($review.verdict -eq 'INCONCLUSIVE') {
+                    # The reviewer is an extra layer, not the gate. Failing to get a verdict
+                    # out of it is said, and the gates still decide.
+                    Write-Host "  The review gave no verdict ($($review.findings)) - the gates decide alone." -ForegroundColor DarkYellow
+                    Write-AutoProgress "$target : review inconclusive - the gates decide alone"
+                }
+            }
+
+            if (-not $rejection) {
+                # Last element, not the whole thing: if any callee ever leaks to the output
+                # stream again, this reads the exit code rather than the noise in front of it.
+                Write-AutoProgress "$target : merging - the gates run first"
+                $merged = @(Invoke-Merge -Quiet -AllowNoCommits:$item.allowNoCommits)[-1]
+                if ($merged -eq 0) { break }
+                $failures = @(Get-LastGateFailures)
+                $rejection = [pscustomobject]@{
+                    kind = 'gates'
+                    detail = (@($failures | ForEach-Object { "--- $($_.name) (exit $($_.code)) ---`n$($_.tail)" }) -join "`n")
+                    why = (Format-GateFailures -Failures $failures)
+                    stopDetail = $failures
+                    next = "phasekit merge $target   to see what blocked it"
+                }
+            }
+
+            if ($round -ge $rounds.Count) {
+                $more = if ($rounds.Count) { " (after $($rounds.Count) fix round(s))" } else { '' }
+                Stop-Auto -Target $target -Why ($rejection.why + $more) -Detail $rejection.stopDetail -Next $rejection.next
+                return 1
+            }
+
+            $step = $rounds[$round]
+            $round++
+            if (-not (Get-PinnedSession -Config $cfg -Phase $target)) {
+                Stop-Auto -Target $target -Why "$($rejection.why), and its conversation is gone, so no fix round can be held" `
+                    -Detail $rejection.stopDetail -Next $rejection.next
+                return 1
+            }
+            $Model = if ($step.model) { $step.model } elseif ($item.model) { $item.model } else { $cliModel }
+            $Effort = if ($step.effort) { $step.effort } elseif ($step.model) { $null } elseif ($item.effort) { $item.effort } else { $cliEffort }
+            Write-Host ''
+            Write-Host "  $target was rejected ($($rejection.kind)) - fix round $round of $($rounds.Count), $($step.label)." -ForegroundColor Yellow
+            Write-AutoProgress "$target : rejected by the $($rejection.kind) - fix round $round of $($rounds.Count) ($($step.label))"
+            try {
+                $Text = Get-RejectionMessage -Target $target -Kind $rejection.kind -Detail $rejection.detail -Round "$round of $($rounds.Count)"
+                $File = ''
+                $null = @(Invoke-Run -Mode 'reply')[-1]
+            }
+            catch { Write-Host "  the fix round did not get through ($($_.Exception.Message))." -ForegroundColor Yellow }
+            finally { $Text = '' }
+
+            if ($rejection.kind -eq 'review') {
+                $lastLog = Get-ChildItem -Path $cfg.logDir -Filter "phase-$($target -replace '[^\w.-]', '_')-*.log" -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                $answer = if ($lastLog) { Get-AgentLastWords -LogTail ((Get-Content -LiteralPath $lastLog.FullName -Tail 400) -join "`n") -MaxChars 4000 } else { '' }
+                $previousReview = [pscustomobject]@{ findings = $rejection.detail; answer = $answer }
+            }
+
+            if (Test-TargetDone -Config $cfg -Target $target -AllowNoCommits:$item.allowNoCommits) { $landed = $true; break }
+            $report = Test-PhaseReady -Config $cfg -Phase $target -AllowNoCommits:$item.allowNoCommits
+            if (-not $report.ok) {
+                Stop-Auto -Target $target -Why ("after fix round ${round}: " + ($report.problems -join '; ')) `
+                    -Next ("Read the log, then answer in the same conversation:`n" +
+                           "    phasekit reply $target -Text `"your answer`"")
+                return 1
+            }
         }
+        # The model and effort a fix round chose belong to that round, not to the next target.
+        $Model = $cliModel
+        $Effort = $cliEffort
+        if ($landed) { Write-AutoProgress "$target : landed during a fix round - moving on"; continue }
 
         Write-AutoProgress "$target : merged"
 
@@ -2122,5 +2280,16 @@ switch ($Command.ToLowerInvariant()) {
     'auto' { Set-MachineAwake; try { exit (Invoke-Auto) } finally { Set-MachineAwake -Off } }
     'logs' { exit (Invoke-Logs) }
     'lessons' { exit (Invoke-Lessons) }
+    'review' {
+        # The reviewer on demand, on a branch as it stands. Changes nothing; prints the
+        # verdict and the findings.
+        if (-not $Phase) { throw 'Which target? e.g.  phasekit review 4.2' }
+        $cfg = Initialize-Run -ForPhase $Phase
+        Set-MachineAwake
+        try { $r = Invoke-Review -Config $cfg -Target $Phase } finally { Set-MachineAwake -Off }
+        Write-Host ''
+        if ($r.findings) { Write-Host $r.findings; Write-Host '' }
+        exit ($(if ($r.verdict -eq 'PASS') { 0 } else { 1 }))
+    }
     default { Show-Help; exit 0 }
 }

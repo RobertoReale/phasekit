@@ -22,6 +22,7 @@ the agent is doing.*
 [How far along](#how-far-along-and-how-much-longer) · [Configuration](#configuration) ·
 [How much to verify](#how-much-to-verify-verify) ·
 [Lessons](#lessons-what-one-agent-learns-the-next-one-knows) ·
+[Review and fix rounds](#a-second-opinion-and-a-second-chance-review-and-fixrounds) ·
 [What a target costs](#what-a-target-costs-and-why-it-is-not-the-clock) ·
 [What makes it work](#what-makes-it-work) · [Sources](#sources-why-it-is-built-this-way) ·
 [Related projects](#related-projects)
@@ -118,6 +119,7 @@ phasekit run 0
 | `phasekit lessons` | What the agents learned so far, best first ([details](#lessons-what-one-agent-learns-the-next-one-knows)) |
 | `phasekit lessons add -Text "…"` | Record one by hand: `when <condition> \| <lesson> \| evidence: <what shows it>` |
 | `phasekit lessons drop <id>` | Retire one by hand; `-Text` says why |
+| `phasekit review <target>` | An independent, read-only review of a target's branch as it stands ([details](#a-second-opinion-and-a-second-chance-review-and-fixrounds)) |
 
 Useful flags: `-Detach` (survives closing the terminal), `-DryRun` (print the prompt and
 the exact `claude` command, run nothing), `-Watch` (redraw the dashboard), `-NoBranch`,
@@ -608,6 +610,52 @@ required, one `WRONG` retires a new lesson, and the gates stay the judge.
 `phasekit lessons` lists them. An answer you give to a stop is often a lesson too; record
 it with `phasekit lessons add`. `"lessons": false` turns the whole thing off.
 
+### A second opinion, and a second chance: `"review"` and `"fixRounds"`
+
+Two choices, both off by default, because each costs sessions.
+
+**`"review": true`** puts an independent reviewer between a finished target and its merge.
+It is a separate session that did not do the work and cannot change anything: it gets file
+reads and the git commands that only read (`diff`, `log`, `show`, `status`, `blame`), and
+no editing tool, by construction rather than by request. Its only job is to show the work
+is wrong: a requirement not met, behaviour that contradicts the plan, tests that do not
+test what they claim or were weakened, a regression, a report that claims more than the
+commit holds. It must point at a file and line, and it is told that an invented finding
+costs a round. It ends with `VERDICT: PASS` or `VERDICT: FAIL`.
+
+```json
+"review": true,
+"reviewModel": "opus",
+"reviewEffort": "high",
+"autoSequence": [ "4.1", { "target": "4.2", "review": false } ]
+```
+
+An entry's own `"review"` wins over the global one, either way. The gates still run after
+a PASS; the review adds to them and never replaces them. A review that ends with no verdict
+is said in the journal and the gates decide alone. A reviewer that changed the repository
+(it cannot, but it is checked) stops the sequence: its verdict is then worth nothing.
+`phasekit review <target>` runs it by hand on a branch as it stands.
+
+**`"fixRounds"`** decides what happens when a target is rejected, by the gates before its
+merge or by the reviewer. Empty, the default, means what it always meant: the sequence stops
+and waits for a person. Each entry is one more round in the target's **own conversation**,
+told exactly what was rejected and why:
+
+```json
+"fixRounds": ["same", "opus/xhigh"]
+```
+
+`"same"` keeps the target's model and effort; `"opus/xhigh"` (or just `"opus"`) moves up
+for that round. So a target written by Sonnet that fails its gates gets one more try on
+Sonnet, then one on Opus at extra-high effort, and only then wakes anybody. After a review
+rejection the next review sees the findings and the builder's answer, and accepts an answer
+backed by evidence; the builder is told it may refute a finding rather than "fix" code that
+was right. Every round is told never to weaken a test or a gate. When the rounds run out,
+the stop note says how many there were.
+
+Rounds do not apply to a target that ended without finishing (a question, uncommitted
+work): those are the stops that need a person, and are handled as before.
+
 `workingDir` is where the agent is launched; `codeDir` is the git repository that receives
 the branch and the commits. They differ when the plan lives in a separate notes repo — set
 `workingDir` to their common parent so the agent can see both.
@@ -724,14 +772,15 @@ it done like this?" has an answer you can check.
 
 ## Related projects
 
-Others solve the same problem differently; some do things phasekit does not.
+Others solve the same problem differently, and two of phasekit's options come from them.
 
 - [claude-autopilot](https://github.com/Timothy1102/claude-autopilot): plan once, then one
-  verified commit per task overnight in a worktree. Has an optional independent reviewer
-  session per task, and escalates a failing task to a stronger model instead of stopping.
+  verified commit per task overnight in a worktree. Its optional reviewer session per task
+  and its escalation of a failing task to a stronger model are where `"review"` and
+  `"fixRounds"` come from.
 - [harnessd](https://github.com/samhagman/harnessd): builder and evaluator negotiate a
   contract per work packet before any code, and a read-only adversarial evaluator tries to
-  disprove the builder's claims.
+  disprove the builder's claims, which is the stance phasekit's reviewer takes.
 - [continuous-claude](https://github.com/AnandChowdhary/continuous-claude): a loop that
   opens a pull request per iteration, waits for CI and merges.
 - [GitHub Spec Kit](https://github.com/github/spec-kit): turns a specification into a plan
@@ -745,4 +794,5 @@ Others solve the same problem differently; some do things phasekit does not.
 
 ## Licence
 
-MIT.
+[Apache License 2.0](LICENSE). Versions published before 15 November 2026 were released
+under the MIT licence and remain available under it.
