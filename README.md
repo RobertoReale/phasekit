@@ -10,6 +10,12 @@ while it does it.
 It exists because "let the agent go and see what happens" produces a diff nobody can read
 and a repository nobody can revert. The unit of trust here is the commit, not the session.
 
+![phasekit dashboard: progress bar, the target running and its model, pace, the forecast end and the usage allowance](docs/images/dashboard.png)
+
+*`phasekit dashboard -Watch` during a real run: 37 of 46 targets done, the forecast end and
+the usage allowance it is planned against. `phasekit logs -Follow` shows, line by line, what
+the agent is doing.*
+
 ## What it is not
 
 It is not a framework, an orchestrator, or a way to avoid thinking about your codebase.
