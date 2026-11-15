@@ -64,6 +64,9 @@ param(
     # logs: tail the newest log as it grows.
     [switch] $Follow,
 
+    # logs: the detailed view - whole commands, the edits, the head of every tool's output.
+    [switch] $Full,
+
     # dashboard: redraw every few seconds instead of printing once and returning.
     [switch] $Watch,
 
@@ -132,7 +135,7 @@ phasekit — plan-driven, unattended agent runs
   phasekit forecast [-Json]        when the sequence ends, usage limits and resets included
   phasekit gates                   run the project's gates locally, no agent
   phasekit auto [-Push]            walk autoSequence unattended: run, verify, merge, next
-  phasekit logs [-Follow]          follow the run, rolling over as each phase starts
+  phasekit logs [-Follow] [-Full]  follow the run; -Full adds whole commands, edits and outputs
   phasekit account [<name>|next]   list the Claude accounts here, or switch the one runs use
   phasekit review <target>         an independent, read-only review of a target's branch
   phasekit lessons                 what the agents learned so far, best first
@@ -1465,6 +1468,7 @@ function Watch-Logs {
 
 function Invoke-Logs {
     $cfg = Get-PhaseKitConfig -Path $Config
+    $script:StreamFull = [bool] $Full
     if ($Follow) { return (Watch-Logs -Config $cfg) }
 
     $newest = Get-NewestLog -LogDir $cfg.logDir
