@@ -101,6 +101,17 @@ function Get-PhaseKitConfig {
         # characters of them: every line is read by every request of every target.
         lessonsMax       = 30
         lessonsMaxChars  = 6000
+        # An independent, read-only reviewer reads each finished target before its merge
+        # and tries to show it is wrong. Off by default: it costs a session per target.
+        # An autoSequence entry's "review" overrides it for that target. See Invoke-Review.
+        review           = $false
+        reviewModel      = 'opus'
+        reviewEffort     = 'high'
+        # What happens when a target's work is rejected - by the gates before its merge, or
+        # by the reviewer. Empty: the sequence stops for a person, as it always did. Each
+        # entry is one more round in the target's own conversation, told what was wrong:
+        # "same" keeps the target's model, "opus/xhigh" (or just "opus") moves up.
+        fixRounds        = @()
         gates            = @()
         # The targets `phasekit auto` walks, in order. See Get-AutoSequence.
         autoSequence     = @()
@@ -136,7 +147,21 @@ function Get-PhaseKitConfig {
             $cfg[$k] = $n
         }
     }
-    foreach ($k in @('skipVerifiedGates', 'handoff', 'lessons')) {
+    foreach ($k in @('reviewModel', 'reviewEffort')) {
+        if ($raw.PSObject.Properties.Name -contains $k -and $raw.$k) { $cfg[$k] = [string] $raw.$k }
+    }
+    if ($raw.PSObject.Properties.Name -contains 'fixRounds' -and $null -ne $raw.fixRounds) {
+        $rounds = @($raw.fixRounds | ForEach-Object { ([string] $_).Trim() })
+        foreach ($r in $rounds) {
+            # A typo must not become a model name that fails hours later, at the one moment
+            # the round was needed.
+            if ($r -ne 'same' -and $r -notmatch '^[\w.-]+(/[\w-]+)?$') {
+                throw "phasekit.json: `"fixRounds`" has '$r'. Each entry is `"same`", a model (`"opus`") or a model and effort (`"opus/xhigh`")."
+            }
+        }
+        $cfg.fixRounds = $rounds
+    }
+    foreach ($k in @('skipVerifiedGates', 'handoff', 'lessons', 'review')) {
         if ($raw.PSObject.Properties.Name -contains $k) { $cfg[$k] = [bool] $raw.$k }
     }
     if ($raw.usageLimit) {
@@ -2327,6 +2352,157 @@ function Write-AutoProgress {
     }
 }
 
+function ConvertTo-OptionalBool {
+    # A per-target switch that is absent means "use the global setting", which is not the
+    # same as false. $null carries that difference.
+    param($Object, [string] $Name)
+    if ($Object -and $Object.PSObject.Properties[$Name] -and $null -ne $Object.$Name) { return [bool] $Object.$Name }
+    return $null
+}
+
+# ---------------------------------------------------------------------------
+# Independent review and fix rounds
+# ---------------------------------------------------------------------------
+#
+# Two ideas taken from harnesses that do them well (claude-autopilot, harnessd), both off
+# until the person turns them on:
+#   - an independent reviewer: a second session that did not do the work, cannot change
+#     anything, and whose only job is to show the work is wrong. The agent that wrote the
+#     code is the worst-placed to see what it missed, and the gates only catch what a test
+#     was written for;
+#   - fix rounds: a rejected target - by the gates or by the reviewer - is told why, in its
+#     own conversation, and tries again, optionally on a stronger model, before anybody is
+#     woken up. The rounds are bounded; when they run out the stop is the old one.
+
+function Test-ReviewWanted {
+    param([Parameter(Mandatory)] $Config, $Item)
+    if ($Item -and $null -ne $Item.review) { return [bool] $Item.review }
+    return [bool] $Config.review
+}
+
+function Get-FixRounds {
+    <#
+        The rounds a rejected target gets, in order: each with the model and effort it runs
+        on, or $null for the target's own.
+    #>
+    param([Parameter(Mandatory)] $Config)
+    return @(@($Config.fixRounds) | Where-Object { $_ } | ForEach-Object {
+            $r = ([string] $_).Trim()
+            if ($r -eq 'same') { [pscustomobject]@{ model = $null; effort = $null; label = 'same model' } }
+            else {
+                $m, $e = $r -split '/', 2
+                [pscustomobject]@{ model = $m; effort = $(if ($e) { $e } else { $null }); label = $r }
+            }
+        })
+}
+
+function Get-ReviewPrompt {
+    param(
+        [Parameter(Mandatory)] $Config,
+        [Parameter(Mandatory)] [string] $Target,
+        [Parameter(Mandatory)] [string] $Base,
+        [Parameter(Mandatory)] [string] $Branch,
+        $Previous
+    )
+    $section = ''
+    try { $section = Get-PlanSectionText -Config $Config -Phase $Target } catch { }
+    $task = if ($section) { "--- the task, quoted from $(Split-Path -Leaf $Config.plan) ---`n$section`n--- end of the task ---" }
+            else { "The task is $Target in $($Config.plan); read it there." }
+    $gates = (@($Config.gates | Where-Object { $_ } | ForEach-Object { $_.name })) -join ', '
+    $again = ''
+    if ($Previous) {
+        $again = ("`nA previous review of this target raised these findings:`n$($Previous.findings)`n" +
+                  "The agent that did the work then answered:`n$($Previous.answer)`n" +
+                  "Judge the answers. Accept one that shows evidence (a file and line, a test, a quoted " +
+                  "requirement). Raise a finding again only if its answer does not resolve it.`n")
+    }
+    return @"
+You are an independent reviewer of $Target, unattended, in a headless session. Another agent
+did this work. You did not, and you cannot change anything: your tools read files and run
+read-only git commands, and nothing else.
+
+Paths: the plan is $($Config.plan); the code repository is $($Config.codeDir).
+The work is the commits on $Branch since $Base. Start with:
+  git diff $Base..$Branch --stat
+  git diff $Base..$Branch
+  git log --format=%B $Base..$Branch
+
+$task
+
+Your only job is to find reasons this work is wrong or incomplete. phasekit runs the gates
+itself ($gates); do not try to run them. Look for:
+- a requirement of the task that is not met, or only appears to be;
+- behaviour that contradicts the plan or the project's own rules;
+- tests that do not test what they claim, were weakened or skipped, or assert the
+  implementation instead of the behaviour;
+- a regression in code the task touched;
+- a report, ledger or commit message that claims more than the commit contains.
+
+Report only what you can point at, a file and line with the reason, and what you are
+confident is a defect. Not style, not preferences, not work outside this task's scope. If
+nothing meets that bar the verdict is PASS: a finding invented to look thorough costs a
+round of work and teaches nothing.
+$again
+End your final message with a line that reads exactly VERDICT: PASS or VERDICT: FAIL. After
+FAIL, list the findings, numbered, one per line: file:line - what is wrong - what shows it.
+"@
+}
+
+function ConvertFrom-ReviewVerdict {
+    <#
+        PASS, FAIL or INCONCLUSIVE, and the findings, from the reviewer's last message.
+        Only the last VERDICT line counts: an earlier one is the reviewer quoting the format.
+    #>
+    param([AllowEmptyString()] [string] $Text)
+    $out = [pscustomobject]@{ verdict = 'INCONCLUSIVE'; findings = '' }
+    if (-not $Text) { return $out }
+    $lines = $Text -split "`r?`n"
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        if ($lines[$i] -match '^\s*[*_#> ]*VERDICT[*_ ]*:\s*[*_ ]*(?<v>PASS|FAIL)\b') {
+            $out.verdict = $Matches['v'].ToUpperInvariant()
+            $after = if ($i -lt $lines.Count - 1) { ($lines[($i + 1)..($lines.Count - 1)] -join "`n").Trim() } else { '' }
+            $before = if ($i -gt 0) { ($lines[0..($i - 1)] -join "`n").Trim() } else { '' }
+            $f = if ($after) { $after } else { $before }
+            if ($f.Length -gt 6000) { $f = '[...] ' + $f.Substring($f.Length - 6000) }
+            if ($out.verdict -eq 'FAIL') { $out.findings = $f }
+            return $out
+        }
+    }
+    return $out
+}
+
+function Get-RejectionMessage {
+    <#
+        What a rejected target is told in its own conversation: why, what to do, and what
+        never to do about it.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Target,
+        [Parameter(Mandatory)] [ValidateSet('review', 'gates')] [string] $Kind,
+        [AllowEmptyString()] [string] $Detail,
+        [string] $Round
+    )
+    $intro = if ($Kind -eq 'review') {
+        "An independent reviewer read your work on $Target and rejected it. Its findings:`n$Detail`n`n" +
+        "For each finding: if it is a real defect, fix it. If it is not, do not change the code for " +
+        "it; say in your report why, with evidence (a file and line, a test, the requirement quoted). " +
+        "The reviewer will read your answer."
+    } else {
+        "phasekit ran the gates on your branch before merging $Target, and they failed:`n$Detail`n`n" +
+        "Reproduce the failure first, then find its cause and fix it. If it is not caused by this " +
+        "task, show that with evidence and fix it anyway if it is within reach; otherwise say so " +
+        "and stop."
+    }
+    $on = if ($Round) { "`n`nThis is fix round $Round." } else { '' }
+    return $intro + $on + @"
+
+
+Never weaken, skip or delete a test or a gate to get through. When it is done, run the full
+gates in the foreground, commit following your rules on commits (fold the fix into this
+task's commit if they ask for one commit per task), and end with your usual final report.
+"@
+}
+
 function Get-AutoSequence {
     <#
         The list of targets `phasekit auto` walks, read from phasekit.json:
@@ -2362,14 +2538,14 @@ function Get-AutoSequence {
         # allowNoCommits flag still apply.
         $configured = @{}
         foreach ($e in @($Config.autoSequence)) {
-            if ($e -is [string]) { $configured[$e] = [pscustomobject]@{ target = $e; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false } }
-            elseif ($e.target)   { $configured[$e.target] = [pscustomobject]@{ target = $e.target; model = $e.model; effort = $e.effort; note = $e.note; allowNoCommits = [bool]$e.allowNoCommits; checkpoint = [bool]$e.checkpoint } }
+            if ($e -is [string]) { $configured[$e] = [pscustomobject]@{ target = $e; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false; review = $null } }
+            elseif ($e.target)   { $configured[$e.target] = [pscustomobject]@{ target = $e.target; model = $e.model; effort = $e.effort; note = $e.note; allowNoCommits = [bool]$e.allowNoCommits; checkpoint = [bool]$e.checkpoint; review = (ConvertTo-OptionalBool $e 'review') } }
         }
 
         return @($flat | ForEach-Object {
             $name = $_.Trim()
             if ($configured.ContainsKey($name)) { $configured[$name] }
-            else { [pscustomobject]@{ target = $name; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false } }
+            else { [pscustomobject]@{ target = $name; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false; review = $null } }
         })
     }
 
@@ -2380,7 +2556,7 @@ function Get-AutoSequence {
     $i = -1
     return @($Config.autoSequence | ForEach-Object {
         $i++
-        if ($_ -is [string]) { [pscustomobject]@{ target = $_; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false } }
+        if ($_ -is [string]) { [pscustomobject]@{ target = $_; model = $null; effort = $null; note = $null; allowNoCommits = $false; checkpoint = $false; review = $null } }
         else {
             # Say which entry is wrong and what it is missing. Without this the run
             # walks on with an empty target and dies several frames later on
@@ -2392,7 +2568,7 @@ function Get-AutoSequence {
                        'Each entry is either a bare string ("4.2") or an object with a ' +
                        '"target" key ({ "target": "4.2", "note": "..." }).')
             }
-            [pscustomobject]@{ target = $_.target; model = $_.model; effort = $_.effort; note = $_.note; allowNoCommits = [bool]$_.allowNoCommits; checkpoint = [bool]$_.checkpoint }
+            [pscustomobject]@{ target = $_.target; model = $_.model; effort = $_.effort; note = $_.note; allowNoCommits = [bool]$_.allowNoCommits; checkpoint = [bool]$_.checkpoint; review = (ConvertTo-OptionalBool $_ 'review') }
         }
     })
 }
