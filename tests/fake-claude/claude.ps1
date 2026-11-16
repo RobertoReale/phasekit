@@ -29,6 +29,12 @@ $sid = if ($kind -eq 'resume') { Get-Arg '--resume' } else { [guid]::NewGuid().T
 $acct = if ($env:CLAUDE_CONFIG_DIR) { Split-Path -Leaf $env:CLAUDE_CONFIG_DIR } else { '.claude' }
 Add-Content -LiteralPath (Join-Path $dir 'accounts.txt') -Value $acct
 $spentHere = $env:PK_CLAUDE_LIMIT_ACCOUNTS -and (@($env:PK_CLAUDE_LIMIT_ACCOUNTS -split ',') -contains $acct)
+# PK_CLAUDE_AUTH_ACCOUNTS: those accounts' login has expired, as the CLI reports it.
+if ($env:PK_CLAUDE_AUTH_ACCOUNTS -and (@($env:PK_CLAUDE_AUTH_ACCOUNTS -split ',') -contains $acct) -and $kind -ne 'review') {
+    '{"type":"system","subtype":"init","session_id":"' + $sid + '","cwd":"."}'
+    '{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed","type":"result","session_id":"' + $sid + '"}'
+    exit 1
+}
 if (($env:PK_CLAUDE_LIMIT -eq '1' -or $spentHere) -and $kind -ne 'review') {
     '{"type":"system","subtype":"init","session_id":"' + $sid + '","cwd":"."}'
     # The real CLI prints this on stderr, which the runner's 2>&1 captures; a script's

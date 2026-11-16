@@ -140,7 +140,7 @@ try {
     function Invoke-Sequence($P, [hashtable] $Env) {
         # The accounts are the test's own (none, unless it makes some), never the machine's.
         $vars = @{ PK_FAKE_DIR = $P.fake; PK_REVIEWS = ''; PK_AGY_REVIEWS = ''; PK_FIX_AT = ''; PK_AGY_LIMIT = ''; PK_CLAUDE_LIMIT = ''
-                   PK_CLAUDE_LIMIT_ACCOUNTS = ''; PHASEKIT_HOME = (Join-Path $P.repo 'home')
+                   PK_CLAUDE_LIMIT_ACCOUNTS = ''; PK_CLAUDE_AUTH_ACCOUNTS = ''; PHASEKIT_HOME = (Join-Path $P.repo 'home')
                    PHASEKIT_CLAUDE_HOME = (Join-Path $P.repo 'home' 'accounts'); CLAUDE_CONFIG_DIR = '' }
         foreach ($k in $Env.Keys) { $vars[$k] = $Env[$k] }
         $saved = @{}
@@ -206,6 +206,24 @@ try {
     Add-Accounts $p
     $r = Invoke-Sequence $p @{ PK_CLAUDE_LIMIT_ACCOUNTS = '.claude' }
     Test-Case 'without switchAccounts the accounts are left alone' ($r.calls -join ';') 'run sonnet medium;agy-fresh claude-opus-fake '
+
+    # 2e. What happened on 2026-11-16: one account spent, the other's login expired. The
+    #     expired login is said as such, written down, and the fallback carries on.
+    $p = New-Project 'expired-login' @{ switchAccounts = $true; limitFallback = @('agy:claude-opus-fake') } -Good
+    Add-Accounts $p
+    $r = Invoke-Sequence $p @{ PK_CLAUDE_LIMIT_ACCOUNTS = '.claude'; PK_CLAUDE_AUTH_ACCOUNTS = '.claude-b' }
+    Test-Case 'a spent account, then an expired login: the fallback' "$($r.code)|$($r.merged)" '0|True'
+    Test-Case 'one try per account, then agy' ($r.calls -join ';') 'run sonnet medium;resume sonnet medium;agy-fresh claude-opus-fake '
+    Test-Case 'the expired login is named, not called a limit' ($r.out -match 'login has expired') 'True'
+    Test-Case 'and kept away from the next switch' ($r.limits -match '"b"') 'True'
+
+    # 2f. An expired login with nowhere to go stops at once, saying how to log in - no
+    #     retries, no wait for a reset that would not help.
+    $p = New-Project 'login-only' @{} -Good
+    Add-Accounts $p
+    $r = Invoke-Sequence $p @{ PK_CLAUDE_AUTH_ACCOUNTS = '.claude' }
+    Test-Case 'an expired login alone stops the run' ($r.calls -join ';') 'run sonnet medium'
+    Test-Case 'and says how to log in' ($r.out -match '/login') 'True'
 
     # 3. Two reviewers of different families: one passes, one rejects - rejected; fixed;
     #    both pass - merged.

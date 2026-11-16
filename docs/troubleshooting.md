@@ -387,6 +387,13 @@ minutes earlier. Only when every account is spent does the run move on to `limit
 or, without one, wait for the reset. Off by default. Whether more than one account fits
 your provider's terms is yours to check.
 
+**A login that expired** ("Failed to authenticate: OAuth session expired") is not a usage
+limit: no reset brings it back. phasekit tells the two apart, reading only what the latest
+attempt wrote. The account is set aside for six hours, the run moves to another account or to
+`limitFallback` as above, and with neither it stops at once with the command to log in again:
+`CLAUDE_CONFIG_DIR` pointing at the account, `claude`, then `/login`. Choosing the account by
+hand afterwards (`phasekit account <name>`) lifts the six hours.
+
 ## `auto` stopped on a target it had just merged
 
 `auto-stopped.txt` says the merge preconditions failed, but `git log` on the main

@@ -988,13 +988,19 @@ What to do: $Next
         # what happened once and leaves it said.
         $script:AllowLimitFallback = $true
         $script:LimitFallbackPending = $false
+        $script:LimitFallbackList = $null
         try {
             $exit = @(Invoke-Run -Mode $mode)[-1]
 
             # A spent allowance with limitFallback set: the run returned instead of waiting,
             # and the target goes on, on the next model, in a fresh session over the branch.
             # When the list runs out, the last session waits for its reset as always.
-            $fallbacks = @(@($cfg.limitFallback) | ForEach-Object { ConvertFrom-ModelSpec $_ })
+            # The list comes from the run that decided to fall back: this sequence's own copy
+            # of the config was read when it started, possibly from another branch's
+            # phasekit.json. Measured 2026-11-16: a runner restarted on a task branch made
+            # before limitFallback was added read an empty list, and stopped.
+            $fbList = if ($null -ne $script:LimitFallbackList) { $script:LimitFallbackList } else { $cfg.limitFallback }
+            $fallbacks = @(@($fbList) | Where-Object { $_ } | ForEach-Object { ConvertFrom-ModelSpec $_ })
             $fb = 0
             while ($script:LimitFallbackPending) {
                 $script:LimitFallbackPending = $false
@@ -1024,6 +1030,17 @@ What to do: $Next
         }
         finally { $script:AllowLimitFallback = $false }
         Write-AutoProgress "$target : the agent ended with exit $exit"
+
+        # An expired login is a person's to fix: a resume, a reply or a fix round would
+        # each meet the same refusal. Say so now, in words that say what to do.
+        if ($exit -ne 0 -and $script:LastStopReason -eq 'auth') {
+            $who = Get-ActiveAccount
+            Stop-Auto -Target $target -Why "the Claude login of account $($who.name) has expired" `
+                -Next ("Log in again:  `$env:CLAUDE_CONFIG_DIR = '$($who.dir)'; claude   then /login`n" +
+                       "  (or switch to an account that works:  phasekit account <name>), then  phasekit resume.`n" +
+                       "  Nothing of $target is lost: its branch and its conversation are kept.")
+            return 1
+        }
 
         # Usage limits are already handled inside the run. What reaches here is a question,
         # a crash, or a dropped connection. Only the last of those is worth retrying: a
@@ -2383,6 +2400,11 @@ function Invoke-Account {
     #>
     if ($Phase) {
         $picked = Set-ActiveAccount -Name $Phase
+        # Choosing an account by hand vouches for it: a login renewed, or a limit known to
+        # be over. Its record no longer keeps automatic switches away from it.
+        if ((Read-AccountLimits).ContainsKey($picked.name)) {
+            Set-AccountLimited -Name $picked.name -Until (Get-Date).AddMinutes(-1)
+        }
         Write-Host ''
         Write-Host "  Runs now use account $($picked.name)  ($($picked.dir))" -ForegroundColor Green
         if ($IsWindows -and -not (Test-Path (Join-Path $picked.dir '.credentials.json'))) {
