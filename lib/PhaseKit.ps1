@@ -129,6 +129,10 @@ function Get-PhaseKitConfig {
         # Models to hand a target to when its own runs out of usage allowance, in order,
         # instead of waiting for the reset. Empty: wait, as always.
         limitFallback    = @()
+        # When a Claude account's allowance runs out, carry on at once under another
+        # account on this machine that is not known to be spent (see Select-FreeAccount),
+        # before limitFallback and before waiting. Off: switching stays a person's command.
+        switchAccounts   = $false
         # Every reviewer; reviewModel is the first. More than one, ideally of different
         # families, and a target passes only if none of them rejects it.
         reviewModels     = @('opus')
@@ -214,7 +218,7 @@ function Get-PhaseKitConfig {
     if ($raw.PSObject.Properties.Name -contains 'planSections' -and $null -ne $raw.planSections) {
         $cfg.planSections = @($raw.planSections | ForEach-Object { ([string] $_).Trim() } | Where-Object { $_ })
     }
-    foreach ($k in @('skipVerifiedGates', 'handoff', 'lessons', 'review', 'lintBeforeAuto', 'agyCredits', 'autoTier')) {
+    foreach ($k in @('skipVerifiedGates', 'handoff', 'lessons', 'review', 'lintBeforeAuto', 'agyCredits', 'autoTier', 'switchAccounts')) {
         if ($raw.PSObject.Properties.Name -contains $k) { $cfg[$k] = [bool] $raw.$k }
     }
     if ($raw.usageLimit) {
@@ -1055,13 +1059,20 @@ function Get-AccountStateFile {
     return (Join-Path $dir 'account')
 }
 
+function Get-AccountsHome {
+    # Where the .claude* directories are. PHASEKIT_CLAUDE_HOME exists for the tests, which
+    # drive a whole sequence in a child process against accounts of their own.
+    if ($env:PHASEKIT_CLAUDE_HOME) { return $env:PHASEKIT_CLAUDE_HOME }
+    return $HOME
+}
+
 function Get-ClaudeAccounts {
     <#
         Every `.claude` or `.claude-<name>` directory in the home directory that looks
         like an account: it holds a login or has run a conversation. `.claude` is called
         `main`, `.claude-b` is called `b`.
     #>
-    param([string] $HomeDir = $HOME)
+    param([string] $HomeDir = (Get-AccountsHome))
 
     $found = foreach ($d in @(Get-ChildItem -LiteralPath $HomeDir -Directory -Force -Filter '.claude*' -ErrorAction SilentlyContinue)) {
         if (-not ($d.Name -match '^\.claude(?:-(?<name>[\w.-]+))?$')) { continue }
@@ -1090,7 +1101,7 @@ function Get-ActiveAccount {
         account is imposed on the child process, so a machine that never ran the command
         behaves exactly as before it existed.
     #>
-    param([string] $HomeDir = $HOME)
+    param([string] $HomeDir = (Get-AccountsHome))
 
     $accounts = @(Get-ClaudeAccounts -HomeDir $HomeDir)
     $name = Get-ChosenAccountName
@@ -1111,7 +1122,7 @@ function Set-ActiveAccount {
     #>
     param(
         [Parameter(Mandatory)] [string] $Name,
-        [string] $HomeDir = $HOME
+        [string] $HomeDir = (Get-AccountsHome)
     )
 
     $accounts = @(Get-ClaudeAccounts -HomeDir $HomeDir)
@@ -1170,6 +1181,72 @@ function Copy-SessionToAccount {
         }
     }
     return $false
+}
+
+# Which accounts are known to be spent, and until when. Written whenever a run meets a
+# usage limit, read before switching: "the next account" is only worth switching to if it
+# is not the one that ran out ten minutes ago. Without the record, two spent accounts
+# hand the target back and forth, and limitFallback is never reached.
+
+function Get-AccountLimitsFile {
+    return (Join-Path (Split-Path -Parent (Get-AccountStateFile)) 'account-limits.json')
+}
+
+function Read-AccountLimits {
+    <# name -> the time its allowance is expected back. Unreadable or missing: none known. #>
+    $limits = @{}
+    $f = Get-AccountLimitsFile
+    if (-not (Test-Path $f)) { return $limits }
+    try {
+        $raw = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+        foreach ($p in $raw.PSObject.Properties) {
+            $until = [datetime]::MinValue
+            if ([datetime]::TryParse([string] $p.Value, [cultureinfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind, [ref] $until)) {
+                $limits[$p.Name] = $until.ToLocalTime()
+            }
+        }
+    }
+    catch { }
+    return $limits
+}
+
+function Set-AccountLimited {
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [Parameter(Mandatory)] [datetime] $Until
+    )
+    $limits = Read-AccountLimits
+    $limits[$Name] = $Until
+    $out = [ordered]@{}
+    foreach ($k in @($limits.Keys | Sort-Object)) { $out[$k] = $limits[$k].ToUniversalTime().ToString('o') }
+    $f = Get-AccountLimitsFile
+    New-Item -ItemType Directory -Path (Split-Path -Parent $f) -Force | Out-Null
+    Set-Content -LiteralPath $f -Value ($out | ConvertTo-Json)
+}
+
+function Select-FreeAccount {
+    <#
+        The next account after -Exclude, in the order `phasekit account` lists them, whose
+        allowance is not known to be spent. $null when there is none: every other account
+        ran out and has not come back yet.
+    #>
+    param(
+        [string] $Exclude,
+        [string] $HomeDir = (Get-AccountsHome)
+    )
+    $accounts = @(Get-ClaudeAccounts -HomeDir $HomeDir)
+    if ($accounts.Count -lt 2) { return $null }
+    $limits = Read-AccountLimits
+    $now = Get-Date
+    $start = [array]::IndexOf(@($accounts.name), $Exclude)
+    for ($i = 1; $i -le $accounts.Count; $i++) {
+        $a = $accounts[($start + $i + $accounts.Count) % $accounts.Count]
+        if ($a.name -eq $Exclude) { continue }
+        if ($limits.ContainsKey($a.name) -and $limits[$a.name] -gt $now) { continue }
+        return $a
+    }
+    return $null
 }
 
 # ---------------------------------------------------------------------------
@@ -2216,6 +2293,8 @@ function Invoke-Agent {
     Reset-StreamClock
     # Claude Code or Antigravity, decided by the model or by the conversation resumed.
     $cmd = ConvertTo-AgentCommand -ClaudeArgs $ClaudeArgs -AllowCredits ([bool] $script:AgyCredits)
+    # Whose allowance a limit belongs to: a Claude account's, or Antigravity's.
+    $script:LastAgentBackend = $cmd.backend
     Write-Host ''
     Write-Host ('-' * 72) -ForegroundColor DarkGray
     $shown = if ($cmd.backend -eq 'agy') { 'agy' } else { 'claude' }
@@ -2295,6 +2374,7 @@ function Invoke-AgentWithLimitRetry {
 
     $attempt = 0
     $restarts = 0
+    $switches = 0
     while ($exit -ne 0 -and $attempt -lt $Config.maxRetries) {
 
         # -Tail and -Raw are mutually exclusive on Get-Content, so join the lines by hand.
@@ -2314,6 +2394,35 @@ function Invoke-AgentWithLimitRetry {
             Write-Host ''
             Write-Host "Full log: $LogPath" -ForegroundColor Red
             return $exit
+        }
+
+        # A Claude account's allowance ran out. Write it down, so no later switch comes back
+        # to it before it resets; then, with "switchAccounts", carry on at once under an
+        # account that is not spent, in the same conversation. That comes before
+        # limitFallback: the same model, the same conversation, nothing to hand over.
+        if ($reason -eq 'limit' -and $script:LastAgentBackend -eq 'claude') {
+            $spent = Get-ActiveAccount
+            $announced = Get-ResetWaitMinutes -LogTail $signal
+            $until = (Get-Date).AddMinutes($(if ($announced) { $announced } else { $Config.waitMinutes }))
+            if ($spent.name -and $spent.name -ne '(environment)') {
+                try { Set-AccountLimited -Name $spent.name -Until $until } catch { }
+            }
+            $free = if ($Config.switchAccounts -and $switches -lt 2 * @(Get-ClaudeAccounts).Count) {
+                Select-FreeAccount -Exclude $spent.name
+            }
+            if ($free) {
+                $switches++
+                Set-ActiveAccount -Name $free.name | Out-Null
+                $note = "$script:NoteMarker Usage limit reached on account $($spent.name) (back ~$($until.ToString('HH:mm'))). " +
+                        "Carrying on now under account $($free.name), in the same conversation."
+                Write-Host ''
+                Write-Host $note -ForegroundColor Yellow
+                Add-Content -LiteralPath $LogPath -Value ''
+                Add-Content -LiteralPath $LogPath -Value $note
+                $resume = (Get-ResumeArgs -SessionId $script:SessionId) + @('-p', $script:ContinuePrompt) + $Common
+                $exit = Invoke-Agent -ClaudeArgs $resume -LogPath $LogPath -SessionFile $SessionFile
+                continue
+            }
         }
 
         # A spent allowance with somewhere else to go: `phasekit auto` hands the target to

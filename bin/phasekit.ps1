@@ -2396,15 +2396,19 @@ function Invoke-Account {
 
     $active = Get-ActiveAccount
     $accounts = @(Get-ClaudeAccounts)
+    $limits = Read-AccountLimits
     Write-Host ''
-    if ($accounts.Count -eq 0) { Write-Host "  No Claude account found in $HOME (.claude, .claude-<name>)." -ForegroundColor Yellow }
+    if ($accounts.Count -eq 0) { Write-Host "  No Claude account found in $(Get-AccountsHome) (.claude, .claude-<name>)." -ForegroundColor Yellow }
     foreach ($a in $accounts) {
         $isActive = $a.dir.TrimEnd('\', '/') -ieq $active.dir.TrimEnd('\', '/')
         $mark = if ($isActive) { '*' } else { ' ' }
         $how = if (-not $isActive) { '' }
                elseif ($active.chosen) { '   <- runs use this (chosen with phasekit account)' }
                else { '   <- runs use this (CLAUDE_CONFIG_DIR)' }
-        Write-Host ("  {0} {1,-8} {2}{3}" -f $mark, $a.name, $a.dir, $how) -ForegroundColor $(if ($isActive) { 'Green' } else { 'White' })
+        $spent = if ($limits.ContainsKey($a.name) -and $limits[$a.name] -gt (Get-Date)) {
+            "   (allowance spent, back ~$($limits[$a.name].ToString('ddd HH:mm')))"
+        } else { '' }
+        Write-Host ("  {0} {1,-8} {2}{3}{4}" -f $mark, $a.name, $a.dir, $how, $spent) -ForegroundColor $(if ($isActive) { 'Green' } else { 'White' })
     }
     Write-Host ''
     Write-Host '  Switch:  phasekit account <name>    or    phasekit account next' -ForegroundColor DarkGray
@@ -2471,8 +2475,9 @@ switch ($Command.ToLowerInvariant()) {
         }
         Write-Host ''
         $reviewers = (@($cfg.reviewModels) | ForEach-Object { Format-ModelLabel -Model $_ -Effort $cfg.reviewEffort }) -join ', '
-        Write-Host ("  review: {0}   fixRounds: {1}   limitFallback: {2}" -f $(if ($cfg.review) { $reviewers } else { 'off' }),
+        Write-Host ("  review: {0}   fixRounds: {1}   switchAccounts: {2}   limitFallback: {3}" -f $(if ($cfg.review) { $reviewers } else { 'off' }),
             $(if (@($cfg.fixRounds).Count) { $cfg.fixRounds -join ', ' } else { 'none' }),
+            $(if ($cfg.switchAccounts) { 'on' } else { 'off' }),
             $(if (@($cfg.limitFallback).Count) { $cfg.limitFallback -join ', ' } else { 'none (wait for the reset)' })) -ForegroundColor DarkGray
         Write-Host ''
         exit 0

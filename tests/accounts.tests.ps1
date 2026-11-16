@@ -87,6 +87,23 @@ try {
     $started = Get-Date
     Wait-UntilDeadline -Deadline (Get-Date).AddSeconds(2) -Account 'b'
     Test-Case 'the same account waits the deadline out' (((Get-Date) - $started).TotalSeconds -ge 1.5) $true
+
+    Write-Host 'which account is free'
+    Test-Case 'nothing known spent: the next one' (Select-FreeAccount -Exclude 'main' -HomeDir $fakeHome).name 'b'
+    Test-Case 'and round from the last' (Select-FreeAccount -Exclude 'b' -HomeDir $fakeHome).name 'main'
+    $until = (Get-Date).AddMinutes(90)
+    Set-AccountLimited -Name 'b' -Until $until
+    $read = Read-AccountLimits
+    Test-Case 'a spent account is written down' ([Math]::Abs(($read['b'] - $until).TotalSeconds) -lt 1) $true
+    Test-Case 'a spent account is skipped' ($null -eq (Select-FreeAccount -Exclude 'main' -HomeDir $fakeHome)) $true
+    Set-AccountLimited -Name 'b' -Until (Get-Date).AddMinutes(-1)
+    Test-Case 'one whose reset has passed is free again' (Select-FreeAccount -Exclude 'main' -HomeDir $fakeHome).name 'b'
+    Set-AccountLimited -Name 'main' -Until $until
+    Test-Case 'the record keeps every account' (@((Read-AccountLimits).Keys | Sort-Object) -join ',') 'b,main'
+    Set-Content -LiteralPath (Get-AccountLimitsFile) -Value 'not json'
+    Test-Case 'an unreadable record means nothing known' ((Read-AccountLimits).Count) 0
+    Test-Case 'a machine with one account has nowhere to go' `
+        ($null -eq (Select-FreeAccount -Exclude 'main' -HomeDir (Join-Path $root 'nobody'))) $true
 }
 finally {
     $env:PHASEKIT_HOME = $savedHome
