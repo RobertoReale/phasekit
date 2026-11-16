@@ -1482,6 +1482,11 @@ function Wait-UntilDeadline {
 
 $script:LimitPattern = 'usage limit|session limit|weekly limit|rate limit|resets at|resets \d|\b429\b'
 
+# What Claude Code says when the account's login is gone. Measured 2026-11-16: an account
+# unused for a while answered every call with the first of these, and the run read it as a
+# usage limit because an older limit message was still in the log's tail.
+$script:AuthPattern = 'Failed to authenticate|OAuth (session|token) (has )?expired|authentication_failed|Invalid API key|Please run /login|Not logged in'
+
 # phasekit writes its own notes into the agent's log so `logs -Follow` shows a run that
 # is waiting rather than a log that simply stopped. Those notes say "usage limit" — so
 # they must be recognisable, or the next retry reads the previous retry's note and
@@ -1583,11 +1588,33 @@ function Get-LimitSignal {
     return ($parts -join "`n")
 }
 
+function Get-LastAttemptTail {
+    <#
+        The lines the latest attempt wrote. Every retry, switch and wait appends its note
+        to the same log before the next attempt runs, so what follows the last note is the
+        latest attempt alone. Read whole, the tail mixed attempts: on 2026-11-16 a login
+        failure under one account came right after a usage limit under another, and the
+        older limit message decided the newer failure's reason.
+    #>
+    param([AllowEmptyCollection()] [string[]] $Lines = @())
+
+    $last = -1
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        if (([string] $Lines[$i]).TrimStart().StartsWith($script:NoteMarker)) { $last = $i }
+    }
+    if ($last -ge 0 -and $last -lt $Lines.Count - 1) {
+        return (@($Lines[($last + 1)..($Lines.Count - 1)]) -join "`n")
+    }
+    return ($Lines -join "`n")
+}
+
 function Get-StopReason {
     <#
         Why the agent stopped, in one word, read from the tail of its own log. The retry
         loop and the tests both call this, so what the tests assert is what actually runs.
 
+            auth       the account's login expired or is missing. Another account or
+                       limitFallback can carry on; otherwise a person has to log in
             limit      the subscription allowance ran out. Wait it out and resume the
                        same conversation - nothing is lost, the work is mid-thought
             transient  the link dropped. Back off briefly and resume
@@ -1604,7 +1631,11 @@ function Get-StopReason {
     #>
     param([Parameter(Mandatory)] [AllowEmptyString()] [string] $LogTail)
 
-    if ((Get-LimitSignal -LogTail $LogTail -RuntimeOnly) -match $script:ContextPattern) { return 'context' }
+    $runtime = Get-LimitSignal -LogTail $LogTail -RuntimeOnly
+    if ($runtime -match $script:ContextPattern) { return 'context' }
+    # A login that expired is not a spent allowance: waiting for a reset changes nothing,
+    # and another account (or another CLI) can carry on. Decided on the runtime's word only.
+    if ($runtime -match $script:AuthPattern) { return 'auth' }
 
     $signal = Get-LimitSignal -LogTail $LogTail
     if ($signal -match $script:LimitPattern) { return 'limit' }
@@ -2370,6 +2401,7 @@ function Invoke-AgentWithLimitRetry {
     )
 
     $script:AgyCredits = [bool] $Config.agyCredits
+    $script:LastStopReason = ''
     $exit = Invoke-Agent -ClaudeArgs $FirstArgs -LogPath $LogPath -SessionFile $SessionFile
 
     $attempt = 0
@@ -2378,7 +2410,7 @@ function Invoke-AgentWithLimitRetry {
     while ($exit -ne 0 -and $attempt -lt $Config.maxRetries) {
 
         # -Tail and -Raw are mutually exclusive on Get-Content, so join the lines by hand.
-        $tail = if (Test-Path $LogPath) { (Get-Content -LiteralPath $LogPath -Tail 40) -join "`n" } else { '' }
+        $tail = if (Test-Path $LogPath) { Get-LastAttemptTail -Lines @(Get-Content -LiteralPath $LogPath -Tail 40) } else { '' }
         $signal = Get-LimitSignal -LogTail $tail
         $reason = Get-StopReason -LogTail $tail
 
@@ -2396,14 +2428,20 @@ function Invoke-AgentWithLimitRetry {
             return $exit
         }
 
-        # A Claude account's allowance ran out. Write it down, so no later switch comes back
-        # to it before it resets; then, with "switchAccounts", carry on at once under an
-        # account that is not spent, in the same conversation. That comes before
+        # A Claude account's allowance ran out, or its login did. Write it down, so no later
+        # switch comes back to it too soon; then, with "switchAccounts", carry on at once
+        # under an account that is not spent, in the same conversation. That comes before
         # limitFallback: the same model, the same conversation, nothing to hand over.
-        if ($reason -eq 'limit' -and $script:LastAgentBackend -eq 'claude') {
+        if ($reason -in @('limit', 'auth') -and $script:LastAgentBackend -eq 'claude') {
             $spent = Get-ActiveAccount
-            $announced = Get-ResetWaitMinutes -LogTail $signal
-            $until = (Get-Date).AddMinutes($(if ($announced) { $announced } else { $Config.waitMinutes }))
+            $until = if ($reason -eq 'auth') {
+                # Until someone logs in again, which phasekit cannot see; `phasekit account
+                # <name>` by hand clears it sooner.
+                (Get-Date).AddHours(6)
+            } else {
+                $announced = Get-ResetWaitMinutes -LogTail $signal
+                (Get-Date).AddMinutes($(if ($announced) { $announced } else { $Config.waitMinutes }))
+            }
             if ($spent.name -and $spent.name -ne '(environment)') {
                 try { Set-AccountLimited -Name $spent.name -Until $until } catch { }
             }
@@ -2413,8 +2451,9 @@ function Invoke-AgentWithLimitRetry {
             if ($free) {
                 $switches++
                 Set-ActiveAccount -Name $free.name | Out-Null
-                $note = "$script:NoteMarker Usage limit reached on account $($spent.name) (back ~$($until.ToString('HH:mm'))). " +
-                        "Carrying on now under account $($free.name), in the same conversation."
+                $what = if ($reason -eq 'auth') { "The login of account $($spent.name) has expired (log in again to use it)." }
+                        else { "Usage limit reached on account $($spent.name) (back ~$($until.ToString('HH:mm')))." }
+                $note = "$script:NoteMarker $what Carrying on now under account $($free.name), in the same conversation."
                 Write-Host ''
                 Write-Host $note -ForegroundColor Yellow
                 Add-Content -LiteralPath $LogPath -Value ''
@@ -2428,13 +2467,30 @@ function Invoke-AgentWithLimitRetry {
         # A spent allowance with somewhere else to go: `phasekit auto` hands the target to
         # the next model in limitFallback (another CLI, another quota) instead of waiting.
         # Only the sequence asks for this; a run by hand waits as it always did.
-        if ($reason -eq 'limit' -and $script:AllowLimitFallback -and @($Config.limitFallback).Count -gt 0) {
-            $note = "$script:NoteMarker Usage limit reached. Handing the target to the next model in limitFallback instead of waiting."
+        # A login that expired is the same for that: another CLI has its own.
+        if ($reason -in @('limit', 'auth') -and $script:AllowLimitFallback -and @($Config.limitFallback).Count -gt 0) {
+            $why = if ($reason -eq 'auth') { 'The account''s login has expired.' } else { 'Usage limit reached.' }
+            $note = "$script:NoteMarker $why Handing the target to the next model in limitFallback instead of waiting."
             Write-Host ''
             Write-Host $note -ForegroundColor Yellow
             Add-Content -LiteralPath $LogPath -Value ''
             Add-Content -LiteralPath $LogPath -Value $note
             $script:LimitFallbackPending = $true
+            # The list as this run's config has it: the sequence may have read its own
+            # copy before phasekit.json changed on the branch this target runs on.
+            $script:LimitFallbackList = @($Config.limitFallback)
+            return $exit
+        }
+
+        if ($reason -eq 'auth') {
+            $who = (Get-ActiveAccount).name
+            Write-Host ''
+            Write-Host "The Claude login has expired (account $who). Waiting would change nothing." -ForegroundColor Red
+            Write-Host 'Log in again, then carry on:' -ForegroundColor Red
+            Write-Host "    `$env:CLAUDE_CONFIG_DIR = '$((Get-ActiveAccount).dir)'; claude      then /login" -ForegroundColor Cyan
+            Write-Host "    phasekit continue $Phase" -ForegroundColor Cyan
+            Write-Host "Full log: $LogPath" -ForegroundColor Red
+            $script:LastStopReason = 'auth'
             return $exit
         }
 

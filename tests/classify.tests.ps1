@@ -88,6 +88,31 @@ Test-Case 'the agent merely remarking on its context' `
 Test-Case 'the CLI saying it outside the JSON stream' `
     'API Error: prompt is too long: 204000 tokens > 200000 maximum' 'context'
 
+# 2026-11-16: an account unused for a while answered every call like this. It is not a
+# spent allowance - no reset brings it back - so it must not be read as one.
+$authResult = '{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed","type":"result"}'
+Test-Case 'an expired login' $authResult 'auth'
+Test-Case 'the agent talking about logins is not one' `
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"the test checks that Failed to authenticate is shown"}]}}' 'stop'
+
+Write-Host 'only the latest attempt speaks'
+
+# The same log holds every attempt; phasekit's note sits between them. The limit that
+# ended the attempt under one account must not decide why the next one, under another,
+# ended. That mix-up handed a login failure to limitFallback as a usage limit.
+$mixed = @(
+    '{"type":"result","is_error":true,"result":"You''ve hit your limit · resets 1:30pm"}'
+    ''
+    '[phasekit] Usage limit reached on account b (back ~13:32). Carrying on now under account main, in the same conversation.'
+    $authResult
+)
+$got = Get-StopReason -LogTail (Get-LastAttemptTail -Lines $mixed)
+$ok = $got -eq 'auth'; if (-not $ok) { $fails++ }
+Write-Host ("  {0}  {1,-52} -> {2,-9} (expected auth)" -f $(if ($ok) { 'ok  ' } else { 'FAIL' }), 'a login failure after a limit, in one log', $got) -ForegroundColor $(if ($ok) { 'Green' } else { 'Red' })
+$got = Get-StopReason -LogTail (Get-LastAttemptTail -Lines @($mixed[0]))
+$ok = $got -eq 'limit'; if (-not $ok) { $fails++ }
+Write-Host ("  {0}  {1,-52} -> {2,-9} (expected limit)" -f $(if ($ok) { 'ok  ' } else { 'FAIL' }), 'a log with one attempt is read whole', $got) -ForegroundColor $(if ($ok) { 'Green' } else { 'Red' })
+
 Write-Host ''
 if ($fails) {
     Write-Host "$fails failed." -ForegroundColor Red
