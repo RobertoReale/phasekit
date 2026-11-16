@@ -138,7 +138,10 @@ try {
         return [pscustomobject]@{ repo = $repo; fake = $fake }
     }
     function Invoke-Sequence($P, [hashtable] $Env) {
-        $vars = @{ PK_FAKE_DIR = $P.fake; PK_REVIEWS = ''; PK_AGY_REVIEWS = ''; PK_FIX_AT = ''; PK_AGY_LIMIT = ''; PK_CLAUDE_LIMIT = ''; PHASEKIT_HOME = (Join-Path $P.repo 'home') }
+        # The accounts are the test's own (none, unless it makes some), never the machine's.
+        $vars = @{ PK_FAKE_DIR = $P.fake; PK_REVIEWS = ''; PK_AGY_REVIEWS = ''; PK_FIX_AT = ''; PK_AGY_LIMIT = ''; PK_CLAUDE_LIMIT = ''
+                   PK_CLAUDE_LIMIT_ACCOUNTS = ''; PHASEKIT_HOME = (Join-Path $P.repo 'home')
+                   PHASEKIT_CLAUDE_HOME = (Join-Path $P.repo 'home' 'accounts'); CLAUDE_CONFIG_DIR = '' }
         foreach ($k in $Env.Keys) { $vars[$k] = $Env[$k] }
         $saved = @{}
         foreach ($k in $vars.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $vars[$k]) }
@@ -152,6 +155,16 @@ try {
             prompts = (& $read 'prompts.txt')
             merged = [bool] (git -C $P.repo log main --oneline | Select-String 'Merge branch')
             journal = $(if (Test-Path $journal) { Get-Content -LiteralPath $journal -Raw } else { '' })
+            accounts = @((& $read 'accounts.txt') -split "`r?`n" | Where-Object { $_ })
+            limits = $(if (Test-Path (Join-Path $P.repo 'home' 'account-limits.json')) { Get-Content -LiteralPath (Join-Path $P.repo 'home' 'account-limits.json') -Raw } else { '' })
+        }
+    }
+    function Add-Accounts($P) {
+        # Two signed-in Claude accounts on the test's "machine": main and b.
+        foreach ($n in @('.claude', '.claude-b')) {
+            $d = Join-Path $P.repo 'home' 'accounts' $n
+            New-Item -ItemType Directory -Path $d -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $d '.credentials.json') -Value '{}'
         }
     }
 
@@ -169,6 +182,30 @@ try {
     Test-Case 'claude first, then the fallback, fresh' ($r.calls -join ';') 'run sonnet medium;agy-fresh claude-opus-fake '
     Test-Case 'the new session is told why it takes over' ($r.prompts -match 'allowance ran out') 'True'
     Test-Case 'the journal says so' ($r.journal -match 'handing over to agy:claude-opus-fake') 'True'
+
+    # 2b. switchAccounts: the other Claude account first, in the same conversation.
+    $p = New-Project 'switch' @{ switchAccounts = $true; limitFallback = @('agy:claude-opus-fake') } -Good
+    Add-Accounts $p
+    $r = Invoke-Sequence $p @{ PK_CLAUDE_LIMIT_ACCOUNTS = '.claude' }
+    Test-Case 'a spent account hands over to the other one' "$($r.code)|$($r.merged)" '0|True'
+    Test-Case 'same model, same conversation, no fallback' ($r.calls -join ';') 'run sonnet medium;resume sonnet medium'
+    Test-Case 'main first, then b' ($r.accounts -join ',') '.claude,.claude-b'
+    Test-Case 'the spent account is written down' ($r.limits -match '"main"') 'True'
+    Test-Case 'and the run says why' ($r.out -match 'Carrying on now under account b') 'True'
+
+    # 2c. Every account spent: then, and only then, limitFallback.
+    $p = New-Project 'switch-all' @{ switchAccounts = $true; limitFallback = @('agy:claude-opus-fake') } -Good
+    Add-Accounts $p
+    $r = Invoke-Sequence $p @{ PK_CLAUDE_LIMIT_ACCOUNTS = '.claude,.claude-b' }
+    Test-Case 'all accounts spent: on to the fallback' "$($r.code)|$($r.merged)" '0|True'
+    Test-Case 'each account once, then agy' ($r.calls -join ';') 'run sonnet medium;resume sonnet medium;agy-fresh claude-opus-fake '
+    Test-Case 'both are written down' (($r.limits -match '"main"') -and ($r.limits -match '"b"')) 'True'
+
+    # 2d. switchAccounts off: two accounts, but straight to the fallback, as before.
+    $p = New-Project 'no-switch' @{ limitFallback = @('agy:claude-opus-fake') } -Good
+    Add-Accounts $p
+    $r = Invoke-Sequence $p @{ PK_CLAUDE_LIMIT_ACCOUNTS = '.claude' }
+    Test-Case 'without switchAccounts the accounts are left alone' ($r.calls -join ';') 'run sonnet medium;agy-fresh claude-opus-fake '
 
     # 3. Two reviewers of different families: one passes, one rejects - rejected; fixed;
     #    both pass - merged.

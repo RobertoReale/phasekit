@@ -785,7 +785,11 @@ the plan, using a model per **tier** that you set once:
   of allowance in the middle of the task, `phasekit auto` hands it, in a fresh session over
   the branch, to the next model in the list instead of waiting for the reset. Antigravity
   carries Claude models too, under its own quota, so `"agy:claude-opus-5-5-high"` continues
-  with the same family. When the list runs out, the last one waits, as before.
+  with the same family. When the list runs out, the last one waits, as before. With
+  `"switchAccounts": true` and more than one Claude account on the machine, the other
+  accounts come first: the same conversation carries on under one that is not spent, and
+  the fallback is used only once every account is
+  ([details](docs/troubleshooting.md#switching-account-instead-of-waiting)).
 
 What phasekit tells each family, from their own vendors' guidance and the measured
 differences between them:

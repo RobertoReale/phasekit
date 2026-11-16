@@ -377,6 +377,16 @@ The choice is stored in `~/.phasekit/account` and concerns phasekit only: intera
 sessions keep whatever `CLAUDE_CONFIG_DIR` says. An account must have been logged in once
 — start `claude` with `CLAUDE_CONFIG_DIR` pointing at it and run `/login`.
 
+**Switching on its own: `"switchAccounts": true`.** In `phasekit.json`, this makes the
+runner do the switch itself the moment an account's allowance runs out: it carries on at
+once under the next account that is not known to be spent, in the same conversation, on the
+same model. Every limit met is written to `~/.phasekit/account-limits.json` with the time
+the allowance is expected back (the reset the CLI announced, or `waitMinutes`), and
+`phasekit account` shows it, so a switch never goes back to an account that ran out ten
+minutes earlier. Only when every account is spent does the run move on to `limitFallback`,
+or, without one, wait for the reset. Off by default. Whether more than one account fits
+your provider's terms is yours to check.
+
 ## `auto` stopped on a target it had just merged
 
 `auto-stopped.txt` says the merge preconditions failed, but `git log` on the main
