@@ -62,6 +62,10 @@ function Get-PhaseKitConfig {
         # How many times one target may be picked up in a fresh conversation after its
         # context window filled. Small on purpose: see Invoke-AgentWithLimitRetry.
         maxContextRestarts = 2
+        # Minutes an agent may go without writing a line before it is taken for stuck,
+        # stopped and resumed in the same conversation. Long enough for a full gates run
+        # inside one tool call; 0 turns the guard off. See Invoke-Agent.
+        stallMinutes     = 45
         # Where the conversation is compacted, in tokens. Left to the CLI's own default a
         # long task grows its context monotonically - one measured target reached 542k and
         # spent its last 174 requests above 460k. Nothing in that tail was harder than the
@@ -161,6 +165,14 @@ function Get-PhaseKitConfig {
             throw "phasekit.json: `"verify`" is '$($raw.verify)'. It must be `"full`" or `"fast`"."
         }
         $cfg.verify = $v
+    }
+    if ($raw.PSObject.Properties.Name -contains 'stallMinutes' -and $null -ne $raw.stallMinutes) {
+        $n = 0.0
+        if (-not [double]::TryParse("$($raw.stallMinutes)", [Globalization.NumberStyles]::Float,
+                [cultureinfo]::InvariantCulture, [ref] $n) -or $n -lt 0) {
+            throw "phasekit.json: `"stallMinutes`" is '$($raw.stallMinutes)'. It must be a number of minutes, 0 to turn the guard off."
+        }
+        $cfg.stallMinutes = $n
     }
     foreach ($k in @('lessonsMax', 'lessonsMaxChars')) {
         if ($raw.PSObject.Properties.Name -contains $k -and $null -ne $raw.$k) {
@@ -2360,6 +2372,8 @@ function Invoke-Agent {
     }
     catch { $priorEncoding = $null }
 
+    $script:LastAgentStalled = $false
+    $guard = Start-StallGuard -LogPath $LogPath -Minutes $script:StallMinutes
     try {
         $exe = $cmd.exe
         $runArgs = @($cmd.args)
@@ -2368,12 +2382,89 @@ function Invoke-Agent {
             Add-LogLine -LogPath $LogPath -Line $line
             Write-StreamLine -Line $line -SessionFile $SessionFile
         }
-        return $LASTEXITCODE
+        $code = $LASTEXITCODE
+        if (Stop-StallGuard -Guard $guard) {
+            $script:LastAgentStalled = $true
+            $note = "$script:NoteMarker No output for $($script:StallMinutes) min: the agent was stuck and has been stopped."
+            Write-Host ''
+            Write-Host $note -ForegroundColor Yellow
+            Add-Content -LiteralPath $LogPath -Value ''
+            Add-Content -LiteralPath $LogPath -Value $note
+            if ($code -eq 0) { $code = 1 }
+        }
+        return $code
     }
     finally {
+        $null = Stop-StallGuard -Guard $guard
         $env:CLAUDE_CONFIG_DIR = $previousConfigDir
         if ($priorEncoding) { try { [Console]::OutputEncoding = $priorEncoding } catch { } }
     }
+}
+
+# How long an agent may stay silent. Set from the config by Invoke-AgentWithLimitRetry.
+$script:StallMinutes = 45
+
+# Antigravity's own words when its agent has finished but the CLI waits on background
+# commands that never end. Measured 2026-11-16: it sat like this for six and a half hours.
+$script:AgyIdlePattern = 'root agent idle; waiting for \d+ background task'
+
+function Start-StallGuard {
+    <#
+        Watches the agent's log from a thread of its own while the agent runs, and stops
+        the agent's process tree once the log has not grown for -Minutes. Nothing else
+        ends a run that hangs: the CLI is alive, so the watchdog sees a healthy runner, and
+        the pipeline reading its output waits forever. A long tool call - a full gates run
+        - writes nothing until it returns, which is why the default is generous. When the
+        log's last line is Antigravity saying it is idle and waiting on background tasks,
+        a fifth of the time is enough: that state does not end by itself.
+
+        Returns a handle for Stop-StallGuard, or $null when the guard is off.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $LogPath,
+        [double] $Minutes
+    )
+    if (-not ($Minutes -gt 0)) { return $null }
+
+    $state = [hashtable]::Synchronized(@{ stop = $false; stalled = $false })
+    $job = Start-ThreadJob -ArgumentList $PID, $LogPath, $Minutes, $state, ${function:Stop-ProcessTree}.ToString(), $script:AgyIdlePattern -ScriptBlock {
+        param($runnerPid, $log, $minutes, $state, $killDef, $idlePattern)
+        ${function:Stop-ProcessTree} = $killDef
+        $started = Get-Date
+        $poll = [Math]::Max(0.5, [Math]::Min(15, $minutes * 60 / 6))
+        while (-not $state.stop) {
+            Start-Sleep -Milliseconds ([int] ($poll * 1000))
+            if ($state.stop) { break }
+            $last = $started
+            $limit = $minutes
+            if (Test-Path -LiteralPath $log) {
+                $item = Get-Item -LiteralPath $log
+                if ($item.LastWriteTime -gt $last) { $last = $item.LastWriteTime }
+                $tail = @(Get-Content -LiteralPath $log -Tail 2 -ErrorAction SilentlyContinue) -join "`n"
+                if ($tail -match $idlePattern) { $limit = $minutes / 5 }
+            }
+            if (((Get-Date) - $last).TotalMinutes -lt $limit) { continue }
+            $state.stalled = $true
+            foreach ($child in @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Parent -and $_.Parent.Id -eq $runnerPid })) {
+                Stop-ProcessTree -Id $child.Id
+            }
+            break
+        }
+    }
+    return [pscustomobject]@{ job = $job; state = $state }
+}
+
+function Stop-StallGuard {
+    <# Ends the guard. Returns whether it had found the agent stuck and stopped it. #>
+    param($Guard)
+    if (-not $Guard) { return $false }
+    $Guard.state.stop = $true
+    if ($Guard.job) {
+        $null = $Guard.job | Wait-Job -Timeout 20
+        $Guard.job | Remove-Job -Force -ErrorAction SilentlyContinue
+        $Guard.job = $null
+    }
+    return [bool] $Guard.state.stalled
 }
 
 function Invoke-AgentWithLimitRetry {
@@ -2402,12 +2493,25 @@ function Invoke-AgentWithLimitRetry {
 
     $script:AgyCredits = [bool] $Config.agyCredits
     $script:LastStopReason = ''
+    if ($null -ne $Config.stallMinutes) { $script:StallMinutes = [double] $Config.stallMinutes }
     $exit = Invoke-Agent -ClaudeArgs $FirstArgs -LogPath $LogPath -SessionFile $SessionFile
 
     $attempt = 0
     $restarts = 0
     $switches = 0
     while ($exit -ne 0 -and $attempt -lt $Config.maxRetries) {
+
+        # Stopped by the stall guard: the conversation is intact up to where it hung, so
+        # resume it - a fresh process clears whatever the CLI was waiting on.
+        if ($script:LastAgentStalled) {
+            $attempt++
+            $note = "$script:NoteMarker Resuming the same conversation after the stall (attempt $attempt of $($Config.maxRetries))."
+            Write-Host $note -ForegroundColor Yellow
+            Add-Content -LiteralPath $LogPath -Value $note
+            $resume = (Get-ResumeArgs -SessionId $script:SessionId) + @('-p', $script:ContinuePrompt) + $Common
+            $exit = Invoke-Agent -ClaudeArgs $resume -LogPath $LogPath -SessionFile $SessionFile
+            continue
+        }
 
         # -Tail and -Raw are mutually exclusive on Get-Content, so join the lines by hand.
         $tail = if (Test-Path $LogPath) { Get-LastAttemptTail -Lines @(Get-Content -LiteralPath $LogPath -Tail 40) } else { '' }
