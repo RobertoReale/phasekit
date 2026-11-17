@@ -4499,7 +4499,8 @@ function Format-AccountLines {
             $r = if ($Readings.ContainsKey($n)) { $Readings[$n][$pair[0]] } else { $null }
             if ($r) {
                 $reset = (ConvertFrom-UnixSeconds $r.resetsAt).ToLocalTime().ToString($pair[2], $inv)
-                $parts += ('{0} {1:p0} (resets {2})' -f $pair[1], $r.pct, $reset)
+                # Not {0:p0}: some cultures write "100 %", and this is read, not localised.
+                $parts += ('{0} {1}% (resets {2})' -f $pair[1], [int] [math]::Round(100 * $r.pct), $reset)
             }
         }
         $text = if ($parts.Count) { $parts -join '   ' } else { 'no warning from Claude (it reports a share only near the limit)' }
