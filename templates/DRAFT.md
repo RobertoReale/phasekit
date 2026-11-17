@@ -47,7 +47,9 @@ already answers; state what you found instead. Cover, in roughly this order:
 - the order of the phases (writing-a-plan.md, "Order the phases by dependency");
 - decision gates: questions that only the person can answer, and which tasks wait on them;
 - how unattended it should be: "review" (an independent read-only reviewer before every
-  merge), "fixRounds" (for example ["same", "opus/xhigh"]), "verify" ("full" or "fast"),
+  merge), "fixRounds" (for example ["same", "opus/xhigh"]), "arbiter" (an independent
+  read-only model that answers a stopped task's technical questions and wakes the person
+  only for product choices, every answer written to decisions.md), "verify" ("full" or "fast"),
   which tasks deserve a higher effort and which are mechanical enough for a cheaper model,
   and whether some should run on Google Antigravity's models ("agy:<id>", from
   `agy models`, if the person has Antigravity) to use that quota too, a Gemini reviewer

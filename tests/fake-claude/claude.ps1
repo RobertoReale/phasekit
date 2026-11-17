@@ -16,7 +16,8 @@ $a = @($args)
 function Get-Arg([string] $Name) { $i = [array]::IndexOf($a, $Name); if ($i -ge 0 -and $i + 1 -lt $a.Count) { return [string] $a[$i + 1] } return '' }
 
 $dir = $env:PK_FAKE_DIR
-$kind = if ($a -contains '--allowedTools') { 'review' } elseif ($a -contains '--resume') { 'resume' } else { 'run' }
+$kind = if ($a -contains '--allowedTools') { if ((Get-Arg '-p') -match 'You are the ARBITER') { 'arbiter' } else { 'review' } }
+        elseif ($a -contains '--resume') { 'resume' } else { 'run' }
 Add-Content -LiteralPath (Join-Path $dir 'calls.txt') -Value ("{0} {1} {2}" -f $kind, (Get-Arg '--model'), (Get-Arg '--effort'))
 Add-Content -LiteralPath (Join-Path $dir 'prompts.txt') -Value ("=== $kind`n" + (Get-Arg '-p'))
 $count = @(Get-Content -LiteralPath (Join-Path $dir 'calls.txt') | Where-Object { $_ -like "$kind *" }).Count
@@ -48,7 +49,21 @@ $text = ''
 # A resume of a run that never got to work (its first call met a usage limit) does the
 # run's work: that is what the real conversation would carry on with.
 if ($kind -eq 'resume' -and -not (Test-Path 'work.txt')) { $kind = 'run' }
+# PK_ASK=1: the first run stops to ask, with nothing done; whatever answers it carries on.
+if ($kind -eq 'run' -and $env:PK_ASK -eq '1' -and $count -eq 1 -and $a -notcontains '--resume') { $kind = 'ask' }
 switch ($kind) {
+    'ask' {
+        $text = "I stopped before changing anything.`n`n**Question for the owner.** The task's budget and section 10 contradict each other. Option (a) or option (b)?"
+    }
+    'arbiter' {
+        # PK_ARBITER: ANSWER, ESCALATE, NONE or TAMPER.
+        switch ($env:PK_ARBITER) {
+            'ESCALATE' { $text = "Read the plan.`n`nDECISION: ESCALATE`nThis removes a feature users see; the owner must choose. Recommend (b)." }
+            'NONE'     { $text = 'I have thoughts but no decision.' }
+            'TAMPER'   { Set-Content -LiteralPath 'arbiter-was-here.txt' -Value 'x'; $text = "DECISION: ANSWER`nTake option (a), it is purely internal. Finish, run the gates, commit." }
+            default    { $text = "Read the plan and the code.`n`nDECISION: ANSWER`nTake option (a): the plan supports it and nothing visible changes. Finish the task, run the gates, commit." }
+        }
+    }
     'run' {
         Set-Content -LiteralPath 'work.txt' -Value 'work'
         $plan = Get-Content -LiteralPath 'PLAN.md' -Raw
@@ -59,7 +74,20 @@ switch ($kind) {
     }
     'resume' {
         $at = if ($env:PK_FIX_AT) { [int] $env:PK_FIX_AT } else { 1 }
-        if ($count -eq $at) {
+        # PK_ASK_ON_FIX=1: the first fix round undoes its commit and stops to ask, as a real
+        # one did (M7.2); the next resume, carrying the answer, commits the work again.
+        if ($env:PK_ASK_ON_FIX -eq '1') {
+            if ($count -eq 1) {
+                git reset -q --soft HEAD~1 2>&1 | Out-Null
+                $text = "I undid my commit.`n`n**Question for the owner.** Fixing finding 1 breaks section 10. Option (a) or (b)?"
+            } else {
+                Set-Content -LiteralPath 'good.txt' -Value 'fixed'
+                git add -A 2>&1 | Out-Null
+                git commit -q -m 'feat: A.1 with the answer' 2>&1 | Out-Null
+                $text = 'Done with option (a).'
+            }
+        }
+        elseif ($count -eq $at) {
             Set-Content -LiteralPath 'good.txt' -Value 'fixed'
             git add -A 2>&1 | Out-Null
             git commit -q -m 'fix: A.1' 2>&1 | Out-Null

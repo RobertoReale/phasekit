@@ -137,6 +137,12 @@ function Get-PhaseKitConfig {
         # account on this machine that is not known to be spent (see Select-FreeAccount),
         # before limitFallback and before waiting. Off: switching stays a person's command.
         switchAccounts   = $false
+        # When a target stops to ask, an independent read-only model answers the question
+        # itself if the answer is technical, and calls a person only for a product choice.
+        # Once per target; every answer is written to decisions.md. See Invoke-Arbiter.
+        arbiter          = $false
+        arbiterModel     = 'opus'
+        arbiterEffort    = 'high'
         # Every reviewer; reviewModel is the first. More than one, ideally of different
         # families, and a target passes only if none of them rejects it.
         reviewModels     = @('opus')
@@ -195,6 +201,12 @@ function Get-PhaseKitConfig {
     }
     else { $cfg.reviewModels = @($cfg.reviewModel) }
     if ($raw.PSObject.Properties.Name -contains 'reviewEffort' -and $raw.reviewEffort) { $cfg.reviewEffort = [string] $raw.reviewEffort }
+    if ($raw.PSObject.Properties.Name -contains 'arbiterModel' -and $raw.arbiterModel) {
+        $m = ([string] $raw.arbiterModel).Trim()
+        if ($m -notmatch $specPattern) { throw "phasekit.json: `"arbiterModel`" is '$m', which is not a model name." }
+        $cfg.arbiterModel = $m
+    }
+    if ($raw.PSObject.Properties.Name -contains 'arbiterEffort' -and $raw.arbiterEffort) { $cfg.arbiterEffort = [string] $raw.arbiterEffort }
     if ($raw.PSObject.Properties.Name -contains 'tiers' -and $raw.tiers) {
         $tiers = [ordered]@{}
         foreach ($p in $raw.tiers.PSObject.Properties) {
@@ -230,7 +242,7 @@ function Get-PhaseKitConfig {
     if ($raw.PSObject.Properties.Name -contains 'planSections' -and $null -ne $raw.planSections) {
         $cfg.planSections = @($raw.planSections | ForEach-Object { ([string] $_).Trim() } | Where-Object { $_ })
     }
-    foreach ($k in @('skipVerifiedGates', 'handoff', 'lessons', 'review', 'lintBeforeAuto', 'agyCredits', 'autoTier', 'switchAccounts')) {
+    foreach ($k in @('skipVerifiedGates', 'handoff', 'lessons', 'review', 'lintBeforeAuto', 'agyCredits', 'autoTier', 'switchAccounts', 'arbiter')) {
         if ($raw.PSObject.Properties.Name -contains $k) { $cfg[$k] = [bool] $raw.$k }
     }
     if ($raw.usageLimit) {
@@ -3289,6 +3301,123 @@ $again
 End your final message with a line that reads exactly VERDICT: PASS or VERDICT: FAIL. After
 FAIL, list the findings, numbered, one per line: file:line - what is wrong - what shows it.
 "@
+}
+
+function Get-ArbiterPrompt {
+    <#
+        What the arbiter is asked when a target stops with a question. The line it may not
+        cross is the one the owner draws for any delegate: technical answers yes, product
+        choices no, and never a lower bar to get a task through - the agent that stopped
+        has every incentive to be told yes, so the arbiter is told what yes may not cost.
+    #>
+    param(
+        [Parameter(Mandatory)] $Config,
+        [Parameter(Mandatory)] [string] $Target,
+        [string] $Problems,
+        [string] $Question
+    )
+    $section = ''
+    try { $section = Get-PlanSectionText -Config $Config -Phase $Target } catch { }
+    $task = if ($section) { "--- the task, quoted from $(Split-Path -Leaf $Config.plan) ---`n$section`n--- end of the task ---" }
+            else { "The task is $Target in $($Config.plan); read it there." }
+    $q = if ($Question) { $Question } else { '(the agent wrote nothing; read its branch and its log to see where it stopped)' }
+    if ($q.Length -gt 12000) { $q = '[...] ' + $q.Substring($q.Length - 12000) }
+    return @"
+You are the ARBITER for an unattended build that phasekit runs one task at a time. The agent
+working on $Target stopped and is waiting for an answer. The owner of the project has handed
+you the questions whose answer is technical; product choices stay with the owner. You cannot
+change anything: your tools read files and run read-only git commands. Read whatever you need -
+the plan ($($Config.plan)), the project's rules, the code in $($Config.codeDir), the branch -
+and decide.
+
+What phasekit saw: $Problems
+
+--- what the agent said last ---
+$q
+--- end ---
+
+$task
+
+ANSWER IT YOURSELF only if all of these hold:
+1. The answer is technical: how to build, test, measure or structure something, or which
+   reading of the plan the plan itself supports.
+2. It changes nothing a user of the product would see, do or be asked: no feature added,
+   removed or changed, no visible text, no default, no data kept, sent or deleted.
+3. It lowers no bar: no test, gate, check, security or data-safety rule is weakened, skipped
+   or worked around to get the task through. A number in the plan may be adjusted only when it
+   is internal (not something the plan promises users), and you say why the new one is right.
+4. The plan, the task and the code give you enough to be confident.
+An answer that amends the plan is allowed when it meets all four: say exactly which line
+changes, and tell the agent to make that change in the plan and record it in the project's
+decision log, in the same commit as the task.
+
+OTHERWISE ESCALATE. The owner decides. When in doubt, escalate: an unnecessary question costs
+the owner a minute, a wrong decision taken in their name costs the project.
+
+End your final message in exactly one of these two forms.
+
+DECISION: ANSWER
+<the answer for the agent, in English, addressed to it: what to do and why, precise enough to
+act on without asking again, ending with what to do next - finish the task, run the gates one
+after the other, commit, report>
+
+DECISION: ESCALATE
+<for the owner, in plain words: what the question is, the options, which one you recommend and
+why, and what is on the branch now>
+"@
+}
+
+function ConvertFrom-ArbiterDecision {
+    <#
+        ANSWER, ESCALATE or NONE, and the text that follows, from the arbiter's last
+        message. Only the last DECISION line counts: an earlier one is it quoting the format.
+    #>
+    param([AllowEmptyString()] [string] $Text)
+    $out = [pscustomobject]@{ decision = 'NONE'; text = '' }
+    if (-not $Text) { return $out }
+    $lines = $Text -split "`r?`n"
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        if ($lines[$i] -match '^\s*[*_#> ]*DECISION[*_ ]*:\s*[*_ ]*(?<d>ANSWER|ESCALATE)\b') {
+            $out.decision = $Matches['d'].ToUpperInvariant()
+            $out.text = if ($i -lt $lines.Count - 1) { ($lines[($i + 1)..($lines.Count - 1)] -join "`n").Trim() } else { '' }
+            # An answer with nothing in it answers nothing.
+            if ($out.decision -eq 'ANSWER' -and $out.text.Length -lt 20) { $out.decision = 'NONE' }
+            return $out
+        }
+    }
+    return $out
+}
+
+function Add-ArbiterDecision {
+    <# One entry in decisions.md: when, which target, what was asked, what was answered. #>
+    param(
+        [Parameter(Mandatory)] [string] $LogDir,
+        [Parameter(Mandatory)] [string] $Target,
+        [string] $Question,
+        [Parameter(Mandatory)] [string] $Answer,
+        [string] $Model
+    )
+    $file = Join-Path $LogDir 'decisions.md'
+    if (-not (Test-Path -LiteralPath $file)) {
+        Set-Content -LiteralPath $file -Value ("# Decisions taken by the arbiter`n`nEach entry is a question an agent stopped on and the " +
+            "answer phasekit's arbiter gave in the owner's place. Read them; one you disagree with is fixed with a`n" +
+            "fix task, and a kind of question you want to keep answering yourself means turning the arbiter off.`n")
+    }
+    $q = if ($Question.Length -gt 3000) { '[...] ' + $Question.Substring($Question.Length - 3000) } else { $Question }
+    $entry = @(
+        ''
+        "## $((Get-Date).ToString('yyyy-MM-dd HH:mm'))  $Target  ($Model)"
+        ''
+        '**The agent asked:**'
+        ''
+        ($q -split "`r?`n" | ForEach-Object { "> $_" }) -join "`n"
+        ''
+        '**The arbiter answered:**'
+        ''
+        $Answer
+    ) -join "`n"
+    Add-Content -LiteralPath $file -Value $entry
+    return $file
 }
 
 function ConvertFrom-ReviewVerdict {
