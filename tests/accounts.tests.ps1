@@ -104,6 +104,38 @@ try {
     Test-Case 'an unreadable record means nothing known' ((Read-AccountLimits).Count) 0
     Test-Case 'a machine with one account has nowhere to go' `
         ($null -eq (Select-FreeAccount -Exclude 'main' -HomeDir (Join-Path $root 'nobody'))) $true
+
+    Write-Host 'a new login in a spent account''s directory'
+    # What happened on 2026-11-17: b ran out, then another subscription was logged into
+    # ~/.claude-b. The record was about the old login; the new one has its whole allowance.
+    Remove-Item -LiteralPath (Get-AccountLimitsFile) -Force
+    Set-Content -LiteralPath (Join-Path $b '.claude.json') -Value '{ "oauthAccount": { "accountUuid": "old-login" } }'
+    Test-Case 'the login is read from the account''s directory' (Get-AccountLogin -Dir $b) 'old-login'
+    Set-AccountLimited -Name 'b' -Until (Get-Date).AddMinutes(90) -Accounts $accounts
+    Test-Case 'the record keeps which login ran out' (Read-AccountLimitRecords)['b'].login 'old-login'
+    Test-Case 'same login: still spent' ($null -eq (Select-FreeAccount -Exclude 'main' -HomeDir $fakeHome)) $true
+    Set-Content -LiteralPath (Join-Path $b '.claude.json') -Value '{ "oauthAccount": { "accountUuid": "new-login" } }'
+    Test-Case 'another login: free at once' (Select-FreeAccount -Exclude 'main' -HomeDir $fakeHome).name 'b'
+    Test-Case 'and no longer shown as spent' ((Read-AccountLimits -Accounts $accounts).ContainsKey('b')) $false
+    Set-Content -LiteralPath (Get-AccountLimitsFile) -Value ('{ "b": "' + (Get-Date).AddMinutes(90).ToUniversalTime().ToString('o') + '" }')
+    Test-Case 'a record from before logins were kept still counts' ((Read-AccountLimits -Accounts $accounts).ContainsKey('b')) $true
+
+    Write-Host 'a new login ends a wait'
+    Set-Content -LiteralPath (Join-Path $b '.claude.json') -Value '{ "oauthAccount": { "accountUuid": "first" } }'
+    $savedClaudeHome = $env:PHASEKIT_CLAUDE_HOME
+    $env:PHASEKIT_CLAUDE_HOME = $fakeHome
+    try {
+        $relog = Start-ThreadJob -ArgumentList (Join-Path $b '.claude.json') -ScriptBlock {
+            param($f) Start-Sleep -Seconds 2; Set-Content -LiteralPath $f -Value '{ "oauthAccount": { "accountUuid": "second" } }'
+        }
+        $log = Join-Path $root 'relog.log'
+        $started = Get-Date
+        Wait-UntilDeadline -Deadline (Get-Date).AddMinutes(30) -LogPath $log -Account 'b' -PollSeconds 1
+        $relog | Wait-Job | Remove-Job
+        Test-Case 'the wait ends when the login changes' (((Get-Date) - $started).TotalSeconds -lt 15) $true
+        Test-Case 'and says why' ((Get-Content -LiteralPath $log -Raw) -match 'now holds another login') $true
+    }
+    finally { $env:PHASEKIT_CLAUDE_HOME = $savedClaudeHome }
 }
 finally {
     $env:PHASEKIT_HOME = $savedHome

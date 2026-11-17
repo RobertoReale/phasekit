@@ -1219,34 +1219,83 @@ function Get-AccountLimitsFile {
     return (Join-Path (Split-Path -Parent (Get-AccountStateFile)) 'account-limits.json')
 }
 
-function Read-AccountLimits {
-    <# name -> the time its allowance is expected back. Unreadable or missing: none known. #>
-    $limits = @{}
+function Get-AccountLogin {
+    <#
+        Which Claude login an account directory holds now: the account id Claude Code keeps
+        in its .claude.json. Logging another subscription into the same directory changes it,
+        and that is the one thing a name like "b" cannot say. '' when it cannot be read.
+    #>
+    param([string] $Dir)
+    if (-not $Dir) { return '' }
+    $f = Join-Path $Dir '.claude.json'
+    if (-not (Test-Path -LiteralPath $f)) { return '' }
+    try {
+        $m = [regex]::Match((Get-Content -LiteralPath $f -Raw), '"accountUuid"\s*:\s*"([^"]+)"')
+        if ($m.Success) { return $m.Groups[1].Value }
+    } catch { }
+    return ''
+}
+
+function Read-AccountLimitRecords {
+    <# name -> @{ until; login } as written, either shape (older records are a bare time). #>
+    $records = @{}
     $f = Get-AccountLimitsFile
-    if (-not (Test-Path $f)) { return $limits }
+    if (-not (Test-Path $f)) { return $records }
     try {
         $raw = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
         foreach ($p in $raw.PSObject.Properties) {
+            # PowerShell 7 reads an ISO time in JSON as a [datetime] already; casting that to
+            # a string and parsing it again loses its time zone, and the reset with it.
+            $plain = ($p.Value -is [string]) -or ($p.Value -is [datetime])
+            $value = if ($plain) { $p.Value } else { $p.Value.until }
+            $login = if ($plain) { '' } else { [string] $p.Value.login }
             $until = [datetime]::MinValue
-            if ([datetime]::TryParse([string] $p.Value, [cultureinfo]::InvariantCulture,
-                    [Globalization.DateTimeStyles]::RoundtripKind, [ref] $until)) {
-                $limits[$p.Name] = $until.ToLocalTime()
-            }
+            if ($value -is [datetime]) { $until = $value }
+            elseif (-not [datetime]::TryParse([string] $value, [cultureinfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind, [ref] $until)) { continue }
+            $records[$p.Name] = [pscustomobject]@{ until = $until.ToLocalTime(); login = $login }
         }
     }
     catch { }
+    return $records
+}
+
+function Read-AccountLimits {
+    <#
+        name -> the time its allowance is expected back. Unreadable or missing: none known.
+        A record made under another login than the one the account's directory holds now
+        is no longer about this account - somebody logged a fresh subscription in - and is
+        left out. Measured 2026-11-17: a run waited three hours on "b" while b already held
+        a new login with its whole allowance.
+    #>
+    param([object[]] $Accounts = @(Get-ClaudeAccounts))
+    $limits = @{}
+    $records = Read-AccountLimitRecords
+    foreach ($name in $records.Keys) {
+        $r = $records[$name]
+        if ($r.login) {
+            $dir = ($Accounts | Where-Object { $_.name -eq $name } | Select-Object -First 1).dir
+            $now = Get-AccountLogin -Dir $dir
+            if ($now -and $now -ne $r.login) { continue }
+        }
+        $limits[$name] = $r.until
+    }
     return $limits
 }
 
 function Set-AccountLimited {
     param(
         [Parameter(Mandatory)] [string] $Name,
-        [Parameter(Mandatory)] [datetime] $Until
+        [Parameter(Mandatory)] [datetime] $Until,
+        [object[]] $Accounts = @(Get-ClaudeAccounts)
     )
-    $limits = Read-AccountLimits
-    $limits[$Name] = $Until
+    $records = Read-AccountLimitRecords
+    $dir = ($Accounts | Where-Object { $_.name -eq $Name } | Select-Object -First 1).dir
+    $records[$Name] = [pscustomobject]@{ until = $Until; login = (Get-AccountLogin -Dir $dir) }
     $out = [ordered]@{}
-    foreach ($k in @($limits.Keys | Sort-Object)) { $out[$k] = $limits[$k].ToUniversalTime().ToString('o') }
+    foreach ($k in @($records.Keys | Sort-Object)) {
+        $out[$k] = [ordered]@{ until = $records[$k].until.ToUniversalTime().ToString('o'); login = $records[$k].login }
+    }
     $f = Get-AccountLimitsFile
     New-Item -ItemType Directory -Path (Split-Path -Parent $f) -Force | Out-Null
     Set-Content -LiteralPath $f -Value ($out | ConvertTo-Json)
@@ -1264,7 +1313,7 @@ function Select-FreeAccount {
     )
     $accounts = @(Get-ClaudeAccounts -HomeDir $HomeDir)
     if ($accounts.Count -lt 2) { return $null }
-    $limits = Read-AccountLimits
+    $limits = Read-AccountLimits -Accounts $accounts
     $now = Get-Date
     $start = [array]::IndexOf(@($accounts.name), $Exclude)
     for ($i = 1; $i -le $accounts.Count; $i++) {
@@ -1478,10 +1527,16 @@ function Wait-UntilDeadline {
     param(
         [Parameter(Mandatory)] [datetime] $Deadline,
         [string] $LogPath,
-        [string] $Account
+        [string] $Account,
+        # How often the account is looked at again. Tests shorten it.
+        [int] $PollSeconds = 60
     )
 
     $lastNote = Get-Date
+    # The login the account held when the wait began: another one logged into the same
+    # directory brings its own allowance, and the wait is then for nothing.
+    $accountDir = if ($Account) { (Get-ClaudeAccounts | Where-Object { $_.name -eq $Account } | Select-Object -First 1).dir } else { $null }
+    $loginAtStart = Get-AccountLogin -Dir $accountDir
     while ($true) {
         $left = ($Deadline - (Get-Date)).TotalSeconds
         if ($left -le 0) { break }
@@ -1490,6 +1545,13 @@ function Wait-UntilDeadline {
             $switchedTo = Get-ChosenAccountName
             if ($switchedTo -and $switchedTo -ne $Account) {
                 $note = "$script:NoteMarker Account switched to $switchedTo - resuming now instead of waiting out the limit on $Account."
+                Write-Host $note -ForegroundColor Yellow
+                if ($LogPath) { Add-Content -LiteralPath $LogPath -Value $note }
+                break
+            }
+            $loginNow = Get-AccountLogin -Dir $accountDir
+            if ($loginAtStart -and $loginNow -and $loginNow -ne $loginAtStart) {
+                $note = "$script:NoteMarker Account $Account now holds another login - resuming now instead of waiting out the old one's limit."
                 Write-Host $note -ForegroundColor Yellow
                 if ($LogPath) { Add-Content -LiteralPath $LogPath -Value $note }
                 break
@@ -1503,7 +1565,7 @@ function Wait-UntilDeadline {
             $lastNote = Get-Date
         }
 
-        Start-Sleep -Seconds ([Math]::Min(60, [Math]::Max(1, [int] $left)))
+        Start-Sleep -Seconds ([Math]::Min($PollSeconds, [Math]::Max(1, [int] $left)))
     }
 }
 
@@ -4954,12 +5016,13 @@ function Get-UsageHistory {
         }
         foreach ($l in @($u.limits)) { $limits.Add($l) }
         if (-not $targets.Contains($f.target)) {
-            $targets[$f.target] = [pscustomobject]@{ target = $f.target; usd = 0.0; active = 0.0; lastT = 0.0 }
+            $targets[$f.target] = [pscustomobject]@{ target = $f.target; usd = 0.0; active = 0.0; lastT = 0.0; firstT = 0.0 }
         }
         $targets[$f.target].usd += $cost
         $targets[$f.target].active += [double] $u.active
         $lastReq = @($u.requests | ForEach-Object { [double] $_.t } | Sort-Object -Descending)
         if ($lastReq.Count -gt 0 -and $lastReq[0] -gt $targets[$f.target].lastT) { $targets[$f.target].lastT = $lastReq[0] }
+        if ($lastReq.Count -gt 0 -and ($targets[$f.target].firstT -eq 0 -or $lastReq[-1] -lt $targets[$f.target].firstT)) { $targets[$f.target].firstT = $lastReq[-1] }
     }
 
     return New-SpendIndex -Requests @($requests) -Limits @($limits) -Targets $targets -UsdPerWeight $usdPerWeight
@@ -5188,15 +5251,28 @@ function Get-CompletionForecast {
 
         It assumes the machine stays on and nothing stops for a person. The observed pace
         on the dashboard is the other half of the story.
+
+        -Elsewhere says where the work goes when the measured allowance is full. The
+        windows are measured from every account's logs together, so on their own they
+        describe one pool. Measured 2026-11-17: the pool read 100% of the week and the
+        forecast waited for Friday's reset, while another account with its whole week was
+        already doing the work and limitFallback stood behind it.
+        - 'none': nowhere; a full window waits for its reset.
+        - 'account': another Claude account is free now (switchAccounts), so the walk
+          starts on an empty allowance. Its windows still fill and wait.
+        - 'fallback': limitFallback takes over whenever Claude is spent, so no allowance
+          stops the clock.
     #>
     param(
         [Parameter(Mandatory)] $Frame,
         [Parameter(Mandatory)] $History,
         [int] $Recent = 12,
-        [Nullable[datetime]] $At = $null
+        [Nullable[datetime]] $At = $null,
+        [ValidateSet('none', 'account', 'fallback')] [string] $Elsewhere = 'none'
     )
 
-    $nowUtc = if ($At) { $At.Value.ToUniversalTime() } else { (Get-Date).ToUniversalTime() }
+    # PowerShell unwraps a Nullable, so a given -At is already a [datetime] here.
+    $nowUtc = if ($null -ne $At) { ([datetime] $At).ToUniversalTime() } else { (Get-Date).ToUniversalTime() }
     $now = ConvertTo-UnixSeconds $nowUtc
 
     $done = @($Frame.rows | Where-Object { $_.state -eq 'done' })
@@ -5211,10 +5287,46 @@ function Get-CompletionForecast {
     }
     $samples = @($samples | Sort-Object lastT | Select-Object -Last $Recent)
 
+    # Between two targets the gates, the review and the merge run, and none of them is in
+    # an agent's log. Measured as the gap from one target's last request to the next
+    # one's first. A gap of two hours or more was a wait - a limit, a question - and
+    # tells nothing about the overhead. Measured on TabDeclutter 2026-11-17: the agent's
+    # own minutes matched the clock, and the fixed 8 minutes this replaces put the end of
+    # four targets three hours early.
+    $overhead = 8.0
+    $spans = @($History.targets.Values | Where-Object { $_.firstT -gt 0 -and $_.lastT -gt 0 -and $_.lastT -le $now } | Sort-Object firstT)
+    $gaps = @()
+    for ($i = 1; $i -lt $spans.Count; $i++) {
+        $gap = ($spans[$i].firstT - $spans[$i - 1].lastT) / 60.0
+        if ($gap -gt 0 -and $gap -lt 120) { $gaps += $gap }
+    }
+    $gaps = @($gaps | Select-Object -Last $Recent)
+    if ($gaps.Count -ge 3) { $overhead = Get-Percentile -Values $gaps -P 0.5 }
+
     $allowance = Get-AllowanceModel -History $History -Now $now
+    $walkAllowance = switch ($Elsewhere) {
+        'fallback' { [pscustomobject]@{ five_hour = $null; seven_day = $null } }
+        'account' {
+            $fresh = [ordered]@{}
+            foreach ($type in $script:AllowanceWindowHours.Keys) {
+                $a = $allowance.$type
+                $fresh[$type] = [pscustomobject]@{
+                    size     = $(if ($a) { $a.size } else { $null })
+                    used     = 0.0
+                    # A five-hour window opens with the first request; a week is assumed
+                    # to start now, its real start being unknown.
+                    resetsAt = $(if ($type -eq 'seven_day') { $now + $script:AllowanceWindowHours[$type] * 3600.0 } else { $null })
+                }
+            }
+            [pscustomobject] $fresh
+        }
+        default { $allowance }
+    }
     $result = [ordered]@{
         now       = $nowUtc
         samples   = $samples.Count
+        overheadMinutes = $overhead
+        elsewhere = $Elsewhere
         allowance = $allowance
         quick     = $null
         typical   = $null
@@ -5242,7 +5354,7 @@ function Get-CompletionForecast {
             $work += [pscustomobject]@{ minutes = $m; usd = $c }
             $total += $m
         }
-        $walk = Invoke-ForecastWalk -Work $work -Allowance $allowance -Now $now
+        $walk = Invoke-ForecastWalk -Work $work -Allowance $walkAllowance -Now $now -OverheadMinutes $overhead
         $result[$q[0]] = [pscustomobject]@{
             finish = (ConvertFrom-UnixSeconds $walk.finish)
             waits  = $walk.waits
@@ -5312,7 +5424,12 @@ function Format-ForecastLines {
         } else { '' }
         $parts += ('{0} {1:p0} used{2}' -f $pair[1], [double] $a.used, $reset)
     }
-    $lines += [pscustomobject]@{ text = ('  allowance ' + ($parts -join '   ') + '   (estimated, all accounts together)'); colour = 'DarkGray' }
+    $after = switch ("$($Forecast.elsewhere)") {
+        'fallback' { '; when spent, limitFallback takes over, so the forecast waits for no reset' }
+        'account'  { '; a free account takes over now' }
+        default    { '' }
+    }
+    $lines += [pscustomobject]@{ text = ('  allowance ' + ($parts -join '   ') + '   (estimated, all accounts together' + $after + ')'); colour = 'DarkGray' }
     return $lines
 }
 
@@ -5722,7 +5839,10 @@ function Get-DashboardFrame {
     if ($remaining -gt 0) {
         try {
             $history = Get-UsageHistory -LogDir $Config.logDir
-            $forecast = Get-CompletionForecast -Frame ([pscustomobject]@{ rows = $rows }) -History $history
+            $elsewhere = if (@($Config.limitFallback | Where-Object { $_ }).Count -gt 0) { 'fallback' }
+                         elseif ($Config.switchAccounts -and $null -ne (Select-FreeAccount -Exclude '')) { 'account' }
+                         else { 'none' }
+            $forecast = Get-CompletionForecast -Frame ([pscustomobject]@{ rows = $rows }) -History $history -Elsewhere $elsewhere
         } catch { $forecast = $null }
     }
 

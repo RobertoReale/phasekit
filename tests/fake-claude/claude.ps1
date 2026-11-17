@@ -36,7 +36,9 @@ if ($env:PK_CLAUDE_AUTH_ACCOUNTS -and (@($env:PK_CLAUDE_AUTH_ACCOUNTS -split ','
     '{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed","type":"result","session_id":"' + $sid + '"}'
     exit 1
 }
-if (($env:PK_CLAUDE_LIMIT -eq '1' -or $spentHere) -and $kind -ne 'review') {
+# PK_CLAUDE_LIMIT_KINDS=resume: only those kinds of call meet the limit (a fix round, say).
+$spentKind = $env:PK_CLAUDE_LIMIT_KINDS -and (@($env:PK_CLAUDE_LIMIT_KINDS -split ',') -contains $kind)
+if (($env:PK_CLAUDE_LIMIT -eq '1' -or $spentHere -or $spentKind) -and $kind -notin @('review', 'arbiter')) {
     '{"type":"system","subtype":"init","session_id":"' + $sid + '","cwd":"."}'
     # The real CLI prints this on stderr, which the runner's 2>&1 captures; a script's
     # [Console]::Error would bypass that, so it goes to the output here.

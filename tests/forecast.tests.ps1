@@ -131,6 +131,43 @@ finally {
 }
 
 Write-Host ''
+Write-Host 'when the measured week is full but the work can go elsewhere'
+
+# The week of 'measuring the windows': rejected after 60 USD, back at +72h. One target
+# done (an hour, 10 USD), one to go. 2026-11-17: the pool read 100%, the forecast waited
+# for the weekly reset, and another account with its whole week was doing the work.
+$targets = [ordered]@{ 'T.1' = [pscustomobject]@{ active = 60; usd = 10; lastT = $t0 + 59 * 600 } }
+$full = New-SpendIndex -Requests $reqs -Limits $limits -Targets $targets
+$frame = [pscustomobject]@{ rows = @(
+    [pscustomobject]@{ target = 'T.1'; state = 'done'; model = 'opus' },
+    [pscustomobject]@{ target = 'T.2'; state = 'queued'; model = 'opus' }
+) }
+$at = ConvertFrom-UnixSeconds ($t0 + 59 * 600 + 1)
+$hoursFrom = { param($fc) [Math]::Round((ConvertTo-UnixSeconds $fc.typical.finish) - ($t0 + 59 * 600 + 1)) / 60 }
+$fc = Get-CompletionForecast -Frame $frame -History $full -At $at
+Test-Case 'nowhere else: it waits for the weekly reset' ((ConvertTo-UnixSeconds $fc.typical.finish) -ge $t0 + 72 * $h) 'True'
+$fc = Get-CompletionForecast -Frame $frame -History $full -At $at -Elsewhere fallback
+Test-Case 'a fallback model: the work alone, gates included' (& $hoursFrom $fc) 68
+Test-Case 'and the dashboard says why' ((Format-ForecastLines -Forecast $fc)[1].text -match 'limitFallback takes over') 'True'
+$fc = Get-CompletionForecast -Frame $frame -History $full -At $at -Elsewhere account
+Test-Case 'a free account: starts on an empty allowance' (& $hoursFrom $fc) 68
+Test-Case 'the measured week is still shown as it is' ([Math]::Round($fc.allowance.seven_day.used, 2)) 1
+
+# Between targets: gates, review, merge. Four targets an hour each, 30 minutes apart,
+# except one five-hour gap that was a wait and says nothing about the overhead.
+$spaced = [ordered]@{}
+$starts = @(0, 90, 180, 540, 630)
+for ($i = 0; $i -lt $starts.Count; $i++) {
+    $first = $t0 - 1000 * 60 + $starts[$i] * 60
+    $spaced["S.$i"] = [pscustomobject]@{ active = 60; usd = 10; firstT = $first; lastT = $first + 3600 }
+}
+$rows = @($spaced.Keys | ForEach-Object { [pscustomobject]@{ target = $_; state = 'done'; model = 'opus' } }) +
+        @([pscustomobject]@{ target = 'S.next'; state = 'queued'; model = 'opus' })
+$fc = Get-CompletionForecast -Frame ([pscustomobject]@{ rows = $rows }) -History (New-SpendIndex -Requests @() -Limits @() -Targets $spaced) -At (ConvertFrom-UnixSeconds $t0) -Elsewhere fallback
+Test-Case 'the time between targets is measured, waits left out' $fc.overheadMinutes 30
+Test-Case 'and the walk adds it' (((ConvertTo-UnixSeconds $fc.typical.finish) - $t0) / 60) 90
+
+Write-Host ''
 Write-Host 'the summary'
 
 $fc = [pscustomobject]@{
