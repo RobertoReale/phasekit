@@ -34,6 +34,9 @@ try {
     Test-Case 'its evidence loses the label' (@($p.ops)[0].evidence -like 'tests/e2e/restart.spec.ts*') 'True'
     Test-Case 'no block, nothing found' (ConvertFrom-LessonOps -Text 'Just a report.').found 'False'
     Test-Case 'NONE is not an operation and not an error' (@((ConvertFrom-LessonOps -Text "LESSONS`nNONE").rejected).Count) 0
+    $bare = ConvertFrom-LessonOps -Text "LESSONS`nCONFIRM L1"
+    Test-Case 'CONFIRM L1 with no colon is still a confirmation' "$(@($bare.ops).Count)|$(@($bare.ops)[0].op)|$(@($bare.ops)[0].id)" '1|CONFIRM|L1'
+    Test-Case 'but prose is still not an operation' (@((ConvertFrom-LessonOps -Text "LESSONS`nConfirmed it twice").rejected).Count) 1
     Test-Case 'a heading and a list marker are accepted' @((ConvertFrom-LessonOps -Text "## LESSONS`n- $good").ops).Count 1
     $fence = ([string] [char] 96) * 3
     Test-Case 'a code fence around the block is ignored' @((ConvertFrom-LessonOps -Text "LESSONS`n$fence`n$good`n$fence").ops).Count 1

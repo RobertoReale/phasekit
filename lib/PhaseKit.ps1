@@ -671,7 +671,10 @@ function ConvertFrom-LessonOps {
         if (-not $l -or $l -match '^```') { continue }
         $l = $l -replace '^[-*]\s+', '' -replace '^`(.*)`$', '$1'
         if ($l -match '^(?i)none\.?$') { continue }
-        if ($l -notmatch '^(?<op>[A-Za-z]+)\s*(?<id>L\d+)?\s*:\s*(?<body>.*)$') {
+        # The colon may be left out after an id: "CONFIRM L1" alone says all a confirmation
+        # needs to, and an agent wrote exactly that (2026-11-17), losing the confirmation.
+        if ($l -notmatch '^(?<op>[A-Za-z]+)\s*(?<id>L\d+)?\s*:\s*(?<body>.*)$' -and
+            $l -notmatch '^(?<op>[A-Za-z]+)\s+(?<id>L\d+)\s*(?<body>)$') {
             $rejected.Add([pscustomobject]@{ line = $l; why = 'not an operation (ADD, CONFIRM, WRONG, EDIT)' })
             continue
         }
