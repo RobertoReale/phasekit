@@ -192,6 +192,8 @@ try {
     Test-Case 'main first, then b' ($r.accounts -join ',') '.claude,.claude-b'
     Test-Case 'the spent account is written down' ($r.limits -match '"main"') 'True'
     Test-Case 'and the run says why' ($r.out -match 'Carrying on now under account b') 'True'
+    $logText = (Get-ChildItem -Path (Join-Path $p.repo 'logs') -Filter 'phase-*.log' | Get-Content -Raw) -join "`n"
+    Test-Case 'each attempt names its account in the log' (($logText -match '\[phasekit\] account main') -and ($logText -match '\[phasekit\] account b')) 'True'
 
     # 2c. Every account spent: then, and only then, limitFallback.
     $p = New-Project 'switch-all' @{ switchAccounts = $true; limitFallback = @('agy:claude-opus-fake') } -Good

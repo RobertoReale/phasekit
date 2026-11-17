@@ -1965,9 +1965,31 @@ function Write-StreamLine {
             } else {
                 Write-Host "$t  DONE  turns=$($ev.num_turns)$cost" -ForegroundColor Green
             }
+            Write-TargetSoFar
             if ($ev.result) { Write-Host $ev.result }
         }
     }
+}
+
+# The log the stream being rendered comes from; set by whoever renders it.
+$script:StreamLogPath = $null
+
+function Write-TargetSoFar {
+    <#
+        After each turn of the agent, one line with what its target has used so far, every
+        attempt and review included. It is what the "$" on the DONE line cannot say alone:
+        that figure is one process, and a target is usually several.
+    #>
+    $path = $script:StreamLogPath
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { return }
+    $leaf = Split-Path -Leaf $path
+    if ($leaf -notmatch '^(phase|review)-(?<target>.+)-\d{8}-\d{6}\.log$') { return }
+    try {
+        $s = Get-TargetSpend -LogDir (Split-Path -Parent $path) -Target $Matches['target']
+        if ($s.requests -le 0) { return }
+        $ctx = if ($s.context -gt 0) { "; context now $(Format-TokenCount $s.context)" } else { '' }
+        Write-Host ("          {0} so far: {1}{2}" -f $Matches['target'], (Format-SpendLine $s), $ctx) -ForegroundColor DarkGray
+    } catch { }
 }
 
 function Add-LogLine {
@@ -2161,6 +2183,7 @@ function Write-AgyStreamEvent {
                 Write-Host "$t  FAILED  $($res.status)" -ForegroundColor Red
                 if ($res.error) { Write-Host "          $($res.error)" -ForegroundColor Red }
             }
+            Write-TargetSoFar
             if ($res.response) { Write-Host $res.response }
         }
     }
@@ -2358,6 +2381,11 @@ function Invoke-Agent {
         }
         $env:CLAUDE_CONFIG_DIR = $account.dir
     }
+    # Which account this attempt runs under, in the log itself: the allowance readings
+    # that follow belong to it, and `phasekit dashboard` shows them per account.
+    if ($cmd.backend -eq 'claude' -and $account.name -and $account.name -ne '(environment)') {
+        try { Add-LogLine -LogPath $LogPath -Line "$script:NoteMarker account $($account.name)" } catch { }
+    }
     Write-Host ('-' * 72) -ForegroundColor DarkGray
 
     # claude writes UTF-8, and PowerShell decodes a native command's output with the
@@ -2373,6 +2401,7 @@ function Invoke-Agent {
     catch { $priorEncoding = $null }
 
     $script:LastAgentStalled = $false
+    $script:StreamLogPath = $LogPath
     $guard = Start-StallGuard -LogPath $LogPath -Minutes $script:StallMinutes
     try {
         $exe = $cmd.exe
@@ -4203,7 +4232,7 @@ function Get-LogSpend {
         [int] $TailLines = 0
     )
 
-    $empty = [pscustomobject]@{ requests = 0; peak = 0; last = 0; read = 0; write = 0; output = 0; weighted = 0 }
+    $empty = [pscustomobject]@{ requests = 0; peak = 0; last = 0; read = 0; write = 0; fresh = 0; output = 0; weighted = 0; usd = 0.0 }
     if (-not (Test-Path $LogPath)) { return $empty }
 
     $lines = if ($TailLines -gt 0) { Get-Content -LiteralPath $LogPath -Tail $TailLines -ErrorAction SilentlyContinue }
@@ -4211,7 +4240,32 @@ function Get-LogSpend {
 
     $seen = @{}
     $lastCtx = 0
+    # Each claude process ends with a result record carrying what it cost at API prices.
+    # One log can hold several processes (a resume, a switch of account), so they add up.
+    $usd = 0.0
+    # The same record also carries that process's token totals, and they are the ones to
+    # believe: a streamed message reports its usage before it has finished writing, so the
+    # output counted request by request comes out a fraction of the real one. Requests of
+    # a process whose result arrived are counted from it; the one still running, from its
+    # requests.
+    $segment = 0
+    $closed = @{}
+    $procUsd = 0.0
     foreach ($line in $lines) {
+        # phasekit writes a note before every process it starts and none while one runs,
+        # so a note is where one process's running cost total ends.
+        if ($line.StartsWith($script:NoteMarker)) { $procUsd = 0.0; continue }
+        # Unescaped quotes only: the same words quoted inside a tool result arrive as \".
+        $m = [regex]::Match($line, '"total_cost_usd":([\d.eE+-]+)')
+        if ($m.Success) {
+            $usd += Get-CostIncrement -Total ([double]::Parse($m.Groups[1].Value, [cultureinfo]::InvariantCulture)) -Previous ([ref] $procUsd)
+            try {
+                $r = $line | ConvertFrom-Json
+                if ($r.usage -and $null -ne $r.usage.output_tokens) { $closed[$segment] = $r.usage }
+            } catch { }
+            $segment++
+            continue
+        }
         # Antigravity: each agent_response step is one model request and carries its own
         # usage. Context is the fresh input plus the cached read; thinking counts as output.
         if ($line -match '"step_type":"agent_response"' -and $line -match '"usage"') {
@@ -4242,12 +4296,13 @@ function Get-LogSpend {
             write = [int64] $u.cache_creation_input_tokens
             fresh = [int64] $u.input_tokens
             out   = [int64] $u.output_tokens
+            seg   = $segment
         }
         $seen[$rid] = $rec
         $lastCtx = $rec.ctx
     }
 
-    if ($seen.Count -eq 0) { return $empty }
+    if ($seen.Count -eq 0) { $empty.usd = $usd; return $empty }
 
     $vals = @($seen.Values)
     $read = ($vals | Measure-Object -Property read -Sum).Sum
@@ -4259,8 +4314,23 @@ function Get-LogSpend {
     # One comparable number, in units of a full-price input token: a cached read is a
     # tenth of one, writing the cache is a quarter more, and output is five. The ratios
     # are the published ones and the absolute number is meaningless - what it is for is
-    # putting two targets next to each other honestly.
+    # putting two targets next to each other honestly. It stays on the per-request counts
+    # it has always used, so targets measured before and after this stay comparable; the
+    # token totals below take the results' figures.
     $weighted = [int64] ($fresh + $read * 0.1 + $write * 1.25 + $out * 5)
+    if ($closed.Count -gt 0) {
+        $open = @($vals | Where-Object { -not $closed.ContainsKey($_.seg) })
+        $read = [int64] ($open | Measure-Object -Property read -Sum).Sum
+        $write = [int64] ($open | Measure-Object -Property write -Sum).Sum
+        $fresh = [int64] ($open | Measure-Object -Property fresh -Sum).Sum
+        $out = [int64] ($open | Measure-Object -Property out -Sum).Sum
+        foreach ($u in $closed.Values) {
+            $read += [int64] $u.cache_read_input_tokens
+            $write += [int64] $u.cache_creation_input_tokens
+            $fresh += [int64] $u.input_tokens
+            $out += [int64] $u.output_tokens
+        }
+    }
 
     return [pscustomobject]@{
         requests = $seen.Count
@@ -4268,9 +4338,206 @@ function Get-LogSpend {
         last     = [int64] $lastCtx
         read     = [int64] $read
         write    = [int64] $write
+        fresh    = [int64] $fresh
         output   = [int64] $out
         weighted = $weighted
+        usd      = $usd
     }
+}
+
+function Get-CostIncrement {
+    <#
+        What one result record adds. A claude process that goes on after its turn ends - it
+        is woken by a background command finishing - writes a result for every turn, and
+        each carries the process's running total, not that turn's cost: measured
+        2026-11-17, $1.88 after 21 turns, then $1.94 after 3 more. So within one process
+        only the growth counts. A total smaller than the last one is a new process.
+    #>
+    param([double] $Total, [ref] $Previous)
+    $add = if ($Total -ge $Previous.Value) { $Total - $Previous.Value } else { $Total }
+    $Previous.Value = $Total
+    return $add
+}
+
+# Parsed logs, by path, size and write time: a finished log never changes, and the live
+# dashboard asks for the same ones on every refresh.
+$script:LogSpendCache = @{}
+
+function Get-TargetSpend {
+    <#
+        What one target has used so far, every attempt and every review included: the
+        tokens by kind, the context it carries now, and what that would cost at API prices.
+        That last figure is not a bill on a subscription; it is the one number that prices
+        every kind of token and every model the same way, so it says how heavy the work is.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $LogDir,
+        [Parameter(Mandatory)] [string] $Target
+    )
+    $name = $Target -replace '[^\w.-]', '_'
+    $sum = [pscustomobject]@{ requests = 0; fresh = [int64] 0; read = [int64] 0; write = [int64] 0; output = [int64] 0
+                              weighted = [int64] 0; usd = 0.0; context = 0; reviewUsd = 0.0; reviewRequests = 0 }
+    if (-not (Test-Path $LogDir)) { return $sum }
+    $files = @(Get-ChildItem -Path $LogDir -File -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name -like "phase-$name-*.log" -or $_.Name -like "review-$name-*.log" } |
+               Sort-Object LastWriteTime)
+    foreach ($f in $files) {
+        $key = "$($f.FullName)|$($f.Length)|$($f.LastWriteTime.Ticks)"
+        $one = $script:LogSpendCache[$key]
+        if (-not $one) { $one = Get-LogSpend -LogPath $f.FullName; $script:LogSpendCache[$key] = $one }
+        if ($f.Name -like 'review-*') {
+            $sum.reviewUsd += $one.usd
+            $sum.reviewRequests += $one.requests
+        } else {
+            if ($one.last -gt 0) { $sum.context = $one.last }
+        }
+        $sum.requests += $one.requests
+        $sum.fresh += $one.fresh; $sum.read += $one.read; $sum.write += $one.write; $sum.output += $one.output
+        $sum.weighted += $one.weighted
+        $sum.usd += $one.usd
+    }
+    return $sum
+}
+
+function Get-AccountReadings {
+    <#
+        What Claude itself said about each account's allowance, read from the logs: for each
+        account and each window (five-hour, weekly), the latest reading - a percentage, or
+        100% when a request was refused - and when that window resets.
+
+        These are the only exact numbers there are. Claude reports a percentage only once a
+        window is nearly used up (a warning, from about 90%) or spent; below that it says
+        nothing, and no published figure turns tokens into a share of a subscription. So an
+        account with no reading is not at 0% - it is below the warning. A reading whose
+        window has since reset is dropped: it describes a window that no longer exists.
+
+        Readings belong to the account named by the last "[phasekit] account" line above
+        them in the same log. Logs written before that line existed say nothing about which
+        account they ran under, and are left out rather than guessed.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $LogDir,
+        [datetime] $Now = (Get-Date),
+        [int] $Days = 8
+    )
+    $out = @{}
+    if (-not (Test-Path $LogDir)) { return $out }
+    $nowUnix = ConvertTo-UnixSeconds $Now.ToUniversalTime()
+    $since = $Now.AddDays(-$Days)
+    foreach ($f in @(Get-ChildItem -Path $LogDir -Filter '*.log' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $since })) {
+        $key = "$($f.FullName)|$($f.Length)|$($f.LastWriteTime.Ticks)"
+        $found = $script:ReadingsCache[$key]
+        if ($null -eq $found) { $found = @(Read-LogReadings -LogPath $f.FullName); $script:ReadingsCache[$key] = $found }
+        foreach ($r in $found) {
+            if ($r.resetsAt -le $nowUnix) { continue }
+            if (-not $out.ContainsKey($r.account)) { $out[$r.account] = @{} }
+            $prev = $out[$r.account][$r.window]
+            # Within one window the share only grows; a later window replaces an earlier one.
+            if (-not $prev -or $r.resetsAt -gt $prev.resetsAt -or ($r.resetsAt -eq $prev.resetsAt -and $r.pct -gt $prev.pct)) {
+                $out[$r.account][$r.window] = [pscustomobject]@{ pct = $r.pct; resetsAt = $r.resetsAt }
+            }
+        }
+    }
+    return $out
+}
+
+$script:ReadingsCache = @{}
+
+function Read-LogReadings {
+    <# Every allowance reading in one log, with the account it was made under. #>
+    param([Parameter(Mandatory)] [string] $LogPath)
+    $marker = [regex]::Escape($script:NoteMarker) + ' account (\S+)'
+    $inv = [cultureinfo]::InvariantCulture
+    $account = $null
+    $list = [System.Collections.Generic.List[object]]::new()
+    $stream = [IO.FileStream]::new($LogPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    $reader = [IO.StreamReader]::new($stream)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ($line.StartsWith($script:NoteMarker)) {
+                $m = [regex]::Match($line, $marker)
+                if ($m.Success) { $account = $m.Groups[1].Value }
+                continue
+            }
+            if (-not $account -or -not $line.StartsWith('{"type":"rate_limit_event"')) { continue }
+            $type = [regex]::Match($line, '"rateLimitType":"([a-z_]+)"')
+            $status = [regex]::Match($line, '"status":"([a-z_]+)"')
+            $resets = [regex]::Match($line, '"resetsAt":(\d+)')
+            if (-not ($type.Success -and $status.Success -and $resets.Success)) { continue }
+            $util = [regex]::Match($line, '"utilization":([\d.]+)')
+            $pct = if ($status.Groups[1].Value -eq 'rejected') { 1.0 }
+                   elseif ($util.Success) { [double]::Parse($util.Groups[1].Value, $inv) }
+                   else { continue }
+            $list.Add([pscustomobject]@{ account = $account; window = $type.Groups[1].Value; pct = $pct
+                                          resetsAt = [double] $resets.Groups[1].Value })
+        }
+    }
+    finally { $reader.Dispose(); $stream.Dispose() }
+    return $list
+}
+
+function Format-AccountLines {
+    <#
+        The dashboard's lines for the accounts: Claude's own readings per account, the
+        record of spent and expired accounts, and which one runs use.
+    #>
+    param(
+        [Parameter(Mandatory)] $Readings,
+        [object[]] $Accounts = @(Get-ClaudeAccounts),
+        [string] $Active = '',
+        $Limits = (Read-AccountLimits),
+        [datetime] $Now = (Get-Date)
+    )
+    $inv = [cultureinfo]::InvariantCulture
+    $lines = @()
+    $names = @(@($Accounts | ForEach-Object { $_.name }) + @($Readings.Keys) | Select-Object -Unique)
+    if ($names.Count -eq 0) { return $lines }
+    $first = $true
+    foreach ($n in $names) {
+        $parts = @()
+        foreach ($pair in @(@('five_hour', '5h', 'HH:mm'), @('seven_day', 'week', 'ddd HH:mm'))) {
+            $r = if ($Readings.ContainsKey($n)) { $Readings[$n][$pair[0]] } else { $null }
+            if ($r) {
+                $reset = (ConvertFrom-UnixSeconds $r.resetsAt).ToLocalTime().ToString($pair[2], $inv)
+                $parts += ('{0} {1:p0} (resets {2})' -f $pair[1], $r.pct, $reset)
+            }
+        }
+        $text = if ($parts.Count) { $parts -join '   ' } else { 'no warning from Claude (it reports a share only near the limit)' }
+        if ($Limits -and $Limits.ContainsKey($n) -and $Limits[$n] -gt $Now) {
+            $text += ('   set aside until {0}' -f $Limits[$n].ToString('ddd HH:mm', $inv))
+        }
+        $mark = if ($n -eq $Active) { '*' } else { ' ' }
+        $head = if ($first) { '  accounts ' } else { '           ' }
+        $lines += [pscustomobject]@{ text = ('{0}{1} {2,-6} {3}' -f $head, $mark, $n, $text)
+                                     colour = $(if ($parts | Where-Object { $_ -match '100%' }) { 'Yellow' } else { 'DarkGray' }) }
+        $first = $false
+    }
+    return $lines
+}
+
+function Format-TokenCount {
+    param([double] $N)
+    $inv = [cultureinfo]::InvariantCulture
+    $away = [MidpointRounding]::AwayFromZero
+    if ($N -ge 1e6) { return ([math]::Round($N / 1e6, 1, $away)).ToString($inv) + 'M' }
+    if ($N -ge 1e4) { return ([math]::Round($N / 1e3, 0, $away)).ToString($inv) + 'k' }
+    if ($N -ge 1e3) { return ([math]::Round($N / 1e3, 1, $away)).ToString($inv) + 'k' }
+    return ([int64] $N).ToString($inv)
+}
+
+function Format-SpendLine {
+    <# One line a person can read: what kinds of tokens, how many, and how heavy that is. #>
+    param([Parameter(Mandatory)] $Spend)
+    $inv = [cultureinfo]::InvariantCulture
+    $parts = @(
+        ('{0} requests' -f $Spend.requests)
+        ('{0} new in' -f (Format-TokenCount $Spend.fresh))
+        ('{0} cache read' -f (Format-TokenCount $Spend.read))
+        ('{0} cache write' -f (Format-TokenCount $Spend.write))
+        ('{0} out' -f (Format-TokenCount $Spend.output))
+    )
+    if ($Spend.usd -gt 0) { $parts += ('~$' + ([math]::Round($Spend.usd, 2)).ToString('0.00', $inv) + ' at API prices') }
+    return ($parts -join ', ')
 }
 
 function Get-RunPace {
@@ -4386,6 +4653,7 @@ function Read-LogUsage {
     $utc = [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal
 
     $newSegment = { [pscustomobject]@{ requests = [ordered]@{}; usd = $null } }
+    $procUsd = 0.0
 
     # Shared for writing: this log may be the one the running agent is appending to, and
     # [IO.File]::ReadLines opens with FileShare.Read, which makes that append fail for as
@@ -4448,10 +4716,13 @@ function Read-LogUsage {
             continue
         }
 
+        if ($line.StartsWith($script:NoteMarker)) { $procUsd = 0.0; continue }
+
         if ($line.StartsWith('{"type":"result"') -or ($line.Contains('"type":"result"') -and $line.Contains('"total_cost_usd"'))) {
             $cost = [regex]::Match($line, '"total_cost_usd":([\d.eE+-]+)')
             if ($cost.Success -and $null -ne $current) {
-                $current.usd = [double]::Parse($cost.Groups[1].Value, $inv)
+                # A running total within one process: see Get-CostIncrement.
+                $current.usd = Get-CostIncrement -Total ([double]::Parse($cost.Groups[1].Value, $inv)) -Previous ([ref] $procUsd)
                 $current = $null
             }
         }
@@ -4511,7 +4782,9 @@ function Get-UsageHistory {
     $dirty = $false
     foreach ($file in Get-ChildItem -Path $LogDir -Filter 'phase-*.log' -File -ErrorAction SilentlyContinue | Sort-Object Name) {
         if ($file.Name -notmatch '^phase-(?<target>.+)-(?<stamp>\d{8}-\d{6})\.log$') { continue }
-        $key = '{0}|{1}|{2}' -f $file.Name, $file.Length, $file.LastWriteTimeUtc.Ticks
+        # v2: a result's cost became the growth of its process's running total. Entries
+        # written before that counted it twice and are read again.
+        $key = 'v2|{0}|{1}|{2}' -f $file.Name, $file.Length, $file.LastWriteTimeUtc.Ticks
         $entry = $cache[$file.Name]
         if ($entry -and $entry.key -eq $key) {
             $usage = $entry.usage
@@ -4906,7 +5179,7 @@ function Format-ForecastLines {
         } else { '' }
         $parts += ('{0} {1:p0} used{2}' -f $pair[1], [double] $a.used, $reset)
     }
-    $lines += [pscustomobject]@{ text = ('  allowance ' + ($parts -join '   ')); colour = 'DarkGray' }
+    $lines += [pscustomobject]@{ text = ('  allowance ' + ($parts -join '   ') + '   (estimated, all accounts together)'); colour = 'DarkGray' }
     return $lines
 }
 
@@ -5341,5 +5614,11 @@ function Get-DashboardFrame {
         logDir    = $Config.logDir
         finished  = (Test-Path $doneFile)
         live      = [bool] @($rows | Where-Object { $_.state -in @('running', 'merging') })
+        # What the target in hand has used so far, and Claude's own word on each account.
+        spend     = $(foreach ($r in @($rows | Where-Object { $_.state -in @('running', 'merging', 'stalled') } | Select-Object -First 1)) {
+                        try { Get-TargetSpend -LogDir $Config.logDir -Target $r.target } catch { $null }
+                    })
+        readings  = $(try { Get-AccountReadings -LogDir $Config.logDir -Now $now } catch { @{} })
+        account   = $(try { (Get-ActiveAccount).name } catch { '' })
     }
 }

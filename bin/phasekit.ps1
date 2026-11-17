@@ -1461,6 +1461,7 @@ function Watch-Logs {
         $createdAt = $current.CreationTime
 
         Reset-StreamClock
+        $script:StreamLogPath = $current.FullName
         $fs = [System.IO.File]::Open($current.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
                                      [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
         # Stateful, so a UTF-8 character split across two reads still decodes.
@@ -1583,6 +1584,7 @@ function Invoke-Logs {
 
     # Rendered, not raw: the log is stream-json, and dumping it verbatim is what sends
     # people to `git log` instead.
+    $script:StreamLogPath = $newest.FullName
     Get-Content -LiteralPath $newest.FullName -Tail 200 | ForEach-Object { Write-StreamLine -Line $_ }
     return 0
 }
@@ -1666,41 +1668,50 @@ function Show-Spend {
     Write-Host ''
     Write-Host "  phasekit  $(Split-Path -Leaf $Config.codeDir) - what the sequence has spent" -ForegroundColor Cyan
     Write-Host ''
-    Write-Host '  target   attempts  requests   peak ctx    weighted' -ForegroundColor DarkGray
+    Write-Host '  target   attempts  requests   peak ctx    weighted   API price' -ForegroundColor DarkGray
 
     $total = [int64] 0
+    $totalUsd = 0.0
     $rows = 0
+    $inv = [cultureinfo]::InvariantCulture
     foreach ($item in $sequence) {
         $name = $item.target -replace '[^\w.-]', '_'
         if (-not $stats.Contains($name)) { continue }
 
         # Every attempt, not just the last: a target restarted three times was paid for
         # three times, and reporting only the surviving log would flatter it.
-        $spend = [pscustomobject]@{ requests = 0; peak = 0; weighted = 0 }
+        $spend = [pscustomobject]@{ requests = 0; peak = 0; weighted = 0; usd = 0.0 }
         foreach ($f in Get-ChildItem -Path $Config.logDir -Filter "phase-$name-*.log" -File -ErrorAction SilentlyContinue) {
             $one = Get-LogSpend -LogPath $f.FullName
             $spend.requests += $one.requests
             $spend.weighted += $one.weighted
+            $spend.usd += $one.usd
             if ($one.peak -gt $spend.peak) { $spend.peak = $one.peak }
         }
         if ($spend.requests -eq 0) { continue }
 
         $total += $spend.weighted
+        $totalUsd += $spend.usd
         $rows++
         # Loud above half a million tokens of context: that is where a request costs three
         # times what the same request cost at the start of the same task.
         $colour = if ($spend.peak -ge 450000) { 'Yellow' } else { 'Gray' }
-        Write-Host ('  {0,-8} {1,8} {2,9} {3,10} {4,11}' -f
+        Write-Host ('  {0,-8} {1,8} {2,9} {3,10} {4,11} {5,11}' -f
             $item.target,
             $stats[$name].attempts,
             $spend.requests,
             ('{0}k' -f [math]::Round($spend.peak / 1000)),
-            ('{0:N1}M' -f ($spend.weighted / 1e6))) -ForegroundColor $colour
+            ('{0:N1}M' -f ($spend.weighted / 1e6)),
+            $(if ($spend.usd -gt 0) { '$' + $spend.usd.ToString('0.00', $inv) } else { '-' })) -ForegroundColor $colour
     }
 
     Write-Host ''
     Write-Host ('  {0} targets measured, {1:N1}M in total, {2:N1}M each on average' -f
         $rows, ($total / 1e6), $(if ($rows) { $total / $rows / 1e6 } else { 0 })) -ForegroundColor Cyan
+    if ($totalUsd -gt 0) {
+        Write-Host ('  ~${0} at API prices in total. On a subscription nothing is billed by the token: this' -f $totalUsd.ToString('0', $inv)) -ForegroundColor DarkGray
+        Write-Host '  is what the same work would cost on the API, the one figure that prices every model alike.' -ForegroundColor DarkGray
+    }
     Write-Host ''
     Write-Host '  weighted: one unit is a full-price input token. A cached read counts a tenth,' -ForegroundColor DarkGray
     Write-Host '  writing the cache a quarter more, output five. Only the ratios are real -' -ForegroundColor DarkGray
@@ -1778,6 +1789,9 @@ function Show-Dashboard {
     elseif ($Frame.remaining -gt 0) {
         Write-Host '  now       nothing running' -ForegroundColor DarkGray
     }
+    if ($Frame.spend -and $Frame.spend.requests -gt 0) {
+        Write-Host ('  so far    ' + (Format-SpendLine $Frame.spend)) -ForegroundColor DarkGray
+    }
 
     # Everything above is inferred from files that outlive the process that wrote them,
     # so a sequence killed an hour ago and one merely between targets look identical up
@@ -1852,6 +1866,11 @@ function Show-Dashboard {
 
     foreach ($line in @(Format-ForecastLines -Forecast $Frame.forecast)) {
         Write-Host $line.text -ForegroundColor $line.colour
+    }
+    if ($Frame.readings) {
+        foreach ($line in @(Format-AccountLines -Readings $Frame.readings -Active $Frame.account -Now $Frame.now)) {
+            Write-Host $line.text -ForegroundColor $line.colour
+        }
     }
 
     if ($Frame.started) {

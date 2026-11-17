@@ -411,6 +411,8 @@ phasekit dashboard -Watch   # the same, redrawn every 20 seconds
   ██████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   15 / 53   28%
 
   now       G.8   coordinates on the first run                running 9m
+            on opus / effort high   context 55k
+  so far    70 requests, 45k new in, 3.9M cache read, 255k cache write, 38k out, ~$4.70 at API prices
   next      G.9  H.1  H.2
 
   pace      typical target 25m   quickest quarter 19m   (14 measured)
@@ -418,7 +420,9 @@ phasekit dashboard -Watch   # the same, redrawn every 20 seconds
 
   left      38 targets   ~16h 4m of work   ~9d 6h at the observed pace
   forecast  ends ~Fri 05/09 10:05 if it keeps running   (between Thu 04/09 and Tue 09/09)
-  allowance 5h 73% used, resets 01:40   week 78% used, resets Wed 03/09 12:00
+  allowance 5h 73% used, resets 01:40   week 78% used, resets Wed 03/09 12:00   (estimated, all accounts together)
+  accounts * main   no warning from Claude (it reports a share only near the limit)
+             b      5h 100% (resets 19:42)   week 91% (resets Fri 03:00)
   since     29/08 21:59   (3d 15h elapsed)
 
   0 ████ 4/4   A ██████ 6/6   G █████░░░░░ 5/10   H ░░░░ 0/4   B ░░░░░ 0/5
@@ -438,6 +442,20 @@ is the allowance, and writing a faster plan would change nothing.
 The typical target is a median rather than a mean on purpose: one target that sat out a
 weekend waiting for a limit to reset moves a mean by a factor of nine, and an estimate
 built on that quotes months.
+
+**What is being used, exactly and not.** The tokens are exact: every request reports them,
+and **so far** adds up the target in hand, every attempt and review included, by kind (new
+input, cache read, cache write, output). The same line follows every turn of the agent in
+`phasekit logs -Follow`, and `phasekit spend` has it per target. The dollar figure is what
+the same tokens would cost on the API. A subscription is not billed by them; it is there
+because it is the one number that prices every kind of token and every model alike.
+
+What is left of a subscription is not exact, and cannot be: no published figure turns
+tokens into a share of a five-hour or weekly allowance, and Claude states a share only near
+the limit (a warning) or at it (a refusal). **accounts** shows those statements as they
+are, per account, with when each window resets; "no warning" means below the warning, not
+0%. **allowance** is phasekit's estimate in between, from those statements and the tokens
+spent, for every account together.
 
 ### When it ends, usage limits included
 
