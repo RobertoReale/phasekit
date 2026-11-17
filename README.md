@@ -14,7 +14,7 @@ Claude Code or Gemini's and others through Google Antigravity.
 It exists because "let the agent go and see what happens" produces a diff nobody can read
 and a repository nobody can revert. The unit of trust here is the commit, not the session.
 
-![phasekit dashboard: progress bar, the target running and its model, pace, the forecast end and the usage allowance](docs/images/dashboard.png)
+![phasekit dashboard: progress bar, the target running, its model and the tokens it has used so far, pace, the forecast end, the estimated allowance and what Claude reports for each account](docs/images/dashboard.png)
 
 *`phasekit dashboard -Watch` during a real run: 37 of 46 targets done, the forecast end and
 the usage allowance it is planned against. `phasekit logs -Follow` shows, line by line, what
