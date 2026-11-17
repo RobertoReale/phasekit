@@ -311,6 +311,14 @@ It is truncated at the start of each sequence, because the question it answers i
 the run is now, and scrolling past last week's merges to find that out is where this
 started. Attaching mid-run prints the last few lines first, then follows.
 
+**An agent that is really stuck** is a different thing: its CLI is alive, so nothing else
+notices, and the run waits for it forever. One Antigravity run once sat for six and a half
+hours on "root agent idle; waiting for 2 background task(s) to finish". So while an agent
+runs, phasekit watches its log: once nothing has been written for `"stallMinutes"` (45 by
+default, long enough for a full gates run inside one tool call; 0 turns it off), it stops the
+agent's processes and resumes the same conversation in a fresh process, counted as one of
+the run's retries. Antigravity's idle line is given a fifth of that time.
+
 A log is also dated by its own clock rather than by the reader's. Not every event in the
 stream carries a timestamp — the one that says the phase ended carries none at all — and
 filling that in from `Get-Date` printed a run that died at ten as one still working at
