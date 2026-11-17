@@ -70,7 +70,13 @@ try {
     Test-Case 'the grandchild is running before the stop' ([bool] (Get-Process -Id $grandchild -ErrorAction SilentlyContinue)) $true
 
     Stop-ProcessTree -Id $child.Id
-    Start-Sleep -Seconds 2
+    # A killed process can take a moment to be gone from the table - on a busy macOS
+    # runner more than two seconds - so wait for it, with a ceiling, not a fixed nap.
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline -and
+           ((Get-Process -Id $child.Id -ErrorAction SilentlyContinue) -or (Get-Process -Id $grandchild -ErrorAction SilentlyContinue))) {
+        Start-Sleep -Milliseconds 300
+    }
     Test-Case 'the runner is stopped' ([bool] (Get-Process -Id $child.Id -ErrorAction SilentlyContinue)) $false
     Test-Case 'and so is what it started' ([bool] (Get-Process -Id $grandchild -ErrorAction SilentlyContinue)) $false
 
