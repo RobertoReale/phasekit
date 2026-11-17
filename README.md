@@ -721,7 +721,41 @@ was right. Every round is told never to weaken a test or a gate. When the rounds
 the stop note says how many there were.
 
 Rounds do not apply to a target that ended without finishing (a question, uncommitted
-work): those are the stops that need a person, and are handled as before.
+work): those are the stops the arbiter is for.
+
+### Questions answered while you sleep: `"arbiter"`
+
+Most stops are a question, and most questions have a technical answer: which of two readings
+of the plan the plan supports, how to measure something, what to do when two requirements
+collide over an internal number. On a real 47-task build every question after the first week
+was one of those, and the time lost was the hours each one waited for somebody to read it.
+
+**`"arbiter": true`** puts those questions to an independent model before anybody is woken.
+It is read-only like the reviewer (file reads, the git commands that only read, nothing that
+edits, and a repository that changed while it ran voids its decision). It reads the question,
+the task, the plan and the code, and ends with one of two answers:
+
+- `DECISION: ANSWER`, only when the answer is technical, changes nothing a user of the product
+  would see, do or be asked, lowers no bar (no test, gate, security or data-safety rule
+  weakened to get the task through) and the plan gives it enough to be sure. The answer goes
+  to the agent in its own conversation and the target carries on, through the reviewer and
+  the gates as usual. A plan amendment is allowed under the same conditions, and the agent is
+  told to make it in the plan and the decision log, in the same commit.
+- `DECISION: ESCALATE` for everything else, and whenever it is unsure. The sequence stops as
+  it always did, and the stop note carries the arbiter's summary: the question, the options,
+  its recommendation.
+
+```json
+"arbiter": true,
+"arbiterModel": "opus",
+"arbiterEffort": "high"
+```
+
+Once per target: a question that comes back after the answer reaches a person. Every answer
+is written to `logs/decisions.md`, the question and the answer side by side, for the owner to
+read. One you disagree with is undone with a fix task; a kind of question you want to keep
+answering yourself means turning the arbiter off. It also answers a fix round that stops to
+ask, which is where requirements tend to collide. Off by default.
 
 ### Models from Google Antigravity: `"agy:<model>"`
 

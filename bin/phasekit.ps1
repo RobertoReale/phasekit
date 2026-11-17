@@ -716,6 +716,70 @@ function Invoke-OneReview {
     return [pscustomobject]@{ verdict = $v.verdict; findings = $v.findings; log = $log }
 }
 
+function Invoke-Arbiter {
+    <#
+        Asks the arbiter about a target that stopped with a question. Read-only, the way
+        the reviewer is: the tools it is given read files and run read-only git commands,
+        and a repository that changed while it ran voids its decision.
+
+        Returns decision ANSWER (with the text for the agent), ESCALATE (with a summary for
+        the owner) or NONE (no usable decision: the stop goes to a person, as without it).
+    #>
+    param(
+        [Parameter(Mandatory)] $Config,
+        [Parameter(Mandatory)] [string] $Target,
+        [string] $Problems,
+        [string] $Question
+    )
+    $safe = $Target -replace '[^\w.-]', '_'
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    # Not phase-<target>-*.log: those are the target's own runs.
+    $log = Join-Path $Config.logDir ("arbiter-{0}-{1}.log" -f $safe, $stamp)
+    for ($n = 2; Test-Path -LiteralPath $log; $n++) { $log = Join-Path $Config.logDir ("arbiter-{0}-{1}-{2}.log" -f $safe, $stamp, $n) }
+    $sessionFile = Join-Path $Config.logDir "arbiter-$safe.session"
+    Remove-Item -LiteralPath $sessionFile -Force -ErrorAction SilentlyContinue
+
+    $headBefore = ([string] (git -C $Config.codeDir rev-parse HEAD 2>$null)).Trim()
+    $treeBefore = (@(git -C $Config.codeDir status --porcelain 2>$null) -join "`n")
+
+    $prompt = Get-ArbiterPrompt -Config $Config -Target $Target -Problems $Problems -Question $Question
+    $common = @(
+        '--model', $Config.arbiterModel
+        '--effort', $Config.arbiterEffort
+        '--output-format', 'stream-json'
+        '--verbose'
+        '--allowedTools', 'Read', 'Grep', 'Glob', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git show:*)', 'Bash(git status:*)', 'Bash(git blame:*)'
+        '--disallowedTools', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'WebSearch'
+    )
+    if ($Config.strictMcp) { $common += '--strict-mcp-config' }
+
+    Write-Host ''
+    Write-Host "  The arbiter reads $Target's question  ($(Format-ModelLabel -Model $Config.arbiterModel -Effort $Config.arbiterEffort), read-only)" -ForegroundColor Cyan
+    Write-Host "  Log: $log"
+
+    $rc = [pscustomobject] @{}
+    foreach ($p in $Config.PSObject.Properties) { $rc | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value }
+    $rc.maxContextRestarts = 0
+    $savedSession = $script:SessionId
+    $script:SessionId = $null
+    try {
+        $exit = Invoke-AgentWithLimitRetry -Config $rc -Phase $Target -FirstArgs (@('-p', $prompt) + $common) `
+            -LogPath $log -SessionFile $sessionFile -Common $common
+    }
+    finally { $script:SessionId = $savedSession }
+
+    $headAfter = ([string] (git -C $Config.codeDir rev-parse HEAD 2>$null)).Trim()
+    $treeAfter = (@(git -C $Config.codeDir status --porcelain 2>$null) -join "`n")
+    if ($headAfter -ne $headBefore -or $treeAfter -ne $treeBefore) {
+        Write-Host '  The repository changed while the read-only arbiter ran - its decision is void.' -ForegroundColor Red
+        return [pscustomobject]@{ decision = 'NONE'; text = 'the repository changed while the arbiter ran'; log = $log }
+    }
+    $words = if (Test-Path -LiteralPath $log) { Get-AgentLastWords -LogTail ((Get-Content -LiteralPath $log -Tail 400) -join "`n") -MaxChars 12000 } else { '' }
+    $d = ConvertFrom-ArbiterDecision -Text $words
+    Write-Host ("  The arbiter: {0}" -f $d.decision) -ForegroundColor $(switch ($d.decision) { 'ANSWER' { 'Green' } 'ESCALATE' { 'Yellow' } default { 'DarkYellow' } })
+    return [pscustomobject]@{ decision = $d.decision; text = $d.text; log = $log }
+}
+
 function Invoke-Auto {
     <#
         Walks a list of targets unattended: run, verify, merge, next. Stops at the first
@@ -868,6 +932,49 @@ What to do: $Next
 
     $attempted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $answered = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $arbitrated = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+
+    # A target that stopped with a question, put to the arbiter when it is on - once per
+    # target, so a question that comes back after the answer reaches a person. On ANSWER the
+    # answer is recorded and sent in the target's own conversation (or to a fresh session
+    # over the branch, if that is gone); the caller then looks at the branch again. $null
+    # when the arbiter is off or already had its turn.
+    function Invoke-ArbiterStep([string] $StopTarget, [string] $Problems) {
+        if (-not $cfg.arbiter -or $arbitrated.Contains($StopTarget)) { return $null }
+        [void] $arbitrated.Add($StopTarget)
+        $lastLog = Get-ChildItem -Path $cfg.logDir -Filter "phase-$($StopTarget -replace '[^\w.-]', '_')-*.log" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        $question = if ($lastLog) { Get-AgentLastWords -LogTail ((Get-Content -LiteralPath $lastLog.FullName -Tail 400) -join "`n") -MaxChars 12000 } else { '' }
+        Write-AutoProgress "$StopTarget : stopped with a question - the arbiter reads it"
+        $a = $null
+        try { $a = Invoke-Arbiter -Config $cfg -Target $StopTarget -Problems $Problems -Question $question }
+        catch { $a = [pscustomobject]@{ decision = 'NONE'; text = $_.Exception.Message; log = '' } }
+        if ($a.decision -ne 'ANSWER') {
+            Write-AutoProgress ("$StopTarget : the arbiter {0}" -f $(if ($a.decision -eq 'ESCALATE') { 'leaves it to the owner' } else { 'gave no decision' }))
+            return $a
+        }
+        $decisionsFile = Add-ArbiterDecision -LogDir $cfg.logDir -Target $StopTarget -Question $question -Answer $a.text `
+            -Model (Format-ModelLabel -Model $cfg.arbiterModel -Effort $cfg.arbiterEffort)
+        Write-AutoProgress "$StopTarget : the arbiter answered (decisions.md) - the agent carries on"
+        $message = ("Answer to your question, from the arbiter: phasekit's independent reviewer, which answers technical " +
+                    "questions in the owner's place and records each answer in $decisionsFile for the owner to read.`n`n" + $a.text)
+        $hasSession = [bool] (Get-PinnedSession -Config $cfg -Phase $StopTarget)
+        $Text = ''; $File = ''
+        try {
+            if ($hasSession) { $Text = $message; $null = @(Invoke-Run -Mode 'reply')[-1] }
+            else { $script:ExtraPrompt = $message; $null = @(Invoke-Run -Mode 'finish')[-1] }
+        }
+        catch { Write-Host "  the arbiter's answer did not get through ($($_.Exception.Message))." -ForegroundColor Yellow }
+        finally { $Text = ''; $script:ExtraPrompt = '' }
+        return $a
+    }
+    function Get-ArbiterDetail($Arbiter) {
+        if ($Arbiter -and $Arbiter.decision -eq 'ESCALATE' -and $Arbiter.text) {
+            return [pscustomobject]@{ name = 'the arbiter, for the owner'; code = $null; tail = $Arbiter.text }
+        }
+        return $null
+    }
+
     while ($true) {
         if (-not $Targets) {
             try {
@@ -1146,6 +1253,18 @@ What to do: $Next
             $report = Test-PhaseReady -Config $cfg -Phase $target -AllowNoCommits:$item.allowNoCommits
         }
 
+        $arb = $null
+        if (-not $report.ok) {
+            $arb = Invoke-ArbiterStep -StopTarget $target -Problems ($report.problems -join '; ')
+            if ($arb -and $arb.decision -eq 'ANSWER') {
+                if (Test-TargetDone -Config $cfg -Target $target -AllowNoCommits:$item.allowNoCommits) {
+                    Write-AutoProgress "$target : landed after the arbiter's answer - moving on"
+                    continue
+                }
+                $report = Test-PhaseReady -Config $cfg -Phase $target -AllowNoCommits:$item.allowNoCommits
+            }
+        }
+
         if (-not $report.ok) {
             # The problems say what the repository shows; the agent's last message says
             # why, and is usually the question the person is being woken up to answer.
@@ -1153,6 +1272,7 @@ What to do: $Next
                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
             $words = if ($lastLog) { Get-AgentLastWords -LogTail ((Get-Content -LiteralPath $lastLog.FullName -Tail 400) -join "`n") } else { '' }
             $said = if ($words) { [pscustomobject]@{ name = 'what the agent said last'; code = $null; tail = $words } } else { $null }
+            $said = @(@($said, (Get-ArbiterDetail $arb)) | Where-Object { $_ })
             Stop-Auto -Target $target -Detail $said `
                 -Why ($report.problems -join '; ') `
                 -Next ("Read the log, then answer in the same conversation:`n" +
@@ -1259,8 +1379,21 @@ What to do: $Next
 
             if (Test-TargetDone -Config $cfg -Target $target -AllowNoCommits:$item.allowNoCommits) { $landed = $true; break }
             $report = Test-PhaseReady -Config $cfg -Phase $target -AllowNoCommits:$item.allowNoCommits
+            $arb = $null
+            if (-not $report.ok) {
+                # The fix round stopped to ask - a reading of the plan the review forced, or a
+                # requirement that cannot be met as written. The arbiter may answer that too.
+                $arb = Invoke-ArbiterStep -StopTarget $target -Problems ("after fix round ${round}: " + ($report.problems -join '; '))
+                if ($arb -and $arb.decision -eq 'ANSWER') {
+                    if (Test-TargetDone -Config $cfg -Target $target -AllowNoCommits:$item.allowNoCommits) { $landed = $true; break }
+                    $report = Test-PhaseReady -Config $cfg -Phase $target -AllowNoCommits:$item.allowNoCommits
+                    # Ready again: back to the top, where the reviewer and the gates judge it.
+                    if ($report.ok) { continue }
+                }
+            }
             if (-not $report.ok) {
                 Stop-Auto -Target $target -Why ("after fix round ${round}: " + ($report.problems -join '; ')) `
+                    -Detail (Get-ArbiterDetail $arb) `
                     -Next ("Read the log, then answer in the same conversation:`n" +
                            "    phasekit reply $target -Text `"your answer`"")
                 return 1
@@ -2520,6 +2653,7 @@ switch ($Command.ToLowerInvariant()) {
             $(if (@($cfg.fixRounds).Count) { $cfg.fixRounds -join ', ' } else { 'none' }),
             $(if ($cfg.switchAccounts) { 'on' } else { 'off' }),
             $(if (@($cfg.limitFallback).Count) { $cfg.limitFallback -join ', ' } else { 'none (wait for the reset)' })) -ForegroundColor DarkGray
+        Write-Host ("  arbiter: {0}" -f $(if ($cfg.arbiter) { Format-ModelLabel -Model $cfg.arbiterModel -Effort $cfg.arbiterEffort } else { 'off (questions wait for a person)' })) -ForegroundColor DarkGray
         Write-Host ''
         exit 0
     }
