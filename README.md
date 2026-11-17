@@ -479,6 +479,14 @@ and the weekly one, the way the run will meet them:
   its reset. The weekly reset keeps its fixed weekly time. The walk is done three times: with
   the quickest quarter of recent targets, the typical one and the slowest quarter. That gives
   the date and the range around it.
+- **Between targets.** The gates, the review and the merge run outside every agent's log.
+  Their time is the median gap between one target's last request and the next one's first.
+  Gaps of two hours or more were waits, and they are left out.
+- **When the work can go elsewhere.** The windows are measured from every account's logs
+  together, as one pool. With `limitFallback` set, a spent Claude allowance hands the
+  target to the fallback instead of stopping it, so the walk waits for no reset, and the
+  allowance line says so. With `switchAccounts` and another account free now, the walk
+  starts on an empty allowance.
 
 It assumes the machine stays on and no stop waits for a person: the observed pace above is
 the reading that includes those.
