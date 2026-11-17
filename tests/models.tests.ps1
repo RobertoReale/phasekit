@@ -140,7 +140,7 @@ try {
     function Invoke-Sequence($P, [hashtable] $Env) {
         # The accounts are the test's own (none, unless it makes some), never the machine's.
         $vars = @{ PK_FAKE_DIR = $P.fake; PK_REVIEWS = ''; PK_AGY_REVIEWS = ''; PK_FIX_AT = ''; PK_AGY_LIMIT = ''; PK_CLAUDE_LIMIT = ''
-                   PK_CLAUDE_LIMIT_ACCOUNTS = ''; PK_CLAUDE_AUTH_ACCOUNTS = ''; PHASEKIT_HOME = (Join-Path $P.repo 'home')
+                   PK_CLAUDE_LIMIT_ACCOUNTS = ''; PK_CLAUDE_AUTH_ACCOUNTS = ''; PK_CLAUDE_LIMIT_KINDS = ''; PHASEKIT_HOME = (Join-Path $P.repo 'home')
                    PHASEKIT_CLAUDE_HOME = (Join-Path $P.repo 'home' 'accounts'); CLAUDE_CONFIG_DIR = '' }
         foreach ($k in $Env.Keys) { $vars[$k] = $Env[$k] }
         $saved = @{}
@@ -226,6 +226,14 @@ try {
     $r = Invoke-Sequence $p @{ PK_CLAUDE_AUTH_ACCOUNTS = '.claude' }
     Test-Case 'an expired login alone stops the run' ($r.calls -join ';') 'run sonnet medium'
     Test-Case 'and says how to log in' ($r.out -match '/login') 'True'
+
+    # 2g. What happened on 2026-11-17: the limit met in a fix round, not in the first run.
+    #     The round goes on, on the fallback, told what it was fixing; the target lands.
+    $p = New-Project 'fallback-in-round' @{ review = $true; fixRounds = @('same'); limitFallback = @('agy:claude-opus-fake') } -Good
+    $r = Invoke-Sequence $p @{ PK_REVIEWS = 'FAIL,PASS'; PK_CLAUDE_LIMIT_KINDS = 'resume' }
+    Test-Case 'a fix round that meets a limit falls back too' "$($r.code)|$($r.merged)" '0|True'
+    Test-Case 'run, review, the round, the fallback, review' ($r.calls -join ';') 'run sonnet medium;review opus high;resume sonnet medium;agy-fresh claude-opus-fake ;review opus high'
+    Test-Case 'the fallback was told what it was fixing' ($r.prompts -match '(?s)=== agy-fresh.*It had just been told this.*the work is wrong') 'True'
 
     # 3. Two reviewers of different families: one passes, one rejects - rejected; fixed;
     #    both pass - merged.

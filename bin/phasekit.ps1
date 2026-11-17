@@ -961,13 +961,56 @@ What to do: $Next
         $hasSession = [bool] (Get-PinnedSession -Config $cfg -Phase $StopTarget)
         $Text = ''; $File = ''
         try {
-            if ($hasSession) { $Text = $message; $null = @(Invoke-Run -Mode 'reply')[-1] }
-            else { $script:ExtraPrompt = $message; $null = @(Invoke-Run -Mode 'finish')[-1] }
+            if ($hasSession) { $Text = $message; $null = Invoke-RunWithFallback -RunMode 'reply' -Note $message }
+            else { $script:ExtraPrompt = $message; $null = Invoke-RunWithFallback -RunMode 'finish' -Note $message }
         }
         catch { Write-Host "  the arbiter's answer did not get through ($($_.Exception.Message))." -ForegroundColor Yellow }
         finally { $Text = ''; $script:ExtraPrompt = '' }
         return $a
     }
+    # One step of a target - its run, a fix round, the arbiter's answer - with limitFallback
+    # behind it: when every Claude account is spent, the step goes on, on the next model in
+    # the list, in a fresh session over the branch, told what it was in the middle of
+    # ($Note: a fix round's rejection, an arbiter's answer). When the list runs out, the last
+    # session waits for its reset. Measured 2026-11-17: a fix round met two spent accounts
+    # and waited three hours, because only a target's first run fell back.
+    # Returns the exit code and, if it handed over, the model the target now belongs to.
+    function Invoke-RunWithFallback([string] $RunMode, [string] $Note = '') {
+        $script:AllowLimitFallback = $true
+        $script:LimitFallbackPending = $false
+        $script:LimitFallbackList = $null
+        $handedOver = $false
+        try {
+            $code = @(Invoke-Run -Mode $RunMode)[-1]
+            # The list comes from the run that decided to fall back: this sequence's own copy
+            # of the config was read when it started, possibly from another branch's
+            # phasekit.json (2026-11-16: a runner restarted on an older branch read an empty one).
+            $fbList = if ($null -ne $script:LimitFallbackList) { $script:LimitFallbackList } else { $cfg.limitFallback }
+            $fallbacks = @(@($fbList) | Where-Object { $_ } | ForEach-Object { ConvertFrom-ModelSpec $_ })
+            $fb = 0
+            while ($script:LimitFallbackPending) {
+                $script:LimitFallbackPending = $false
+                $from = Format-ModelLabel -Model $(if ($Model) { $Model } else { $cfg.model }) -Effort $Effort
+                if ($fb -ge $fallbacks.Count) {
+                    Write-AutoProgress "$Phase : limitFallback exhausted - waiting for the reset on $from"
+                    $script:AllowLimitFallback = $false
+                    $code = @(Invoke-Run -Mode 'continue')[-1]
+                    break
+                }
+                $next = $fallbacks[$fb]; $fb++
+                $Model = $next.model; $Effort = $next.effort
+                $handedOver = $true
+                Write-AutoProgress "$Phase : usage limit on $from - handing over to $(Format-ModelLabel -Model $next.model -Effort $next.effort)"
+                $script:ExtraPrompt = ("The session on $from stopped because its usage allowance ran out, in the middle of " +
+                                       "the task. You continue it on another model; nothing of its work is lost." +
+                                       $(if ($Note) { "`n`nIt had just been told this, and was acting on it:`n$Note" } else { '' }))
+                try { $code = @(Invoke-Run -Mode 'finish')[-1] } finally { $script:ExtraPrompt = '' }
+            }
+        }
+        finally { $script:AllowLimitFallback = $false }
+        return [pscustomobject]@{ exit = $code; handedOver = $handedOver; model = $Model; effort = $Effort }
+    }
+
     function Get-ArbiterDetail($Arbiter) {
         if ($Arbiter -and $Arbiter.decision -eq 'ESCALATE' -and $Arbiter.text) {
             return [pscustomobject]@{ name = 'the arbiter, for the owner'; code = $null; tail = $Arbiter.text }
@@ -1093,39 +1136,13 @@ What to do: $Next
         # That leaves a runner mark with no stop note, which reads as a killed runner, so
         # the watchdog restarts it into the very same refusal. Stopping on purpose says
         # what happened once and leaves it said.
-        $script:AllowLimitFallback = $true
-        $script:LimitFallbackPending = $false
-        $script:LimitFallbackList = $null
         try {
-            $exit = @(Invoke-Run -Mode $mode)[-1]
-
-            # A spent allowance with limitFallback set: the run returned instead of waiting,
-            # and the target goes on, on the next model, in a fresh session over the branch.
-            # When the list runs out, the last session waits for its reset as always.
-            # The list comes from the run that decided to fall back: this sequence's own copy
-            # of the config was read when it started, possibly from another branch's
-            # phasekit.json. Measured 2026-11-16: a runner restarted on a task branch made
-            # before limitFallback was added read an empty list, and stopped.
-            $fbList = if ($null -ne $script:LimitFallbackList) { $script:LimitFallbackList } else { $cfg.limitFallback }
-            $fallbacks = @(@($fbList) | Where-Object { $_ } | ForEach-Object { ConvertFrom-ModelSpec $_ })
-            $fb = 0
-            while ($script:LimitFallbackPending) {
-                $script:LimitFallbackPending = $false
-                $from = Format-ModelLabel -Model $(if ($Model) { $Model } else { $cfg.model }) -Effort $Effort
-                if ($fb -ge $fallbacks.Count) {
-                    Write-AutoProgress "$target : limitFallback exhausted - waiting for the reset on $from"
-                    $script:AllowLimitFallback = $false
-                    $exit = @(Invoke-Run -Mode 'continue')[-1]
-                    break
-                }
-                $next = $fallbacks[$fb]; $fb++
-                $Model = $next.model; $Effort = $next.effort
-                Write-AutoProgress "$target : usage limit on $from - handing over to $(Format-ModelLabel -Model $next.model -Effort $next.effort)"
-                $script:ExtraPrompt = ("The session on $from stopped because its usage allowance ran out, in the middle of " +
-                                       "the task. You continue it on another model; nothing of its work is lost.")
-                try { $exit = @(Invoke-Run -Mode 'finish')[-1] } finally { $script:ExtraPrompt = '' }
+            $res = Invoke-RunWithFallback -RunMode $mode
+            $exit = $res.exit
+            if ($res.handedOver) {
                 # From here the target belongs to this model: a "same" fix round must not
                 # go back to the one whose allowance is spent.
+                $Model = $res.model; $Effort = $res.effort
                 $pick = [pscustomobject]@{ model = $Model; effort = $Effort; tier = $pick.tier; source = 'limitFallback' }
             }
         }
@@ -1234,11 +1251,13 @@ What to do: $Next
             # An exception here would take the whole sequence down with it, which is worse
             # than the stop it was trying to avoid. Fall through to that stop instead.
             try {
+                $note = ''
                 if ($hasSession) {
                     $Text = Get-UnfinishedWorkAnswer -Target $target
                     $File = ''
+                    $note = $Text
                 }
-                $null = @(Invoke-Run -Mode $how)[-1]
+                $null = Invoke-RunWithFallback -RunMode $how -Note $note
             }
             catch {
                 Write-Host "  that did not get through ($($_.Exception.Message))." -ForegroundColor Yellow
@@ -1365,7 +1384,10 @@ What to do: $Next
                 $message = Get-RejectionMessage -Target $target -Kind $rejection.kind -Detail $rejection.detail -Round "$round of $($rounds.Count)"
                 if ($how -eq 'reply') { $Text = $message } else { $script:ExtraPrompt = $message }
                 $File = ''
-                $null = @(Invoke-Run -Mode $how)[-1]
+                $res = Invoke-RunWithFallback -RunMode $how -Note $message
+                if ($res.handedOver) {
+                    $pick = [pscustomobject]@{ model = $res.model; effort = $res.effort; tier = $pick.tier; source = 'limitFallback' }
+                }
             }
             catch { Write-Host "  the fix round did not get through ($($_.Exception.Message))." -ForegroundColor Yellow }
             finally { $Text = ''; $script:ExtraPrompt = '' }
